@@ -19,6 +19,7 @@ import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager.C
 import io.github.hectorvent.floci.core.common.docker.ContainerLogStreamer;
 import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
 import io.github.hectorvent.floci.core.common.docker.CurrentContainerNetworkResolver;
+import io.github.hectorvent.floci.core.common.docker.DockerHostResolver;
 import com.github.dockerjava.api.model.Container;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -37,13 +38,14 @@ import org.jboss.logging.Logger;
 public class FlociUiManager {
 
     private static final Logger LOG = Logger.getLogger(FlociUiManager.class);
-    private static final int CONTAINER_INTERNAL_PORT = 3000;
+    private static final int CONTAINER_INTERNAL_PORT = 4500;
 
     private final ContainerBuilder containerBuilder;
     private final ContainerLifecycleManager lifecycleManager;
     private final ContainerLogStreamer logStreamer;
     private final ContainerDetector containerDetector;
     private final CurrentContainerNetworkResolver currentContainerNetworkResolver;
+    private final DockerHostResolver dockerHostResolver;
     private final EmulatorConfig config;
     private final RegionResolver regionResolver;
 
@@ -66,6 +68,7 @@ public class FlociUiManager {
                           ContainerLogStreamer logStreamer,
                           ContainerDetector containerDetector,
                           CurrentContainerNetworkResolver currentContainerNetworkResolver,
+                          DockerHostResolver dockerHostResolver,
                           EmulatorConfig config,
                           RegionResolver regionResolver) {
         this.containerBuilder = containerBuilder;
@@ -73,6 +76,7 @@ public class FlociUiManager {
         this.logStreamer = logStreamer;
         this.containerDetector = containerDetector;
         this.currentContainerNetworkResolver = currentContainerNetworkResolver;
+        this.dockerHostResolver = dockerHostResolver;
         this.config = config;
         this.regionResolver = regionResolver;
     }
@@ -191,14 +195,23 @@ public class FlociUiManager {
         return env;
     }
 
-    /** The endpoint the UI's API server uses to reach Floci from inside its container. */
-    private String resolveFlociEndpoint() {
-        if (containerDetector.isRunningInContainer()) {
-            // Honors FLOCI_HOSTNAME (e.g. http://floci:4566) so the sibling container
-            // reaches Floci over the shared Docker network, not its own localhost.
+    /**
+     * The endpoint the UI's API server uses to reach Floci from inside its container.
+     *
+     * <p>Reuses {@link DockerHostResolver}, the same mechanism Lambda and CodeBuild use:
+     * when Floci runs in a container the sibling UI reaches it directly by Floci's own
+     * container IP over the shared Docker network (no {@code host.docker.internal}, no
+     * manual {@code FLOCI_HOSTNAME}); when Floci runs on the host the only path from a
+     * container is the host gateway ({@code host.docker.internal}). An explicitly
+     * configured {@code FLOCI_HOSTNAME} still wins so name-based compose setups keep
+     * working.
+     */
+    String resolveFlociEndpoint() {
+        if (containerDetector.isRunningInContainer() && config.hostname().isPresent()) {
             return config.effectiveBaseUrl();
         }
-        return "http://host.docker.internal:" + config.port();
+        String scheme = config.tls().enabled() ? "https" : "http";
+        return scheme + "://" + dockerHostResolver.resolve() + ":" + config.port();
     }
 
     private Optional<String> resolveDockerNetwork() {

@@ -271,7 +271,7 @@ floci:
       enabled: true
       image: "floci/floci-ui:latest"
       container-name: floci-ui
-      port: 8080
+      port: 4500
       keep-running-on-shutdown: false
     bedrock-runtime:
       enabled: true

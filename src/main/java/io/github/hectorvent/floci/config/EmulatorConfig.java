@@ -860,7 +860,7 @@ public interface EmulatorConfig {
         String containerName();
 
         /** Single fixed host port the UI is published on (single-instance service). */
-        @WithDefault("8080")
+        @WithDefault("4500")
         int port();
 
         @WithDefault("false")
