@@ -104,7 +104,7 @@ public class S3Controller {
     // --- Bucket operations ---
 
     @GET
-    @Produces({MediaType.TEXT_HTML, MediaType.APPLICATION_XML})
+    @Produces({MediaType.APPLICATION_XML, MediaType.TEXT_HTML})
     public Response listBuckets(@HeaderParam("X-Amz-Target") String target,
                                 @HeaderParam("Accept") String accept) {
         if (target != null) {
@@ -133,7 +133,7 @@ public class S3Controller {
                    .end("Bucket");
             }
             xml.end("Buckets").end("ListAllMyBucketsResult");
-            return Response.ok(xml.build()).build();
+            return Response.ok(xml.build()).type(MediaType.APPLICATION_XML).build();
         } catch (AwsException e) {
             return xmlErrorResponse(e);
         }
