@@ -48,11 +48,13 @@ jobs:
 
       - name: Build native executable
         run: |
-          EXTRA_ARGS="-Dquarkus.native.additional-build-args-append=\"-march=armv8-a\""
+          PROFILE_ARG=""
           if [[ -n "${{ github.event.inputs.profile }}" ]]; then
-            EXTRA_ARGS="$EXTRA_ARGS -Dquarkus.profile=${{ github.event.inputs.profile }}"
+            PROFILE_ARG="-Dquarkus.profile=${{ github.event.inputs.profile }}"
           fi
-          mvn clean package -Dnative -DskipTests -B $EXTRA_ARGS
+          mvn clean package -Dnative -DskipTests -B \
+            -Dquarkus.native.additional-build-args="-march=armv8-a" \
+            $PROFILE_ARG
 
       - name: Verify binary
         run: |
