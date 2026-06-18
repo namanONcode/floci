@@ -52,9 +52,7 @@ jobs:
           if [[ -n "${{ github.event.inputs.profile }}" ]]; then
             PROFILE_ARG="-Dquarkus.profile=${{ github.event.inputs.profile }}"
           fi
-          mvn clean package -Dnative -DskipTests -B \
-            -Dquarkus.native.additional-build-args="-march=armv8-a" \
-            $PROFILE_ARG
+          mvn clean package -Dnative -DskipTests -B $PROFILE_ARG
 
       - name: Verify binary
         run: |
