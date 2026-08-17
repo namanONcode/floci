@@ -84,6 +84,11 @@ public class Ec2QueryHandler {
                 case "GetManagedPrefixListEntries" -> handleGetManagedPrefixListEntries(params, region);
                 case "ModifyManagedPrefixList" -> handleModifyManagedPrefixList(params, region);
                 case "DeleteManagedPrefixList" -> handleDeleteManagedPrefixList(params, region);
+                // Transit Gateways
+                case "CreateTransitGateway" -> handleCreateTransitGateway(params, region);
+                case "DescribeTransitGateways" -> handleDescribeTransitGateways(params, region);
+                case "ModifyTransitGateway" -> handleModifyTransitGateway(params, region);
+                case "DeleteTransitGateway" -> handleDeleteTransitGateway(params, region);
                 case "CreateDefaultVpc" -> handleCreateDefaultVpc(params, region);
                 case "AssociateVpcCidrBlock" -> handleAssociateVpcCidrBlock(params, region);
                 case "DisassociateVpcCidrBlock" -> handleDisassociateVpcCidrBlock(params, region);
@@ -1181,6 +1186,119 @@ public class Ec2QueryHandler {
         return xmlResponse(xml.build());
     }
 
+    private Response handleCreateTransitGateway(MultivaluedMap<String, String> p, String region) {
+        TransitGateway gateway = service.createTransitGateway(
+                region,
+                p.getFirst("Description"),
+                parseTransitGatewayOptions(p, "Options"),
+                parseTagsForResource(p, "transit-gateway"));
+        XmlBuilder xml = new XmlBuilder()
+                .start("CreateTransitGatewayResponse", AwsNamespaces.EC2)
+                .elem("requestId", UUID.randomUUID().toString())
+                .start("transitGateway").raw(transitGatewayXml(gateway)).end("transitGateway")
+                .end("CreateTransitGatewayResponse");
+        return xmlResponse(xml.build());
+    }
+
+    private Response handleDescribeTransitGateways(MultivaluedMap<String, String> p, String region) {
+        List<TransitGateway> gateways = service.describeTransitGateways(
+                region, getList(p, "TransitGatewayIds"), getFilters(p));
+        XmlBuilder xml = new XmlBuilder()
+                .start("DescribeTransitGatewaysResponse", AwsNamespaces.EC2)
+                .elem("requestId", UUID.randomUUID().toString())
+                .start("transitGatewaySet");
+        for (TransitGateway gateway : gateways) {
+            xml.start("item").raw(transitGatewayXml(gateway)).end("item");
+        }
+        xml.end("transitGatewaySet").end("DescribeTransitGatewaysResponse");
+        return xmlResponse(xml.build());
+    }
+
+    private Response handleModifyTransitGateway(MultivaluedMap<String, String> p, String region) {
+        TransitGateway gateway = service.modifyTransitGateway(
+                region,
+                p.getFirst("TransitGatewayId"),
+                p.getFirst("Description"),
+                parseTransitGatewayOptions(p, "Options"),
+                getList(p, "Options.AddTransitGatewayCidrBlocks"),
+                getList(p, "Options.RemoveTransitGatewayCidrBlocks"));
+        XmlBuilder xml = new XmlBuilder()
+                .start("ModifyTransitGatewayResponse", AwsNamespaces.EC2)
+                .elem("requestId", UUID.randomUUID().toString())
+                // Verified against a live account: modify echoes the gateway without its tagSet,
+                // unlike create and describe.
+                .start("transitGateway").raw(transitGatewayXml(gateway, false)).end("transitGateway")
+                .end("ModifyTransitGatewayResponse");
+        return xmlResponse(xml.build());
+    }
+
+    private Response handleDeleteTransitGateway(MultivaluedMap<String, String> p, String region) {
+        TransitGateway gateway = service.deleteTransitGateway(region, p.getFirst("TransitGatewayId"));
+        XmlBuilder xml = new XmlBuilder()
+                .start("DeleteTransitGatewayResponse", AwsNamespaces.EC2)
+                .elem("requestId", UUID.randomUUID().toString())
+                .start("transitGateway").raw(transitGatewayXml(gateway, false)).end("transitGateway")
+                .end("DeleteTransitGatewayResponse");
+        return xmlResponse(xml.build());
+    }
+
+    private TransitGatewayOptions parseTransitGatewayOptions(MultivaluedMap<String, String> p, String prefix) {
+        TransitGatewayOptions options = new TransitGatewayOptions();
+        options.setAmazonSideAsn(longOrNull(p, prefix + ".AmazonSideAsn"));
+        options.setAutoAcceptSharedAttachments(p.getFirst(prefix + ".AutoAcceptSharedAttachments"));
+        options.setDefaultRouteTableAssociation(p.getFirst(prefix + ".DefaultRouteTableAssociation"));
+        options.setAssociationDefaultRouteTableId(p.getFirst(prefix + ".AssociationDefaultRouteTableId"));
+        options.setDefaultRouteTablePropagation(p.getFirst(prefix + ".DefaultRouteTablePropagation"));
+        options.setPropagationDefaultRouteTableId(p.getFirst(prefix + ".PropagationDefaultRouteTableId"));
+        options.setVpnEcmpSupport(p.getFirst(prefix + ".VpnEcmpSupport"));
+        options.setDnsSupport(p.getFirst(prefix + ".DnsSupport"));
+        options.setSecurityGroupReferencingSupport(p.getFirst(prefix + ".SecurityGroupReferencingSupport"));
+        options.setMulticastSupport(p.getFirst(prefix + ".MulticastSupport"));
+        options.setTransitGatewayCidrBlocks(getList(p, prefix + ".TransitGatewayCidrBlocks"));
+        return options;
+    }
+
+    private String transitGatewayXml(TransitGateway gateway) {
+        return transitGatewayXml(gateway, true);
+    }
+
+    private String transitGatewayXml(TransitGateway gateway, boolean includeTags) {
+        XmlBuilder xml = new XmlBuilder()
+                .elem("transitGatewayId", gateway.getTransitGatewayId())
+                .elem("transitGatewayArn", gateway.getTransitGatewayArn())
+                .elem("state", gateway.getState())
+                .elem("ownerId", gateway.getOwnerId())
+                .elem("description", gateway.getDescription())
+                .elem("creationTime", gateway.getCreationTime())
+                .start("options")
+                .elem("amazonSideAsn", String.valueOf(gateway.getOptions().getAmazonSideAsn()));
+        List<String> cidrBlocks = gateway.getOptions().getTransitGatewayCidrBlocks();
+        // AWS omits the member entirely rather than sending an empty set.
+        if (cidrBlocks != null && !cidrBlocks.isEmpty()) {
+            // A plain string list (ValueStringList), so each item carries the CIDR as its own text
+            // rather than wrapping it in an element.
+            xml.start("transitGatewayCidrBlocks");
+            for (String cidr : cidrBlocks) {
+                xml.elem("item", cidr);
+            }
+            xml.end("transitGatewayCidrBlocks");
+        }
+        xml.elem("autoAcceptSharedAttachments", gateway.getOptions().getAutoAcceptSharedAttachments())
+                .elem("defaultRouteTableAssociation", gateway.getOptions().getDefaultRouteTableAssociation())
+                .elem("associationDefaultRouteTableId", gateway.getOptions().getAssociationDefaultRouteTableId())
+                .elem("defaultRouteTablePropagation", gateway.getOptions().getDefaultRouteTablePropagation())
+                .elem("propagationDefaultRouteTableId", gateway.getOptions().getPropagationDefaultRouteTableId())
+                .elem("vpnEcmpSupport", gateway.getOptions().getVpnEcmpSupport())
+                .elem("dnsSupport", gateway.getOptions().getDnsSupport())
+                .elem("securityGroupReferencingSupport", gateway.getOptions().getSecurityGroupReferencingSupport())
+                .elem("multicastSupport", gateway.getOptions().getMulticastSupport())
+                .end("options");
+        if (includeTags) {
+            xml.raw(tagSetXml(gateway.getTags()));
+        }
+        return xml.build();
+    }
+
     private String managedPrefixListXml(ManagedPrefixList list) {
         XmlBuilder xml = new XmlBuilder()
                 .elem("prefixListId", list.getPrefixListId())
@@ -1544,6 +1662,30 @@ public class Ec2QueryHandler {
         List<String> owners = getList(p, "Owner");
         Map<String, List<String>> filters = getFilters(p);
         List<Image> images = service.describeImages(region, imageIds, owners, filters);
+        // CDK's MachineImage.lookup is a synth-time context provider that queries
+        // by a `name` wildcard and aborts `cdk deploy` if the response is empty.
+        // When a wildcard name filter matches no seeded AMI, synthesize one that
+        // satisfies it, so the lookup resolves — the exact id is a runtime detail.
+        if (images.isEmpty() && imageIds.isEmpty() && filters.containsKey("name")) {
+            // A filter's values are an OR, so the wildcard is whichever value carries one rather
+            // than whichever comes first. Taking the first outright meant an exact value ahead of
+            // a wildcard skipped synthesis and the lookup got nothing.
+            String namePattern = filters.get("name").stream()
+                    .filter(v -> v != null && (v.contains("*") || v.contains("?")))
+                    .findFirst()
+                    .orElse(null);
+            if (namePattern != null) {
+                Image synthesized = synthesizeLookupImage(namePattern, filters, owners);
+                // Only hand it back if it satisfies everything that was asked for. Returning an
+                // AMI that violates the request is worse than the empty result the lookup would
+                // otherwise get, and the caller cannot tell the difference. Owner.N is carried
+                // outside the filter set, so it has to be checked separately.
+                if (service.imageMatchesFilters(synthesized, filters)
+                        && service.imageMatchesOwners(synthesized, owners)) {
+                    images = List.of(synthesized);
+                }
+            }
+        }
         XmlBuilder xml = new XmlBuilder()
                 .start("DescribeImagesResponse", AwsNamespaces.EC2)
                 .elem("requestId", UUID.randomUUID().toString())
@@ -1570,6 +1712,93 @@ public class Ec2QueryHandler {
         }
         xml.end("imagesSet").end("DescribeImagesResponse");
         return xmlResponse(xml.build());
+    }
+
+    /** Stands in for a {@code *} when turning a lookup pattern into a concrete name. */
+    private static final String SYNTH_WILDCARD_TOKEN = "20260101";
+
+    /** Stands in for a {@code ?}, which matches exactly one character. */
+    private static final String SYNTH_SINGLE_CHAR_TOKEN = "0";
+
+    /** AWS's own account for the Amazon-owned AMIs, and the default when no owner is requested. */
+    private static final String AMAZON_OWNER_ID = "137112412989";
+
+    /** The account behind the {@code aws-marketplace} owner alias. */
+    private static final String AWS_MARKETPLACE_OWNER_ID = "679593333241";
+
+    /**
+     * The owner the synthesized image should carry. {@code Owner.N} takes the aliases {@code self},
+     * {@code amazon} and {@code aws-marketplace} as well as bare account ids, and an alias written
+     * through verbatim produced an image owned by the literal string. AWS always reports an account
+     * id in {@code imageOwnerId}, so each alias resolves to the account it names.
+     */
+    private String resolveSynthOwner(Map<String, List<String>> filters, List<String> owners) {
+        // An owner-alias filter names an account just as much as Owner.N does, so it is consulted
+        // before the default. Without that, filtering on owner-alias alone produced an image
+        // carrying that alias beside the default Amazon account id, contradicting itself the same
+        // way an unresolved alias did in the other direction.
+        String requested = filters.getOrDefault("owner-id", owners == null ? List.of() : owners)
+                .stream().findFirst()
+                .orElseGet(() -> firstFilterValue(filters, "owner-alias", AMAZON_OWNER_ID));
+        return switch (requested) {
+            case "self" -> config.defaultAccountId();
+            case "amazon" -> AMAZON_OWNER_ID;
+            case "aws-marketplace" -> AWS_MARKETPLACE_OWNER_ID;
+            default -> requested;
+        };
+    }
+
+    /**
+     * The alias that belongs to a resolved owner account, or null when the account has none. AWS
+     * only sets imageOwnerAlias for its own published images, so defaulting it to amazon reported
+     * ownership contradicting the owner id whenever the scope named anything else.
+     */
+    private static String aliasForOwner(String ownerId) {
+        return switch (ownerId) {
+            case AMAZON_OWNER_ID -> "amazon";
+            case AWS_MARKETPLACE_OWNER_ID -> "aws-marketplace";
+            default -> null;
+        };
+    }
+
+    /** The requested value for a scalar filter, so the synthesized image satisfies it. */
+    private static String firstFilterValue(Map<String, List<String>> filters, String name, String fallback) {
+        return filters.getOrDefault(name, List.of()).stream()
+                .filter(v -> v != null && !v.contains("*") && !v.contains("?"))
+                .findFirst()
+                .orElse(fallback);
+    }
+
+    /**
+     * Builds an AMI that satisfies a lookup's name wildcard and its owner and architecture filters.
+     * The id is a hash of the pattern, so repeated lookups resolve to the same image.
+     */
+    private Image synthesizeLookupImage(String namePattern, Map<String, List<String>> filters, List<String> owners) {
+        Image img = new Image();
+        // 17 hex chars after "ami-", deterministic from the pattern.
+        String hash = String.format("%08x", namePattern.hashCode() & 0x7fffffff);
+        String id17 = (hash + hash + hash).substring(0, 17);
+        img.setImageId("ami-" + id17);
+        // Substitute each wildcard rather than truncating at the first one, so an infix pattern
+        // like ubuntu-*-20.04-* yields a name that still satisfies it. Truncating produced
+        // "ubuntu-20260101", which does not. A ? takes exactly one character, so leaving it in
+        // place would hand back a name the requesting filter no longer matches.
+        img.setName(namePattern
+                .replace("*", SYNTH_WILDCARD_TOKEN)
+                .replace("?", SYNTH_SINGLE_CHAR_TOKEN));
+        img.setState(firstFilterValue(filters, "state", "available"));
+        String ownerId = resolveSynthOwner(filters, owners);
+        img.setOwnerId(ownerId);
+        img.setImageOwnerAlias(firstFilterValue(filters, "owner-alias", aliasForOwner(ownerId)));
+        img.setPublic(true);
+        img.setArchitecture(firstFilterValue(filters, "architecture", "x86_64"));
+        img.setRootDeviceType(firstFilterValue(filters, "root-device-type", "ebs"));
+        img.setRootDeviceName(firstFilterValue(filters, "root-device-name", "/dev/xvda"));
+        img.setVirtualizationType(firstFilterValue(filters, "virtualization-type", "hvm"));
+        img.setHypervisor(firstFilterValue(filters, "hypervisor", "xen"));
+        img.setDescription("Synthesized AMI for MachineImage.lookup(" + namePattern + ")");
+        img.setCreationDate("2026-01-01T00:00:00.000Z");
+        return img;
     }
 
     private Response handleCreateImage(MultivaluedMap<String, String> p, String region) {

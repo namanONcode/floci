@@ -12,6 +12,11 @@ import io.github.hectorvent.floci.services.eks.EksController;
 import io.github.hectorvent.floci.services.mwaa.MwaaController;
 import io.github.hectorvent.floci.services.iot.IotController;
 import io.github.hectorvent.floci.services.iot.IotDataController;
+import io.github.hectorvent.floci.services.bedrockagentcore.BedrockAgentCoreController;
+import io.github.hectorvent.floci.services.bedrockagentcorecontrol.BedrockAgentCoreControlController;
+import io.github.hectorvent.floci.services.bedrockagentcorecontrol.BedrockAgentCoreGatewayController;
+import io.github.hectorvent.floci.services.bedrockagentcorecontrol.BedrockAgentCoreIdentityController;
+import io.github.hectorvent.floci.services.bedrockagentcorecontrol.BedrockAgentCoreMemoryController;
 import io.github.hectorvent.floci.services.pipes.PipesController;
 import io.github.hectorvent.floci.services.lambda.LambdaController;
 import io.github.hectorvent.floci.services.lambdamicrovms.LambdaMicrovmsController;
@@ -23,6 +28,7 @@ import io.github.hectorvent.floci.services.route53.Route53Controller;
 import io.github.hectorvent.floci.services.ses.SesController;
 import io.github.hectorvent.floci.services.appsync.AppSyncController;
 import io.github.hectorvent.floci.services.rdsdata.RdsDataController;
+import io.github.hectorvent.floci.services.guardduty.GuardDutyController;
 import io.github.hectorvent.floci.services.rum.RumController;
 import io.github.hectorvent.floci.services.s3vectors.S3VectorsController;
 import io.github.hectorvent.floci.services.s3tables.S3TablesController;
@@ -296,6 +302,19 @@ public class ResolvedServiceCatalog {
                         "pipes", config.storage().mode(), 5000L, null, ServiceProtocol.REST_JSON,
                         protocols(ServiceProtocol.REST_JSON),
                         Set.of(), Set.of("pipes"), Set.of(), Set.of(PipesController.class)),
+                descriptor("bedrock-agentcore-control", "bedrock-agentcore-control",
+                        config.services().bedrockAgentCoreControl().enabled(), true,
+                        "bedrockagentcore", config.storage().mode(), 5000L, null, ServiceProtocol.REST_JSON,
+                        protocols(ServiceProtocol.REST_JSON),
+                        Set.of(), Set.of("bedrock-agentcore"), Set.of(),
+                        Set.of(BedrockAgentCoreControlController.class, BedrockAgentCoreIdentityController.class,
+                                BedrockAgentCoreGatewayController.class, BedrockAgentCoreMemoryController.class)),
+                descriptor("bedrock-agentcore", "bedrock-agentcore",
+                        config.services().bedrockAgentCore().enabled(), true,
+                        null, null, 5000L, null, ServiceProtocol.REST_JSON,
+                        protocols(ServiceProtocol.REST_JSON),
+                        Set.of(), Set.of(), Set.of(),
+                        Set.of(BedrockAgentCoreController.class)),
                 descriptor("elasticloadbalancing", "elbv2", config.services().elbv2().enabled(), true,
                         "elbv2", config.storage().mode(), 5000L, AwsNamespaces.ELB_V2, ServiceProtocol.QUERY,
                         protocols(ServiceProtocol.QUERY),
@@ -443,7 +462,13 @@ public class ResolvedServiceCatalog {
                         "rum", storageMode(config.storage().services().rum().mode(), config.storage().mode()),
                         config.storage().services().rum().flushIntervalMs(), null, ServiceProtocol.REST_JSON,
                         protocols(ServiceProtocol.REST_JSON),
-                        Set.of(), Set.of("rum"), Set.of(), Set.of(RumController.class))
+                        Set.of(), Set.of("rum"), Set.of(), Set.of(RumController.class)),
+                descriptor("guardduty", "guardduty", config.services().guardduty().enabled(), true,
+                        "guardduty",
+                        storageMode(config.storage().services().guardduty().mode(), config.storage().mode()),
+                        config.storage().services().guardduty().flushIntervalMs(), null, ServiceProtocol.REST_JSON,
+                        protocols(ServiceProtocol.REST_JSON),
+                        Set.of(), Set.of("guardduty"), Set.of(), Set.of(GuardDutyController.class))
         ));
     }
 

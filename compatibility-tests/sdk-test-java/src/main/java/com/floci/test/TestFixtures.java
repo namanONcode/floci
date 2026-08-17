@@ -26,6 +26,7 @@ import software.amazon.awssdk.services.lambda.LambdaClient;
 import software.amazon.awssdk.services.opensearch.OpenSearchClient;
 import software.amazon.awssdk.services.neptune.NeptuneClient;
 import software.amazon.awssdk.services.rds.RdsClient;
+import software.amazon.awssdk.services.guardduty.GuardDutyClient;
 import software.amazon.awssdk.services.rum.RumClient;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.endpoints.Endpoint;
@@ -57,6 +58,8 @@ import software.amazon.awssdk.services.elasticbeanstalk.ElasticBeanstalkClient;
 import software.amazon.awssdk.services.acm.AcmClient;
 import software.amazon.awssdk.services.ec2.Ec2Client;
 import software.amazon.awssdk.services.ecr.EcrClient;
+import software.amazon.awssdk.services.bedrockagentcore.BedrockAgentCoreClient;
+import software.amazon.awssdk.services.bedrockagentcorecontrol.BedrockAgentCoreControlClient;
 import software.amazon.awssdk.services.pipes.PipesClient;
 import software.amazon.awssdk.services.codebuild.CodeBuildClient;
 import software.amazon.awssdk.services.codedeploy.CodeDeployClient;
@@ -717,6 +720,14 @@ public final class TestFixtures {
                 .build();
     }
 
+    public static GuardDutyClient guardDutyClient() {
+        return GuardDutyClient.builder()
+                .endpointOverride(ENDPOINT)
+                .region(REGION)
+                .credentialsProvider(CREDENTIALS)
+                .build();
+    }
+
     public static NeptuneClient neptuneClient() {
         return NeptuneClient.builder()
                 .endpointOverride(ENDPOINT)
@@ -839,6 +850,22 @@ public final class TestFixtures {
 
     public static PipesClient pipesClient() {
         return PipesClient.builder()
+                .endpointOverride(ENDPOINT)
+                .region(REGION)
+                .credentialsProvider(CREDENTIALS)
+                .build();
+    }
+
+    public static BedrockAgentCoreControlClient bedrockAgentCoreControlClient() {
+        return BedrockAgentCoreControlClient.builder()
+                .endpointOverride(ENDPOINT)
+                .region(REGION)
+                .credentialsProvider(CREDENTIALS)
+                .build();
+    }
+
+    public static BedrockAgentCoreClient bedrockAgentCoreClient() {
+        return BedrockAgentCoreClient.builder()
                 .endpointOverride(ENDPOINT)
                 .region(REGION)
                 .credentialsProvider(CREDENTIALS)

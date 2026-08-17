@@ -65,6 +65,8 @@ floci:
         flush-interval-ms: 60000
       rum:
         flush-interval-ms: 60000
+      guardduty:
+        flush-interval-ms: 60000
 
   auth:
     validate-signatures: false
@@ -177,6 +179,8 @@ floci:
       enabled: true
     firehose:
       enabled: true
+      tick-interval-seconds: 10
+      flush-record-count: 0
     kms:
       enabled: true
     cognito:
@@ -216,6 +220,7 @@ floci:
       max-published-ports-per-instance: 20
       socat-image: alpine/socat
       mock: true
+      aws-faithful-private-ip: false
     ecs:
       enabled: true
       mock: true
@@ -303,4 +308,6 @@ floci:
       enabled: true
     cloudhsmv2:
     rum:
+      enabled: true
+    guardduty:
       enabled: true
