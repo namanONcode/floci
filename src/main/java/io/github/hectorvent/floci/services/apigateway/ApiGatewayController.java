@@ -2106,6 +2106,10 @@ public class ApiGatewayController {
         node.put("routeKey", r.getRouteKey());
         node.put("authorizationType", r.getAuthorizationType());
         if (r.getAuthorizerId() != null) node.put("authorizerId", r.getAuthorizerId());
+        if (r.getAuthorizationScopes() != null && !r.getAuthorizationScopes().isEmpty()) {
+            ArrayNode scopes = node.putArray("authorizationScopes");
+            r.getAuthorizationScopes().forEach(scopes::add);
+        }
         if (r.getTarget() != null) node.put("target", r.getTarget());
         if (r.getRouteResponseSelectionExpression() != null) node.put("routeResponseSelectionExpression", r.getRouteResponseSelectionExpression());
         return node;
@@ -2176,6 +2180,10 @@ public class ApiGatewayController {
         if (s.getStageVariables() != null) {
             ObjectNode stageVariables = node.putObject("stageVariables");
             s.getStageVariables().forEach(stageVariables::put);
+        }
+        if (s.getTags() != null && !s.getTags().isEmpty()) {
+            ObjectNode tags = node.putObject("tags");
+            s.getTags().forEach(tags::put);
         }
         return node;
     }

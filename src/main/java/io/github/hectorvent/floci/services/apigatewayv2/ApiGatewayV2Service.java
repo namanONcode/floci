@@ -361,6 +361,9 @@ public class ApiGatewayV2Service {
         route.setRouteKey((String) request.get("routeKey"));
         route.setAuthorizationType((String) request.getOrDefault("authorizationType", "NONE"));
         route.setAuthorizerId((String) request.get("authorizerId"));
+        @SuppressWarnings("unchecked")
+        List<String> authorizationScopes = (List<String>) request.get("authorizationScopes");
+        route.setAuthorizationScopes(authorizationScopes);
         route.setTarget((String) request.get("target"));
         route.setRouteResponseSelectionExpression((String) request.get("routeResponseSelectionExpression"));
 
@@ -395,6 +398,11 @@ public class ApiGatewayV2Service {
         }
         if (request.containsKey("authorizerId") && request.get("authorizerId") != null) {
             route.setAuthorizerId((String) request.get("authorizerId"));
+        }
+        if (request.containsKey("authorizationScopes") && request.get("authorizationScopes") != null) {
+            @SuppressWarnings("unchecked")
+            List<String> authorizationScopes = (List<String>) request.get("authorizationScopes");
+            route.setAuthorizationScopes(authorizationScopes);
         }
         if (request.containsKey("target") && request.get("target") != null) {
             route.setTarget((String) request.get("target"));
@@ -584,6 +592,12 @@ public class ApiGatewayV2Service {
         @SuppressWarnings("unchecked")
         Map<String, String> stageVariables = (Map<String, String>) request.get("stageVariables");
         stage.setStageVariables(stageVariables);
+
+        @SuppressWarnings("unchecked")
+        Map<String, String> tags = (Map<String, String>) request.get("tags");
+        if (tags != null) {
+            stage.setTags(ReservedTags.stripApiGatewayReservedTags(tags));
+        }
 
         stageStore.put(stageKey(region, apiId, stage.getStageName()), stage);
         LOG.infov("Created stage: {0} for API {1}", stage.getStageName(), apiId);

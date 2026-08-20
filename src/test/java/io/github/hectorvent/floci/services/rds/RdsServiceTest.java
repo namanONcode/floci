@@ -123,6 +123,8 @@ class RdsServiceTest {
 
         when(containerManager.start(any(), any(), any(), any(), any(), any(), any(), any(), any()))
                 .thenReturn(new RdsContainerHandle("cont-id", "id", "localhost", 5432));
+        when(ec2Service.resolveDefaultVpcId(any()))
+                .thenAnswer(invocation -> Ec2Service.defaultVpcId(invocation.getArgument(0)));
         when(ec2Service.describeSubnets(any(), anyList(), any()))
                 .thenAnswer(invocation -> {
                     @SuppressWarnings("unchecked")
@@ -525,6 +527,23 @@ class RdsServiceTest {
     }
 
     @Test
+    void modifyDbInstanceAppliesAutoMinorVersionUpgrade() {
+        // #2420 review: ModifyDBInstance silently dropped this - created true (the AWS
+        // default), an explicit modify to false must actually take effect and stick on a
+        // later read, not just get echoed back unchanged.
+        rdsService.createDbInstance("mydb", "postgres", "13",
+                "admin", "original-password", "dbname", "db.t3.micro",
+                20, false, null, null, null, null, false);
+
+        DbInstance modified = rdsService.modifyDbInstance(
+                "mydb", null, null, null, List.of(), null, null, false);
+        assertFalse(modified.isAutoMinorVersionUpgrade());
+
+        DbInstance described = rdsService.getDbInstance("mydb");
+        assertFalse(described.isAutoMinorVersionUpgrade());
+    }
+
+    @Test
     void modifyDbInstanceRejectsMissingDbSubnetGroup() {
         rdsService.createDbInstance("mydb", "postgres", "13",
                 "admin", "original-password", "dbname", "db.t3.micro",
@@ -656,12 +675,17 @@ class RdsServiceTest {
 
     @Test
     void tagOperationsRejectUnsupportedResourceArn() {
-        AwsException exception = assertThrows(AwsException.class, () ->
+        // Parameter groups are tagged now, so an absent one is a missing resource rather than a
+        // missing feature. A type Floci still does not model keeps the limitation message.
+        AwsException absentGroup = assertThrows(AwsException.class, () ->
                 rdsService.listTagsForResource("arn:aws:rds:us-east-1:123456789012:pg:some-parameter-group"));
+        assertEquals("DBParameterGroupNotFound", absentGroup.getErrorCode());
 
-        assertEquals("InvalidParameterValue", exception.getErrorCode());
+        AwsException unsupportedType = assertThrows(AwsException.class, () ->
+                rdsService.listTagsForResource("arn:aws:rds:us-east-1:123456789012:snapshot:some-snapshot"));
+        assertEquals("InvalidParameterValue", unsupportedType.getErrorCode());
         // The type is valid on real AWS; the message must present this as a Floci limitation.
-        assertTrue(exception.getMessage().contains("not yet implemented by Floci"));
+        assertTrue(unsupportedType.getMessage().contains("not yet implemented by Floci"));
     }
 
     @Test
@@ -1109,6 +1133,40 @@ class RdsServiceTest {
                 "regional-pg", "us-west-2").getDescription());
         assertEquals("west", rdsService.getDbClusterParameterGroup(
                 "regional-cpg", "us-west-2").getDescription());
+    }
+
+    @Test
+    void aParameterGroupPersistedWithoutAnArnGetsOneOnFirstRead() {
+        // Only creation assigned the ARN, so a group written by an earlier version would never
+        // get one — and the ARN is what a caller tags by, so the group could not be tagged at all.
+        String accountId = "123456789012";
+        InMemoryStorage<String, DbParameterGroup> rawParameterGroups = new InMemoryStorage<>();
+        InMemoryStorage<String, DbClusterParameterGroup> rawClusterParameterGroups =
+                new InMemoryStorage<>();
+        rawParameterGroups.put("legacy-pg", new DbParameterGroup(
+                "legacy-pg", "postgres16", "legacy"));
+        rawClusterParameterGroups.put("legacy-cpg", new DbClusterParameterGroup(
+                "legacy-cpg", "aurora-postgresql16", "legacy"));
+        RdsService service = new RdsService(
+                containerManager, proxyManager, ec2Service,
+                new RegionResolver("us-east-1", accountId), config,
+                new InMemoryStorage<>(), new InMemoryStorage<>(),
+                new AccountAwareStorageBackend<>(rawParameterGroups, null, accountId),
+                new AccountAwareStorageBackend<>(rawClusterParameterGroups, null, accountId),
+                new InMemoryStorage<>());
+
+        assertEquals("arn:aws:rds:us-east-1:" + accountId + ":pg:legacy-pg",
+                service.getDbParameterGroup("legacy-pg", "us-east-1").getDbParameterGroupArn());
+        assertEquals("arn:aws:rds:us-east-1:" + accountId + ":cluster-pg:legacy-cpg",
+                service.getDbClusterParameterGroup("legacy-cpg", "us-east-1")
+                        .getDbClusterParameterGroupArn());
+
+        // And with an ARN it can be tagged, which is the point of backfilling it.
+        service.addTagsToResource(
+                "arn:aws:rds:us-east-1:" + accountId + ":cluster-pg:legacy-cpg",
+                Map.of("env", "upgraded"), "us-east-1");
+        assertEquals(Map.of("env", "upgraded"), service.listTagsForResource(
+                "arn:aws:rds:us-east-1:" + accountId + ":cluster-pg:legacy-cpg", "us-east-1"));
     }
 
     @Test
@@ -4294,7 +4352,7 @@ class RdsServiceTest {
             String id, String engine, String engineVersion, String optionGroupName) {
         return rdsService.createDbInstance(id, engine, engineVersion, "admin", "password",
                 "dbname", "db.t3.micro", 20, false, null, null, null, null, false, false,
-                null, Map.of(), List.of(), optionGroupName, null);
+                null, Map.of(), List.of(), optionGroupName, null, true);
     }
 
     private RdsService newService(RdsContainerManager containerManager,

@@ -95,6 +95,7 @@ public class RdsQueryHandler {
                 case "ModifyDBProxyTargetGroup" -> handleModifyDbProxyTargetGroup(params, region);
                 case "DescribeDBProxyTargets" -> handleDescribeDbProxyTargets(params, region);
                 case "DescribeDBClusterSnapshots" -> handleDescribeDbClusterSnapshots(params);
+                case "DescribeGlobalClusters" -> handleDescribeGlobalClusters(params);
                 case "AddTagsToResource" -> handleAddTagsToResource(params, region);
                 case "ListTagsForResource" -> handleListTagsForResource(params, region);
                 case "RemoveTagsFromResource" -> handleRemoveTagsFromResource(params, region);
@@ -136,6 +137,9 @@ public class RdsQueryHandler {
         Map<String, String> tags = parseTags(params);
         String availabilityZone = params.getFirst("AvailabilityZone");
         boolean multiAz = "true".equalsIgnoreCase(params.getFirst("MultiAZ"));
+        // AWS defaults this to true when the request omits it - unlike most boolean flags here,
+        // which default to false.
+        boolean autoMinorVersionUpgrade = !"false".equalsIgnoreCase(params.getFirst("AutoMinorVersionUpgrade"));
 
         if (dbInstanceClass == null) {
             dbInstanceClass = "db.t3.micro";
@@ -150,7 +154,7 @@ public class RdsQueryHandler {
                     masterPassword, dbName, dbInstanceClass, allocatedStorage, iamEnabled,
                     paramGroupName, dbSubnetGroupName, dbClusterIdentifier, availabilityZone, multiAz,
                     manageMasterUserPassword, masterUserSecretKmsKeyId, tags, vpcSecurityGroupIds,
-                    optionGroupName, region);
+                    optionGroupName, region, autoMinorVersionUpgrade);
             String result = dbInstanceXml(instance);
             return Response.ok(AwsQueryResponse.envelope("CreateDBInstance", AwsNamespaces.RDS, result)).build();
         } catch (AwsException e) {
@@ -220,11 +224,14 @@ public class RdsQueryHandler {
         Boolean iamEnabled = iamStr != null ? Boolean.parseBoolean(iamStr) : null;
         String dbSubnetGroupName = params.getFirst("DBSubnetGroupName");
         String optionGroupName = params.getFirst("OptionGroupName");
+        String autoMinorVersionUpgradeStr = params.getFirst("AutoMinorVersionUpgrade");
+        Boolean autoMinorVersionUpgrade = autoMinorVersionUpgradeStr != null
+                ? Boolean.parseBoolean(autoMinorVersionUpgradeStr) : null;
         try {
             List<String> vpcSecurityGroupIds = vpcSecurityGroupIds(params);
             DbInstance instance = service.modifyDbInstance(
                     id, newPassword, iamEnabled, dbSubnetGroupName,
-                    vpcSecurityGroupIds, optionGroupName, region);
+                    vpcSecurityGroupIds, optionGroupName, region, autoMinorVersionUpgrade);
             String result = dbInstanceXml(instance);
             return Response.ok(AwsQueryResponse.envelope("ModifyDBInstance", AwsNamespaces.RDS, result)).build();
         } catch (AwsException e) {
@@ -474,6 +481,11 @@ public class RdsQueryHandler {
         try {
             DbParameterGroup group = service.createDbParameterGroup(
                     name, family, description, region);
+            // Tags given at create are readable back on a live account.
+            Map<String, String> tags = parseTags(params);
+            if (!tags.isEmpty()) {
+                service.addTagsToResource(group.getDbParameterGroupArn(), tags, region);
+            }
             String result = paramGroupXml(group);
             return Response.ok(AwsQueryResponse.envelope("CreateDBParameterGroup", AwsNamespaces.RDS, result)).build();
         } catch (AwsException e) {
@@ -575,6 +587,10 @@ public class RdsQueryHandler {
         try {
             DbClusterParameterGroup group = service.createDbClusterParameterGroup(
                     name, family, description, region);
+            Map<String, String> tags = parseTags(params);
+            if (!tags.isEmpty()) {
+                service.addTagsToResource(group.getDbClusterParameterGroupArn(), tags, region);
+            }
             String result = clusterParamGroupXml(group);
             return Response.ok(AwsQueryResponse.envelope("CreateDBClusterParameterGroup", AwsNamespaces.RDS, result)).build();
         } catch (AwsException e) {
@@ -1096,6 +1112,41 @@ public class RdsQueryHandler {
         return xml.build();
     }
 
+    private Response handleDescribeGlobalClusters(MultivaluedMap<String, String> params) {
+        // Global clusters are not modeled. Both providers read this on every cluster read, and
+        // DocumentDB signs with the "rds" scope, so this handler answers for either service.
+        // MaxRecords is rejected before the identifier is looked up, and a marker after it —
+        // the order a live account applies them in.
+        String maxRecords = params.getFirst("MaxRecords");
+        if (maxRecords != null && !maxRecords.isBlank()) {
+            int max = -1;
+            try {
+                max = Integer.parseInt(maxRecords.trim());
+            } catch (NumberFormatException e) {
+                LOG.debugv("Non-numeric MaxRecords {0} on DescribeGlobalClusters", maxRecords);
+            }
+            if (max < 20 || max > 100) {
+                throw new AwsException("InvalidParameterValue",
+                        "Invalid value " + maxRecords + " for MaxRecords. Must be between 20 and 100", 400);
+            }
+        }
+        String identifier = params.getFirst("GlobalClusterIdentifier");
+        if (identifier != null && !identifier.isBlank()) {
+            // Naming one is a different question from listing none, and AWS errors on it.
+            throw new AwsException("GlobalClusterNotFoundFault",
+                    "Global cluster '" + identifier + "' not found", 404);
+        }
+        // No page is ever handed out, so any marker a caller presents came from somewhere else.
+        String marker = params.getFirst("Marker");
+        if (marker != null && !marker.isBlank()) {
+            throw new AwsException("InvalidParameterValue", "The request token is invalid.", 400);
+        }
+        // Filters are not validated: the answer is empty for every name AWS accepts, and a partial
+        // list of accepted names would reject filters a live account allows.
+        String result = new XmlBuilder().start("GlobalClusters").end("GlobalClusters").build();
+        return Response.ok(AwsQueryResponse.envelope("DescribeGlobalClusters", AwsNamespaces.RDS, result)).build();
+    }
+
     private Response handleDescribeDbClusterSnapshots(MultivaluedMap<String, String> params) {
         // DB cluster snapshots are not modeled; return the RDS Query API's wire-accurate
         // empty result (empty <DBClusterSnapshots> wrapper, no <Marker>) so SDK clients
@@ -1134,6 +1185,7 @@ public class RdsQueryHandler {
         }
         xml.elem("IAMDatabaseAuthenticationEnabled", i.isIamDatabaseAuthenticationEnabled())
            .elem("MultiAZ", i.isMultiAz())
+           .elem("AutoMinorVersionUpgrade", i.isAutoMinorVersionUpgrade())
            .elem("StorageType", "gp2")
            .elem("PubliclyAccessible", false)
            .elem("AvailabilityZone", i.getAvailabilityZone() != null ? i.getAvailabilityZone() : config.defaultAvailabilityZone())
@@ -1371,6 +1423,7 @@ public class RdsQueryHandler {
                 .elem("DBParameterGroupName", g.getDbParameterGroupName())
                 .elem("DBParameterGroupFamily", g.getDbParameterGroupFamily())
                 .elem("Description", g.getDescription())
+                .elem("DBParameterGroupArn", g.getDbParameterGroupArn())
                 .build();
     }
 
@@ -1473,6 +1526,7 @@ public class RdsQueryHandler {
                 .elem("DBClusterParameterGroupName", g.getDbClusterParameterGroupName())
                 .elem("DBParameterGroupFamily", g.getDbParameterGroupFamily())
                 .elem("Description", g.getDescription())
+                .elem("DBClusterParameterGroupArn", g.getDbClusterParameterGroupArn())
                 .build();
     }
 
@@ -1639,7 +1693,10 @@ public class RdsQueryHandler {
             if (key == null) {
                 break;
             }
-            tags.put(key, params.getFirst(prefix + "." + i + ".Value"));
+            // A key given without a value is stored as an empty value, as AWS stores it —
+            // a null would also break the immutable copy the read hands back.
+            String value = params.getFirst(prefix + "." + i + ".Value");
+            tags.put(key, value == null ? "" : value);
         }
     }
 

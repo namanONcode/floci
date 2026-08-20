@@ -210,7 +210,7 @@ class RdsQueryHandlerTest {
         when(service.listDbInstances(null, "us-west-2")).thenReturn(List.of());
         when(service.getDbInstance("mydb", "us-west-2")).thenReturn(instance);
         when(service.modifyDbInstance(
-                eq("mydb"), isNull(), isNull(), isNull(), anyList(), isNull(), eq("us-west-2")))
+                eq("mydb"), isNull(), isNull(), isNull(), anyList(), isNull(), eq("us-west-2"), isNull()))
                 .thenReturn(instance);
         when(service.rebootDbInstance("mydb", "us-west-2")).thenReturn(instance);
         when(service.listDbClusters(null, "us-west-2")).thenReturn(List.of());
@@ -235,7 +235,7 @@ class RdsQueryHandlerTest {
         verify(service).getDbInstance("mydb", "us-west-2");
         verify(service).deleteDbInstance("mydb", "us-west-2");
         verify(service).modifyDbInstance(
-                eq("mydb"), isNull(), isNull(), isNull(), anyList(), isNull(), eq("us-west-2"));
+                eq("mydb"), isNull(), isNull(), isNull(), anyList(), isNull(), eq("us-west-2"), isNull());
         verify(service).rebootDbInstance("mydb", "us-west-2");
         verify(service).listDbClusters(null, "us-west-2");
         verify(service).getDbCluster("mycluster", "us-west-2");
@@ -348,7 +348,7 @@ class RdsQueryHandlerTest {
         when(service.createDbInstance(eq("mydb"), eq("postgres"), eq("16.3"),
                 eq(null), eq(null), eq(null), eq("db.t3.micro"),
                 eq(20), eq(false), eq(null), eq(null), eq(null), eq(null), eq(false), eq(false), eq(null),
-                eq(java.util.Map.of("example:ClusterId", "cluster-a", "Name", "mydb")), eq(List.of()), isNull(), isNull()))
+                eq(java.util.Map.of("example:ClusterId", "cluster-a", "Name", "mydb")), eq(List.of()), isNull(), isNull(), eq(true)))
                 .thenReturn(instance);
 
         MultivaluedMap<String, String> p = params();
@@ -362,7 +362,7 @@ class RdsQueryHandlerTest {
 
         verify(service).createDbInstance("mydb", "postgres", "16.3",
                 null, null, null, "db.t3.micro", 20, false, null, null, null, null, false, false, null,
-                java.util.Map.of("example:ClusterId", "cluster-a", "Name", "mydb"), List.of(), null, null);
+                java.util.Map.of("example:ClusterId", "cluster-a", "Name", "mydb"), List.of(), null, null, true);
     }
 
     @Test
@@ -372,7 +372,7 @@ class RdsQueryHandlerTest {
         when(service.createDbInstance(eq("mydb"), eq("postgres"), eq("16.3"),
                 eq(null), eq(null), eq(null), eq("db.t3.micro"),
                 eq(20), eq(false), eq(null), eq(null), eq(null), eq(null), eq(false), eq(false), eq(null),
-                eq(java.util.Map.of()), eq(List.of("sg-123", "sg-456")), isNull(), isNull()))
+                eq(java.util.Map.of()), eq(List.of("sg-123", "sg-456")), isNull(), isNull(), eq(true)))
                 .thenReturn(instance);
 
         MultivaluedMap<String, String> p = params();
@@ -387,7 +387,7 @@ class RdsQueryHandlerTest {
         assertTrue(body.contains("<VpcSecurityGroupId>sg-456</VpcSecurityGroupId>"));
         verify(service).createDbInstance("mydb", "postgres", "16.3",
                 null, null, null, "db.t3.micro", 20, false, null, null, null, null, false, false, null,
-                java.util.Map.of(), List.of("sg-123", "sg-456"), null, null);
+                java.util.Map.of(), List.of("sg-123", "sg-456"), null, null, true);
     }
 
     @Test
@@ -403,7 +403,7 @@ class RdsQueryHandlerTest {
         assertTrue(((String) response.getEntity()).contains("InvalidParameterValue"));
         verify(service, never()).createDbInstance(any(), any(), any(), any(), any(), any(), any(),
                 anyInt(), anyBoolean(), any(), any(), any(), any(), anyBoolean(), anyBoolean(),
-                any(), any(), any(), any(), any());
+                any(), any(), any(), any(), any(), anyBoolean());
     }
 
     @Test
@@ -503,7 +503,7 @@ class RdsQueryHandlerTest {
         when(service.createDbInstance(eq("mydb"), eq("postgres"), eq("16.3"),
                 eq("admin"), eq("secret"), eq("dbname"), eq("db.t3.micro"),
                 eq(20), eq(false), eq(null), eq(null), eq(null), eq(null), eq(false), eq(false),
-                eq(null), eq(java.util.Map.of()), eq(List.of()), isNull(), isNull()))
+                eq(null), eq(java.util.Map.of()), eq(List.of()), isNull(), isNull(), eq(true)))
                 .thenReturn(instance);
 
         MultivaluedMap<String, String> p = params();
@@ -517,7 +517,7 @@ class RdsQueryHandlerTest {
 
         verify(service).createDbInstance("mydb", "postgres", "16.3",
                 "admin", "secret", "dbname", "db.t3.micro", 20, false, null, null, null, null, false, false,
-                null, java.util.Map.of(), List.of(), null, null);
+                null, java.util.Map.of(), List.of(), null, null, true);
     }
 
     @Test
@@ -529,7 +529,7 @@ class RdsQueryHandlerTest {
         when(service.createDbInstance(eq("mydb"), eq("postgres"), eq("16.3"),
                 eq("admin"), eq(null), eq("dbname"), eq("db.t3.micro"),
                 eq(20), eq(false), eq(null), eq(null), eq(null), eq(null), eq(false), eq(true),
-                eq("kms-key-1"), eq(java.util.Map.of()), eq(List.of()), isNull(), isNull()))
+                eq("kms-key-1"), eq(java.util.Map.of()), eq(List.of()), isNull(), isNull(), eq(true)))
                 .thenReturn(instance);
 
         MultivaluedMap<String, String> p = params();
@@ -548,7 +548,7 @@ class RdsQueryHandlerTest {
         assertTrue(body.contains("<KmsKeyId>kms-key-1</KmsKeyId>"));
         verify(service).createDbInstance("mydb", "postgres", "16.3",
                 "admin", null, "dbname", "db.t3.micro", 20, false, null, null, null, null, false, true,
-                "kms-key-1", java.util.Map.of(), List.of(), null, null);
+                "kms-key-1", java.util.Map.of(), List.of(), null, null, true);
     }
 
     @Test
@@ -561,7 +561,7 @@ class RdsQueryHandlerTest {
         when(service.createDbInstance(eq("mydb"), eq("postgres"), eq("16.3"),
                 eq("admin"), eq("secret"), eq("dbname"), eq("db.t3.micro"),
                 eq(20), eq(false), eq(null), eq("default"), eq(null), eq("ap-northeast-1a"), eq(true),
-                eq(false), eq(null), eq(java.util.Map.of()), eq(List.of()), isNull(), isNull()))
+                eq(false), eq(null), eq(java.util.Map.of()), eq(List.of()), isNull(), isNull(), eq(true)))
                 .thenReturn(instance);
 
         MultivaluedMap<String, String> p = params();
@@ -585,11 +585,33 @@ class RdsQueryHandlerTest {
     }
 
     @Test
+    void createDbInstance_honorsExplicitAutoMinorVersionUpgradeFalse() {
+        DbInstance instance = makeInstance("mydb");
+        instance.setAutoMinorVersionUpgrade(false);
+        when(service.createDbInstance(eq("mydb"), eq("postgres"), eq("16.3"),
+                eq(null), eq(null), eq(null), eq("db.t3.micro"),
+                eq(20), eq(false), eq(null), eq(null), eq(null), eq(null), eq(false),
+                eq(false), eq(null), eq(java.util.Map.of()), eq(List.of()), isNull(), isNull(), eq(false)))
+                .thenReturn(instance);
+
+        MultivaluedMap<String, String> p = params();
+        p.add("DBInstanceIdentifier", "mydb");
+        p.add("Engine", "postgres");
+        p.add("AutoMinorVersionUpgrade", "false");
+
+        Response response = handler.handle("CreateDBInstance", p);
+
+        assertEquals(200, response.getStatus());
+        String body = (String) response.getEntity();
+        assertTrue(body.contains("<AutoMinorVersionUpgrade>false</AutoMinorVersionUpgrade>"));
+    }
+
+    @Test
     void createDbInstance_unknownSubnetGroupShouldFailValidation() {
         when(service.createDbInstance(eq("mydb"), eq("postgres"), eq("16.3"),
                 eq("admin"), eq("secret"), eq("dbname"), eq("db.t3.micro"),
                 eq(20), eq(false), eq(null), eq("missing-subnet-group"), eq(null), eq(null), eq(false),
-                eq(false), eq(null), eq(java.util.Map.of()), eq(List.of()), isNull(), isNull()))
+                eq(false), eq(null), eq(java.util.Map.of()), eq(List.of()), isNull(), isNull(), eq(true)))
                 .thenThrow(new AwsException("DBSubnetGroupNotFoundFault",
                         "DB subnet group missing-subnet-group not found.", 404));
 
@@ -681,7 +703,7 @@ class RdsQueryHandlerTest {
         when(service.createDbInstance(eq("mydb"), eq("oracle"), eq("1.0"),
                 eq(null), eq(null), eq(null), eq("db.t3.micro"),
                 eq(20), eq(false), eq(null), eq(null), eq(null), eq(null), eq(false), eq(false),
-                eq(null), eq(java.util.Map.of()), eq(List.of()), isNull(), isNull()))
+                eq(null), eq(java.util.Map.of()), eq(List.of()), isNull(), isNull(), eq(true)))
                 .thenThrow(new AwsException("InvalidParameterValue",
                         "Unsupported engine: oracle. Supported: postgres, mysql, mariadb.", 400));
 
@@ -905,6 +927,108 @@ class RdsQueryHandlerTest {
         assertTrue(body.contains("<DescribeDBClusterSnapshotsResult>"));
         assertTrue(body.contains("<DBClusterSnapshots></DBClusterSnapshots>"));
         assertFalse(body.contains("<Marker>"));
+    }
+
+    // ─────────────────────────── Global clusters ───────────────────────────────
+
+    @Test
+    void describeGlobalClusters_returnsEmptyListWith200() {
+        // The RDS and DocumentDB providers both read this on every cluster read, and DocumentDB
+        // signs with the "rds" scope, so this handler answers for both. A live account with no
+        // global clusters answers with an empty list, not an error.
+        Response response = handler.handle("DescribeGlobalClusters", params());
+
+        String body = (String) response.getEntity();
+        assertEquals(200, response.getStatus());
+        assertTrue(body.contains("<DescribeGlobalClustersResult>"));
+        assertTrue(body.contains("<GlobalClusters></GlobalClusters>"));
+        assertTrue(body.contains("rds.amazonaws.com/doc/2014-10-31"));
+    }
+
+    @Test
+    void describeGlobalClusters_unknownIdentifierIsNotFound() {
+        // Naming one that does not exist is a different question from listing none, and AWS
+        // answers it with GlobalClusterNotFoundFault rather than an empty list.
+        MultivaluedMap<String, String> params = params();
+        params.putSingle("GlobalClusterIdentifier", "no-such-gc");
+
+        Response response = handler.handle("DescribeGlobalClusters", params);
+
+        String body = (String) response.getEntity();
+        assertEquals(404, response.getStatus());
+        assertTrue(body.contains("<Code>GlobalClusterNotFoundFault</Code>"));
+        assertTrue(body.contains("Global cluster &apos;no-such-gc&apos; not found"));
+    }
+
+    @Test
+    void describeGlobalClusters_blankIdentifierListsRatherThanFailing() {
+        // An empty form field is the SDK omitting the filter, not a request for a cluster named "".
+        MultivaluedMap<String, String> params = params();
+        params.putSingle("GlobalClusterIdentifier", "");
+
+        Response response = handler.handle("DescribeGlobalClusters", params);
+
+        assertEquals(200, response.getStatus());
+        assertTrue(((String) response.getEntity()).contains("<GlobalClusters></GlobalClusters>"));
+    }
+
+    @Test
+    void describeGlobalClusters_rejectsMaxRecordsOutsideTheAllowedRange() {
+        // A live account rejects this before it looks the identifier up, so an empty model is no
+        // reason to accept a value AWS refuses.
+        for (String value : new String[]{"5", "101", "abc"}) {
+            MultivaluedMap<String, String> params = params();
+            params.putSingle("MaxRecords", value);
+            params.putSingle("GlobalClusterIdentifier", "no-such-gc");
+
+            Response response = handler.handle("DescribeGlobalClusters", params);
+
+            assertEquals(400, response.getStatus(), "MaxRecords=" + value);
+            String body = (String) response.getEntity();
+            assertTrue(body.contains("Invalid value " + value + " for MaxRecords"), body);
+        }
+    }
+
+    @Test
+    void describeGlobalClusters_acceptsMaxRecordsInsideTheAllowedRange() {
+        MultivaluedMap<String, String> params = params();
+        params.putSingle("MaxRecords", "20");
+
+        Response response = handler.handle("DescribeGlobalClusters", params);
+
+        assertEquals(200, response.getStatus());
+    }
+
+    @Test
+    void describeGlobalClusters_rejectsAMarkerItNeverIssued() {
+        // No page is ever handed out, so a marker cannot have come from here. AWS checks this
+        // after the identifier, which is why the not-found wins when both are present.
+        MultivaluedMap<String, String> params = params();
+        params.putSingle("Marker", "bogus");
+
+        Response response = handler.handle("DescribeGlobalClusters", params);
+
+        assertEquals(400, response.getStatus());
+        assertTrue(((String) response.getEntity()).contains("The request token is invalid."));
+
+        params.putSingle("GlobalClusterIdentifier", "no-such-gc");
+        Response withBoth = handler.handle("DescribeGlobalClusters", params);
+        assertEquals(404, withBoth.getStatus());
+        assertTrue(((String) withBoth.getEntity()).contains("GlobalClusterNotFoundFault"));
+    }
+
+    @Test
+    void describeGlobalClusters_acceptsFiltersWithoutValidatingThem() {
+        // Every filter name AWS accepts answers empty here, and Floci carries no list of the
+        // accepted names — rejecting one would refuse a filter a live account allows.
+        MultivaluedMap<String, String> params = params();
+        params.putSingle("Filters.Filter.1.Name", "db-cluster-id");
+        params.putSingle("Filters.Filter.1.Values.Value.1", "anything");
+
+        Response response = handler.handle("DescribeGlobalClusters", params);
+
+        assertEquals(200, response.getStatus());
+        assertTrue(((String) response.getEntity()).contains("<GlobalClusters></GlobalClusters>"));
     }
 
     // ──────────────────────────── DBProxy wire shapes ──────────────────────────
@@ -1808,7 +1932,7 @@ class RdsQueryHandlerTest {
         DbInstance instance = makeInstance("mydb");
         when(service.createDbInstance(any(), any(), any(), any(), any(), any(), any(),
                 anyInt(), anyBoolean(), any(), any(), any(), any(), anyBoolean(), anyBoolean(),
-                any(), any(), anyList(), any(), any()))
+                any(), any(), anyList(), any(), any(), anyBoolean()))
                 .thenReturn(instance);
 
         MultivaluedMap<String, String> p = params();
@@ -1820,7 +1944,7 @@ class RdsQueryHandlerTest {
         assertEquals(200, response.getStatus());
         verify(service).createDbInstance(eq("mydb"), eq("mysql"), any(), any(), any(), any(),
                 any(), anyInt(), anyBoolean(), any(), any(), any(), any(), anyBoolean(),
-                anyBoolean(), any(), any(), anyList(), eq("og1"), any());
+                anyBoolean(), any(), any(), anyList(), eq("og1"), any(), anyBoolean());
     }
 
     // ──────────────────────────── Helpers ────────────────────────────
