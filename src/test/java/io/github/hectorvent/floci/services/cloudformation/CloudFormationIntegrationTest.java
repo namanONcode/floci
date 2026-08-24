@@ -1797,6 +1797,106 @@ class CloudFormationIntegrationTest {
         throw new AssertionError("Stack did not reach DELETE_COMPLETE within timeout");
     }
 
+    // Regression: issue #1966. A resource removed outside CloudFormation must be treated as
+    // already deleted, even when its provisioner does not have a resource-specific safe delete.
+    @Test
+    void deleteStack_withAlreadyDeletedApiGatewayRestApi_reachesDeleteComplete() throws Exception {
+        String stackName = "cfn-1966-missing-rest-api";
+        String template = """
+            {
+              "Resources": {
+                "RestApi": {
+                  "Type": "AWS::ApiGateway::RestApi",
+                  "Properties": {
+                    "Name": "cfn-1966-missing-rest-api"
+                  }
+                }
+              }
+            }
+            """;
+
+        String createResponse = given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody", template)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<StackId>"))
+            .extract().asString();
+        String stackArn = createResponse.substring(
+                createResponse.indexOf("<StackId>") + "<StackId>".length(), createResponse.indexOf("</StackId>"));
+
+        boolean created = false;
+        long createDeadline = System.currentTimeMillis() + 10_000;
+        while (System.currentTimeMillis() < createDeadline) {
+            String statusXml = given()
+                .contentType("application/x-www-form-urlencoded")
+                .formParam("Action", "DescribeStacks")
+                .formParam("StackName", stackArn)
+            .when()
+                .post("/")
+            .then()
+                .statusCode(200)
+            .extract().asString();
+            if (statusXml.contains("<StackStatus>CREATE_COMPLETE</StackStatus>")) {
+                created = true;
+                break;
+            }
+            Thread.sleep(200);
+        }
+        assertThat("Stack did not reach CREATE_COMPLETE within timeout", created, equalTo(true));
+
+        String resourcesXml = given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStackResources")
+            .formParam("StackName", stackArn)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract().asString();
+        String apiId = physicalIdByLogicalId(resourcesXml, "RestApi");
+
+        // Simulate state loss or an out-of-band delete. API Gateway reports NotFoundException (404)
+        // when CloudFormation later tries to delete the tracked physical ID.
+        given()
+        .when()
+            .delete("/restapis/" + apiId)
+        .then()
+            .statusCode(202);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DeleteStack")
+            .formParam("StackName", stackName)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        long deleteDeadline = System.currentTimeMillis() + 10_000;
+        while (System.currentTimeMillis() < deleteDeadline) {
+            String statusXml = given()
+                .contentType("application/x-www-form-urlencoded")
+                .formParam("Action", "DescribeStacks")
+                .formParam("StackName", stackArn)
+            .when()
+                .post("/")
+            .then()
+                .statusCode(200)
+                .extract().asString();
+            if (statusXml.contains("<StackStatus>DELETE_COMPLETE</StackStatus>")) {
+                return;
+            }
+            assertThat(statusXml, not(containsString("<StackStatus>DELETE_FAILED</StackStatus>")));
+            Thread.sleep(200);
+        }
+        throw new AssertionError("Stack did not reach DELETE_COMPLETE within timeout");
+    }
+
     @Test
     void describeDeletedStack_byArn_expiresAfterRetentionWindow() throws Exception {
         String template = """
@@ -6989,6 +7089,88 @@ class CloudFormationIntegrationTest {
         getRoutes(apiId).body("Items.size()", equalTo(1))
                 .body("Items[0].RouteId", equalTo(routeId))
                 .body("Items[0].AuthorizerId", equalTo(authorizerId));
+    }
+
+    // ── PR #2011 follow-up: AWS::ApiGatewayV2::Route AuthorizationScopes pass-through ──
+
+    @Test
+    void apiGatewayV2RouteAuthorizationScopesProvisionedAndClearedOnUpdate() {
+        // %s slot holds the AuthorizationScopes property line ("" to omit it entirely).
+        String template = """
+            {
+              "Resources": {
+                "HttpApi": {
+                  "Type": "AWS::ApiGatewayV2::Api",
+                  "Properties": { "Name": "cfn-apigwv2-scopes-api", "ProtocolType": "HTTP" }
+                },
+                "Authorizer": {
+                  "Type": "AWS::ApiGatewayV2::Authorizer",
+                  "Properties": {
+                    "ApiId": { "Ref": "HttpApi" },
+                    "Name": "cfn-jwt-scopes-authorizer",
+                    "AuthorizerType": "JWT",
+                    "IdentitySource": ["$request.header.Authorization"],
+                    "JwtConfiguration": {
+                      "Audience": ["my-client-id"],
+                      "Issuer": "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_xxxxx"
+                    }
+                  }
+                },
+                "Route": {
+                  "Type": "AWS::ApiGatewayV2::Route",
+                  "Properties": {
+                    "ApiId": { "Ref": "HttpApi" },
+                    "RouteKey": "GET /scoped",
+                    "AuthorizationType": "JWT",
+                    "AuthorizerId": { "Ref": "Authorizer" },
+                    %s
+                    "Target": "integrations/none"
+                  }
+                }
+              },
+              "Outputs": {
+                "ApiId": { "Value": { "Ref": "HttpApi" } },
+                "RouteId": { "Value": { "Ref": "Route" } }
+              }
+            }
+            """;
+
+        String stackName = "cfn-apigwv2-route-scopes-stack";
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody", template.formatted(
+                    "\"AuthorizationScopes\": [\"orders/read\", \"orders/write\"],"))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        String createXml = apigwv2DescribeStacks(stackName);
+        String apiId = apigwOutputValue(createXml, "ApiId");
+        String routeId = apigwOutputValue(createXml, "RouteId");
+
+        getRoutes(apiId).body("Items.size()", equalTo(1))
+                .body("Items[0].RouteId", equalTo(routeId))
+                .body("Items[0].AuthorizationScopes", contains("orders/read", "orders/write"));
+
+        // Removing the property from the template clears the scopes in place.
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "UpdateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody", template.formatted(""))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        apigwv2DescribeStacks(stackName);
+        getRoutes(apiId).body("Items.size()", equalTo(1))
+                .body("Items[0].RouteId", equalTo(routeId))
+                .body("Items[0].AuthorizationScopes", nullValue());
     }
 
     @Test

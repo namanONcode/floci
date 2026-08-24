@@ -93,10 +93,12 @@ nav:
     - Managed Service for Apache Flink: services/kinesisanalytics.md
     - Secrets Manager: services/secrets-manager.md
     - CloudFormation: services/cloudformation.md
+    - Cloud Control API: services/cloudcontrol.md
     - Step Functions: services/step-functions.md
     - SWF: services/swf.md
     - IAM: services/iam.md
     - STS: services/sts.md
+    - Organizations: services/organizations.md
     - ElastiCache: services/elasticache.md
     - MemoryDB: services/memorydb.md
     - RDS: services/rds.md
@@ -135,6 +137,7 @@ nav:
     - CodeDeploy: services/codedeploy.md
     - CodePipeline: services/codepipeline.md
     - AWS Backup: services/backup.md
+    - AWS FIS: services/fis.md
     - CloudTrail: services/cloudtrail.md
     - CloudFront: services/cloudfront.md
     - Route53: services/route53.md
@@ -145,6 +148,7 @@ nav:
     - AWS Config: services/config.md
     - CloudTrail: services/cloudtrail.md
     - EMR: services/emr.md
+    - EMR Serverless: services/emr-serverless.md
     - WAF v2: services/wafv2.md
     - Textract: services/textract.md
     - Transcribe: services/transcribe.md

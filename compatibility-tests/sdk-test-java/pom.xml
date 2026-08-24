@@ -213,6 +213,11 @@
             <groupId>software.amazon.awssdk</groupId>
             <artifactId>cloudhsmv2</artifactId>
         </dependency>
+        <!-- Organizations client -->
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>organizations</artifactId>
+        </dependency>
         <!-- Cloud Map (servicediscovery) client -->
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
@@ -257,6 +262,10 @@
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
             <artifactId>rum</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>fis</artifactId>
         </dependency>
         <!-- GuardDuty client -->
         <dependency>
