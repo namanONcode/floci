@@ -16,37 +16,51 @@ import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.MethodSource;
 import software.amazon.awssdk.services.glue.GlueClient;
 import software.amazon.awssdk.services.glue.model.CheckSchemaVersionValidityRequest;
+import software.amazon.awssdk.services.glue.model.CheckSchemaVersionValidityResponse;
 import software.amazon.awssdk.services.glue.model.Compatibility;
 import software.amazon.awssdk.services.glue.model.CreateRegistryRequest;
+import software.amazon.awssdk.services.glue.model.CreateRegistryResponse;
 import software.amazon.awssdk.services.glue.model.CreateSchemaRequest;
+import software.amazon.awssdk.services.glue.model.CreateSchemaResponse;
 import software.amazon.awssdk.services.glue.model.DataFormat;
 import software.amazon.awssdk.services.glue.model.DeleteRegistryRequest;
 import software.amazon.awssdk.services.glue.model.DeleteSchemaRequest;
 import software.amazon.awssdk.services.glue.model.DeleteSchemaVersionsRequest;
+import software.amazon.awssdk.services.glue.model.DeleteSchemaVersionsResponse;
 import software.amazon.awssdk.services.glue.model.EntityNotFoundException;
 import software.amazon.awssdk.services.glue.model.GetRegistryRequest;
 import software.amazon.awssdk.services.glue.model.GetSchemaByDefinitionRequest;
+import software.amazon.awssdk.services.glue.model.GetSchemaByDefinitionResponse;
 import software.amazon.awssdk.services.glue.model.GetSchemaRequest;
 import software.amazon.awssdk.services.glue.model.GetSchemaVersionRequest;
+import software.amazon.awssdk.services.glue.model.GetSchemaVersionResponse;
 import software.amazon.awssdk.services.glue.model.GetSchemaVersionsDiffRequest;
+import software.amazon.awssdk.services.glue.model.GetSchemaVersionsDiffResponse;
 import software.amazon.awssdk.services.glue.model.GetTagsRequest;
 import software.amazon.awssdk.services.glue.model.InvalidInputException;
 import software.amazon.awssdk.services.glue.model.ListRegistriesRequest;
+import software.amazon.awssdk.services.glue.model.ListSchemaVersionsResponse;
 import software.amazon.awssdk.services.glue.model.ListSchemasRequest;
 import software.amazon.awssdk.services.glue.model.ListSchemaVersionsRequest;
 import software.amazon.awssdk.services.glue.model.MetadataKeyValuePair;
 import software.amazon.awssdk.services.glue.model.PutSchemaVersionMetadataRequest;
+import software.amazon.awssdk.services.glue.model.PutSchemaVersionMetadataResponse;
 import software.amazon.awssdk.services.glue.model.QuerySchemaVersionMetadataRequest;
+import software.amazon.awssdk.services.glue.model.QuerySchemaVersionMetadataResponse;
 import software.amazon.awssdk.services.glue.model.RegisterSchemaVersionRequest;
+import software.amazon.awssdk.services.glue.model.RegisterSchemaVersionResponse;
 import software.amazon.awssdk.services.glue.model.RegistryId;
 import software.amazon.awssdk.services.glue.model.RemoveSchemaVersionMetadataRequest;
+import software.amazon.awssdk.services.glue.model.RemoveSchemaVersionMetadataResponse;
 import software.amazon.awssdk.services.glue.model.SchemaDiffType;
 import software.amazon.awssdk.services.glue.model.SchemaId;
 import software.amazon.awssdk.services.glue.model.SchemaVersionNumber;
 import software.amazon.awssdk.services.glue.model.TagResourceRequest;
 import software.amazon.awssdk.services.glue.model.UntagResourceRequest;
 import software.amazon.awssdk.services.glue.model.UpdateRegistryRequest;
+import software.amazon.awssdk.services.glue.model.UpdateRegistryResponse;
 import software.amazon.awssdk.services.glue.model.UpdateSchemaRequest;
+import software.amazon.awssdk.services.glue.model.UpdateSchemaResponse;
 
 import java.util.HashMap;
 import java.util.Map;
@@ -146,6 +160,24 @@ class GlueSchemaRegistryTest {
                     + "message Customer {\n"
                     + "  int64 id = 1;\n"
                     + "  string email = 2;\n"
+                    + "}\n";
+
+    private static final String PROTOBUF_SCHEMA_RESPACED =
+            "syntax   =   \"proto3\";\n"
+                    + "\n"
+                    + "package   com.floci;\n"
+                    + "\n"
+                    + "message Customer {\n"
+                    + "\n"
+                    + "  int64 id=1;\n"
+                    + "    string   email   =   2;\n"
+                    + "}\n";
+
+    private static final String PROTOBUF_SCHEMA_INVALID =
+            "syntax = \"proto3\";\n"
+                    + "package com.floci;\n"
+                    + "message Customer {\n"
+                    + "  int64 id = ;\n"
                     + "}\n";
 
     private static final String JSON_COMPAT_BASE_CLOSED =
@@ -274,7 +306,7 @@ class GlueSchemaRegistryTest {
         String schemaName = TestFixtures.uniqueName("default-orders");
 
         try (GlueClient glue = TestFixtures.glueClient()) {
-            var created = glue.createSchema(CreateSchemaRequest.builder()
+            CreateSchemaResponse created = glue.createSchema(CreateSchemaRequest.builder()
                     .schemaName(schemaName)
                     .dataFormat(DataFormat.AVRO)
                     .schemaDefinition(AVRO_V1)
@@ -288,7 +320,7 @@ class GlueSchemaRegistryTest {
 
                 assertThat(glue.getRegistry(GetRegistryRequest.builder().build()).registryName())
                         .isEqualTo(AWSSchemaRegistryConstants.DEFAULT_REGISTRY_NAME);
-                var updatedRegistry = glue.updateRegistry(UpdateRegistryRequest.builder()
+                UpdateRegistryResponse updatedRegistry = glue.updateRegistry(UpdateRegistryRequest.builder()
                         .registryId(RegistryId.builder()
                                 .registryName(AWSSchemaRegistryConstants.DEFAULT_REGISTRY_NAME)
                                 .build())
@@ -328,7 +360,7 @@ class GlueSchemaRegistryTest {
                     .registryName(registryName)
                     .build());
             try {
-                var json = glue.createSchema(CreateSchemaRequest.builder()
+                CreateSchemaResponse json = glue.createSchema(CreateSchemaRequest.builder()
                         .registryId(RegistryId.builder().registryName(registryName).build())
                         .schemaName(jsonSchemaName)
                         .dataFormat(DataFormat.JSON)
@@ -340,7 +372,7 @@ class GlueSchemaRegistryTest {
                         .schemaVersionId(json.schemaVersionId())
                         .build()).schemaDefinition()).isEqualTo(JSON_SCHEMA);
 
-                var protobuf = glue.createSchema(CreateSchemaRequest.builder()
+                CreateSchemaResponse protobuf = glue.createSchema(CreateSchemaRequest.builder()
                         .registryId(RegistryId.builder().registryName(registryName).build())
                         .schemaName(protobufSchemaName)
                         .dataFormat(DataFormat.PROTOBUF)
@@ -356,7 +388,7 @@ class GlueSchemaRegistryTest {
                         .dataFormat(DataFormat.JSON)
                         .schemaDefinition(JSON_SCHEMA)
                         .build()).valid()).isTrue();
-                var invalidJson = glue.checkSchemaVersionValidity(CheckSchemaVersionValidityRequest.builder()
+                CheckSchemaVersionValidityResponse invalidJson = glue.checkSchemaVersionValidity(CheckSchemaVersionValidityRequest.builder()
                         .dataFormat(DataFormat.JSON)
                         .schemaDefinition("{not-json")
                         .build());
@@ -367,6 +399,70 @@ class GlueSchemaRegistryTest {
                         .dataFormat(DataFormat.PROTOBUF)
                         .schemaDefinition(PROTOBUF_SCHEMA)
                         .build()).valid()).isTrue();
+            } finally {
+                glue.deleteRegistry(DeleteRegistryRequest.builder()
+                        .registryId(RegistryId.builder().registryName(registryName).build())
+                        .build());
+            }
+        }
+    }
+
+    /**
+     * Ensure the parser still links and runs after excluding KotlinPoet and ICU4j. Canonicalization is
+     * asserted by re-registering a whitespace-only variant. It resolves to the version already stored
+     * only when Wire reformatted both definitions, which the raw-definition fallback in the service
+     * would not do.
+     */
+    @Test
+    void sdkClientValidatesAndCanonicalizesProtobufSchemas() {
+        String registryName = TestFixtures.uniqueName("java-gsr-protobuf-validation");
+        String schemaName = TestFixtures.uniqueName("protobuf-validated");
+
+        try (GlueClient glue = TestFixtures.glueClient()) {
+            glue.createRegistry(CreateRegistryRequest.builder()
+                    .registryName(registryName)
+                    .build());
+            try {
+                CheckSchemaVersionValidityResponse invalid = glue.checkSchemaVersionValidity(CheckSchemaVersionValidityRequest.builder()
+                        .dataFormat(DataFormat.PROTOBUF)
+                        .schemaDefinition(PROTOBUF_SCHEMA_INVALID)
+                        .build());
+                assertThat(invalid.valid()).isFalse();
+                assertThat(invalid.error()).isNotBlank();
+
+                assertThatThrownBy(() -> glue.createSchema(CreateSchemaRequest.builder()
+                        .registryId(RegistryId.builder().registryName(registryName).build())
+                        .schemaName(TestFixtures.uniqueName("protobuf-invalid"))
+                        .dataFormat(DataFormat.PROTOBUF)
+                        .compatibility(Compatibility.NONE)
+                        .schemaDefinition(PROTOBUF_SCHEMA_INVALID)
+                        .build()))
+                        .isInstanceOf(InvalidInputException.class);
+
+                CreateSchemaResponse created = glue.createSchema(CreateSchemaRequest.builder()
+                        .registryId(RegistryId.builder().registryName(registryName).build())
+                        .schemaName(schemaName)
+                        .dataFormat(DataFormat.PROTOBUF)
+                        .compatibility(Compatibility.BACKWARD)
+                        .schemaDefinition(PROTOBUF_SCHEMA)
+                        .build());
+
+                RegisterSchemaVersionResponse reregistered = glue.registerSchemaVersion(RegisterSchemaVersionRequest.builder()
+                        .schemaId(SchemaId.builder()
+                                .registryName(registryName)
+                                .schemaName(schemaName)
+                                .build())
+                        .schemaDefinition(PROTOBUF_SCHEMA_RESPACED)
+                        .build());
+                assertThat(reregistered.schemaVersionId()).isEqualTo(created.schemaVersionId());
+                assertThat(reregistered.versionNumber()).isEqualTo(1L);
+
+                assertThat(glue.getSchema(GetSchemaRequest.builder()
+                        .schemaId(SchemaId.builder()
+                                .registryName(registryName)
+                                .schemaName(schemaName)
+                                .build())
+                        .build()).latestSchemaVersion()).isEqualTo(1L);
             } finally {
                 glue.deleteRegistry(DeleteRegistryRequest.builder()
                         .registryId(RegistryId.builder().registryName(registryName).build())
@@ -533,7 +629,7 @@ class GlueSchemaRegistryTest {
                         .schemaDefinition(AVRO_COMPAT_BASE)
                         .build());
 
-                var register = RegisterSchemaVersionRequest.builder()
+                RegisterSchemaVersionRequest register = RegisterSchemaVersionRequest.builder()
                         .schemaId(SchemaId.builder()
                                 .registryName(registryName)
                                 .schemaName(schemaName)
@@ -619,7 +715,7 @@ class GlueSchemaRegistryTest {
         String schemaName = TestFixtures.uniqueName("meta-schema");
 
         try (GlueClient glue = TestFixtures.glueClient()) {
-            var registry = glue.createRegistry(CreateRegistryRequest.builder()
+            CreateRegistryResponse registry = glue.createRegistry(CreateRegistryRequest.builder()
                     .registryName(registryName)
                     .tags(Map.of("env", "test"))
                     .build());
@@ -648,7 +744,7 @@ class GlueSchemaRegistryTest {
                         .doesNotContainKey("env")
                         .containsEntry("team", "platform");
 
-                var schema = glue.createSchema(CreateSchemaRequest.builder()
+                CreateSchemaResponse schema = glue.createSchema(CreateSchemaRequest.builder()
                         .registryId(RegistryId.builder().registryName(registryName).build())
                         .schemaName(schemaName)
                         .dataFormat(DataFormat.AVRO)
@@ -660,7 +756,7 @@ class GlueSchemaRegistryTest {
                         .resourceArn(schema.schemaArn())
                         .build()).tags()).containsEntry("purpose", "metadata");
 
-                var putMetadata = glue.putSchemaVersionMetadata(PutSchemaVersionMetadataRequest.builder()
+                PutSchemaVersionMetadataResponse putMetadata = glue.putSchemaVersionMetadata(PutSchemaVersionMetadataRequest.builder()
                         .schemaVersionId(schema.schemaVersionId())
                         .metadataKeyValue(MetadataKeyValuePair.builder()
                                 .metadataKey("stage")
@@ -670,7 +766,7 @@ class GlueSchemaRegistryTest {
                 assertThat(putMetadata.registryName()).isEqualTo(registryName);
                 assertThat(putMetadata.schemaName()).isEqualTo(schemaName);
                 assertThat(putMetadata.latestVersion()).isTrue();
-                var metadata = glue.querySchemaVersionMetadata(QuerySchemaVersionMetadataRequest.builder()
+                QuerySchemaVersionMetadataResponse metadata = glue.querySchemaVersionMetadata(QuerySchemaVersionMetadataRequest.builder()
                         .schemaVersionId(schema.schemaVersionId())
                         .build());
                 assertThat(metadata.metadataInfoMap()).containsKey("stage");
@@ -683,7 +779,7 @@ class GlueSchemaRegistryTest {
                                 .metadataValue("qa")
                                 .build())
                         .build());
-                var updatedMetadata = glue.querySchemaVersionMetadata(QuerySchemaVersionMetadataRequest.builder()
+                QuerySchemaVersionMetadataResponse updatedMetadata = glue.querySchemaVersionMetadata(QuerySchemaVersionMetadataRequest.builder()
                         .schemaVersionId(schema.schemaVersionId())
                         .metadataList(MetadataKeyValuePair.builder()
                                 .metadataKey("stage")
@@ -694,7 +790,7 @@ class GlueSchemaRegistryTest {
                 assertThat(updatedMetadata.metadataInfoMap().get("stage").otherMetadataValueList())
                         .anyMatch(item -> "prod".equals(item.metadataValue()));
 
-                var removeMetadata = glue.removeSchemaVersionMetadata(RemoveSchemaVersionMetadataRequest.builder()
+                RemoveSchemaVersionMetadataResponse removeMetadata = glue.removeSchemaVersionMetadata(RemoveSchemaVersionMetadataRequest.builder()
                         .schemaVersionId(schema.schemaVersionId())
                         .metadataKeyValue(MetadataKeyValuePair.builder()
                                 .metadataKey("stage")
@@ -704,7 +800,7 @@ class GlueSchemaRegistryTest {
                 assertThat(removeMetadata.registryName()).isEqualTo(registryName);
                 assertThat(removeMetadata.schemaName()).isEqualTo(schemaName);
                 assertThat(removeMetadata.latestVersion()).isTrue();
-                var afterRemoval = glue.querySchemaVersionMetadata(QuerySchemaVersionMetadataRequest.builder()
+                QuerySchemaVersionMetadataResponse afterRemoval = glue.querySchemaVersionMetadata(QuerySchemaVersionMetadataRequest.builder()
                         .schemaVersionId(schema.schemaVersionId())
                         .build());
                 assertThat(afterRemoval.metadataInfoMap().get("stage").metadataValue()).isEqualTo("prod");
@@ -722,13 +818,13 @@ class GlueSchemaRegistryTest {
         String schemaName = TestFixtures.uniqueName("orders");
 
         try (GlueClient glue = TestFixtures.glueClient()) {
-            var registry = glue.createRegistry(CreateRegistryRequest.builder()
+            CreateRegistryResponse registry = glue.createRegistry(CreateRegistryRequest.builder()
                     .registryName(registryName)
                     .build());
             assertThat(registry.registryName()).isEqualTo(registryName);
             assertThat(registry.registryArn()).contains(":registry/" + registryName);
 
-            var created = glue.createSchema(CreateSchemaRequest.builder()
+            CreateSchemaResponse created = glue.createSchema(CreateSchemaRequest.builder()
                     .registryId(RegistryId.builder().registryName(registryName).build())
                     .schemaName(schemaName)
                     .dataFormat(DataFormat.AVRO)
@@ -738,20 +834,20 @@ class GlueSchemaRegistryTest {
             assertThat(created.schemaName()).isEqualTo(schemaName);
             assertThat(created.schemaVersionId()).isNotBlank();
 
-            var registered = glue.registerSchemaVersion(RegisterSchemaVersionRequest.builder()
+            RegisterSchemaVersionResponse registered = glue.registerSchemaVersion(RegisterSchemaVersionRequest.builder()
                     .schemaId(SchemaId.builder().registryName(registryName).schemaName(schemaName).build())
                     .schemaDefinition(AVRO_V2)
                     .build());
             assertThat(registered.versionNumber()).isEqualTo(2L);
 
-            var byDefinition = glue.getSchemaByDefinition(GetSchemaByDefinitionRequest.builder()
+            GetSchemaByDefinitionResponse byDefinition = glue.getSchemaByDefinition(GetSchemaByDefinitionRequest.builder()
                     .schemaId(SchemaId.builder().registryName(registryName).schemaName(schemaName).build())
                     .schemaDefinition(AVRO_V2)
                     .build());
             assertThat(byDefinition.schemaVersionId()).isEqualTo(registered.schemaVersionId());
             assertThat(byDefinition.dataFormat()).isEqualTo(DataFormat.AVRO);
 
-            var diff = glue.getSchemaVersionsDiff(GetSchemaVersionsDiffRequest.builder()
+            GetSchemaVersionsDiffResponse diff = glue.getSchemaVersionsDiff(GetSchemaVersionsDiffRequest.builder()
                     .schemaId(SchemaId.builder().registryName(registryName).schemaName(schemaName).build())
                     .firstSchemaVersionNumber(SchemaVersionNumber.builder().versionNumber(1L).build())
                     .secondSchemaVersionNumber(SchemaVersionNumber.builder().versionNumber(2L).build())
@@ -759,7 +855,7 @@ class GlueSchemaRegistryTest {
                     .build());
             assertThat(diff.diff()).contains("--- v1", "+++ v2", "amount");
 
-            var compatibilityUpdate = glue.updateSchema(UpdateSchemaRequest.builder()
+            UpdateSchemaResponse compatibilityUpdate = glue.updateSchema(UpdateSchemaRequest.builder()
                     .schemaId(SchemaId.builder().registryName(registryName).schemaName(schemaName).build())
                     .compatibility(Compatibility.FORWARD)
                     .build());
@@ -769,14 +865,14 @@ class GlueSchemaRegistryTest {
                     .schemaId(SchemaId.builder().registryName(registryName).schemaName(schemaName).build())
                     .build()).compatibility()).isEqualTo(Compatibility.FORWARD);
 
-            var firstPage = glue.listSchemaVersions(ListSchemaVersionsRequest.builder()
+            ListSchemaVersionsResponse firstPage = glue.listSchemaVersions(ListSchemaVersionsRequest.builder()
                     .schemaId(SchemaId.builder().registryName(registryName).schemaName(schemaName).build())
                     .maxResults(1)
                     .build());
             assertThat(firstPage.schemas()).hasSize(1);
             assertThat(firstPage.nextToken()).isNotBlank();
 
-            var secondPage = glue.listSchemaVersions(ListSchemaVersionsRequest.builder()
+            ListSchemaVersionsResponse secondPage = glue.listSchemaVersions(ListSchemaVersionsRequest.builder()
                     .schemaId(SchemaId.builder().registryName(registryName).schemaName(schemaName).build())
                     .maxResults(1)
                     .nextToken(firstPage.nextToken())
@@ -784,20 +880,20 @@ class GlueSchemaRegistryTest {
             assertThat(secondPage.schemas()).hasSize(1);
             assertThat(secondPage.nextToken()).isNull();
 
-            var checkpointUpdate = glue.updateSchema(UpdateSchemaRequest.builder()
+            UpdateSchemaResponse checkpointUpdate = glue.updateSchema(UpdateSchemaRequest.builder()
                     .schemaId(SchemaId.builder().registryName(registryName).schemaName(schemaName).build())
                     .schemaVersionNumber(SchemaVersionNumber.builder().versionNumber(2L).build())
                     .build());
             assertThat(checkpointUpdate.schemaName()).isEqualTo(schemaName);
             assertThat(checkpointUpdate.registryName()).isEqualTo(registryName);
 
-            var deleted = glue.deleteSchemaVersions(DeleteSchemaVersionsRequest.builder()
+            DeleteSchemaVersionsResponse deleted = glue.deleteSchemaVersions(DeleteSchemaVersionsRequest.builder()
                     .schemaId(SchemaId.builder().registryName(registryName).schemaName(schemaName).build())
                     .versions("1")
                     .build());
             assertThat(deleted.schemaVersionErrors()).isEmpty();
 
-            var latest = glue.getSchemaVersion(GetSchemaVersionRequest.builder()
+            GetSchemaVersionResponse latest = glue.getSchemaVersion(GetSchemaVersionRequest.builder()
                     .schemaId(SchemaId.builder().registryName(registryName).schemaName(schemaName).build())
                     .schemaVersionNumber(SchemaVersionNumber.builder().latestVersion(true).build())
                     .build());
@@ -956,7 +1052,7 @@ class GlueSchemaRegistryTest {
                 .schemaDefinition(firstSchemaDefinition)
                 .build());
 
-        var register = RegisterSchemaVersionRequest.builder()
+        RegisterSchemaVersionRequest register = RegisterSchemaVersionRequest.builder()
                 .schemaId(SchemaId.builder()
                         .registryName(registryName)
                         .schemaName(schemaName)

@@ -49,6 +49,7 @@ public class ElastiCacheMemcachedContainerManager {
     private final EmulatorConfig config;
     private final RegionResolver regionResolver;
     private final Map<String, ElastiCacheContainerHandle> activeContainers = new ConcurrentHashMap<>();
+    private volatile boolean dockerUnavailableLogged;
 
     @Inject
     public ElastiCacheMemcachedContainerManager(ContainerBuilder containerBuilder,
@@ -65,7 +66,58 @@ public class ElastiCacheMemcachedContainerManager {
         this.regionResolver = regionResolver;
     }
 
-    public ElastiCacheContainerHandle start(String clusterId, String image) {
+    /**
+     * Attempts {@link #start} and reports the backend as unavailable instead of propagating the
+     * failure, when the cause is that no Docker daemon is reachable from Floci: Floci running
+     * inside Docker without a mounted socket, or a stopped daemon on the host. A failure raised
+     * while the daemon <em>is</em> reachable is a genuine container problem and still propagates,
+     * so nothing changes for a Floci that can start Memcached containers.
+     *
+     * @return the container handle, or {@code null} when no Docker daemon is reachable and no
+     *         container was created
+     */
+    public ElastiCacheContainerHandle tryStart(String clusterId, String image, String region) {
+        try {
+            ElastiCacheContainerHandle handle = start(clusterId, image, region);
+            dockerUnavailableLogged = false;
+            return handle;
+        } catch (RuntimeException e) {
+            if (isDockerReachable()) {
+                throw e;
+            }
+            ElastiCacheContainerHandle partial = activeContainers.get(clusterId);
+            if (partial != null) {
+                stop(partial);
+                throw e;
+            }
+            if (!dockerUnavailableLogged) {
+                dockerUnavailableLogged = true;
+                LOG.warnv("No Docker daemon is reachable from Floci ({0}). ElastiCache metadata "
+                        + "operations keep working and cache clusters still reach 'available', but "
+                        + "they have no backing Memcached container until a daemon becomes "
+                        + "reachable.", e.getMessage());
+            }
+            return null;
+        }
+    }
+
+    /**
+     * Probes the configured Docker endpoint, which is how a missing daemon is told apart from a
+     * container that failed for its own reasons.
+     */
+    public boolean isDockerReachable() {
+        try {
+            lifecycleManager.getDockerClient().pingCmd().exec();
+            return true;
+        } catch (Exception e) {
+            LOG.debugv("Docker daemon is not reachable: {0}", e.getMessage());
+            return false;
+        }
+    }
+
+    /** {@code region} is null for a cluster recorded without one, which then counts as the default region's. */
+    public ElastiCacheContainerHandle start(String clusterId, String image, String region) {
+        String effectiveRegion = region != null ? region : regionResolver.getDefaultRegion();
         LOG.infov("Starting Memcached container for cluster: {0}", clusterId);
 
         String containerName = ContainerStorageHelper.resourceName(config, "memcached", null, clusterId);
@@ -76,7 +128,7 @@ public class ElastiCacheMemcachedContainerManager {
                 .withDockerNetwork(config.services().elasticache().dockerNetwork())
                 .withLogRotation()
                 .withLabels(ContainerStorageHelper.resourceIdentityLabels(
-                        "elasticache", clusterId, regionResolver.getAccountId(), regionResolver.getDefaultRegion()));
+                        "elasticache", clusterId, regionResolver.getAccountId(), effectiveRegion));
 
         if (!containerDetector.isRunningInContainer()) {
             specBuilder.withDynamicPort(BACKEND_PORT);
@@ -99,10 +151,9 @@ public class ElastiCacheMemcachedContainerManager {
                 : info.containerId();
         String logGroup = "/aws/elasticache/cluster/" + clusterId + "/engine-log";
         String logStream = logStreamer.generateLogStreamName(shortId);
-        String region = regionResolver.getDefaultRegion();
 
         Closeable logHandle = logStreamer.attach(
-                info.containerId(), logGroup, logStream, region, "elasticache-memcached:" + clusterId);
+                info.containerId(), logGroup, logStream, effectiveRegion, "elasticache-memcached:" + clusterId);
         handle.setLogStream(logHandle);
 
         waitForBackendReady(clusterId, endpoint.host(), endpoint.port());

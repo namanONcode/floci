@@ -131,6 +131,7 @@ func TestRdsDataApiGoSdkV1(t *testing.T) {
 	})
 	require.NoError(t, err)
 	assert.Equal(t, int64(1), awsV1.Int64Value(insertOut.NumberOfRecordsUpdated))
+	assert.Nil(t, insertOut.Records, "AWS omits records for a statement that returns no result set")
 
 	inTxRead, err := dataSvc.ExecuteStatement(&rdsdataservice.ExecuteStatementInput{
 		ResourceArn:   awsV1.String(resourceArn),
@@ -570,6 +571,7 @@ func TestRdsDataApiGoSdkPostgresV1(t *testing.T) {
 	})
 	require.NoError(t, err)
 	assert.Equal(t, int64(1), awsV1.Int64Value(insertOut.NumberOfRecordsUpdated))
+	assert.Nil(t, insertOut.Records, "AWS omits records for a statement that returns no result set")
 
 	inTxRead, err := dataSvc.ExecuteStatement(&rdsdataservice.ExecuteStatementInput{
 		ResourceArn:   awsV1.String(resourceArn),
@@ -625,6 +627,39 @@ func TestRdsDataApiGoSdkPostgresV1(t *testing.T) {
 	assert.Equal(t, 1.5, awsV1.Float64Value(selectOut.Records[0][9].DoubleValue))
 	assert.Equal(t, `{"ok":true}`, awsV1.StringValue(selectOut.Records[0][10].StringValue))
 	assert.Equal(t, "2021-03-04T05:06:07Z", awsV1.StringValue(selectOut.Records[0][11].StringValue))
+
+	// Error code and message checked against Aurora PostgreSQL 17.7 on 2026-09-13.
+	for _, unsupported := range []struct{ sql, typeName string }{
+		{"select point(1, 2)", "POINT"},
+		{"select interval '1 day 2 hours'", "INTERVAL"},
+		{"select 12.34::money", "MONEY"},
+		{"select box '((0,0),(1,1))'", "BOX"},
+		{"select circle '<(0,0),1>'", "CIRCLE"},
+		{"select line '{1,2,3}'", "LINE"},
+		{"select lseg '[(0,0),(1,1)]'", "LSEG"},
+		{"select path '[(0,0),(1,1)]'", "PATH"},
+		{"select polygon '((0,0),(1,1),(1,0))'", "POLYGON"},
+	} {
+		_, err = dataSvc.ExecuteStatement(&rdsdataservice.ExecuteStatementInput{
+			ResourceArn: awsV1.String(resourceArn),
+			SecretArn:   awsV1.String(secretArn),
+			Database:    awsV1.String(database),
+			Sql:         awsV1.String(unsupported.sql),
+		})
+		assertAwsErrorCode(t, err, "UnsupportedResultException")
+		var unsupportedErr awserr.Error
+		require.ErrorAs(t, err, &unsupportedErr)
+		assert.Equal(t, "The result contains the unsupported data type "+unsupported.typeName+".", unsupportedErr.Message())
+	}
+
+	textCastOut, err := dataSvc.ExecuteStatement(&rdsdataservice.ExecuteStatementInput{
+		ResourceArn: awsV1.String(resourceArn),
+		SecretArn:   awsV1.String(secretArn),
+		Database:    awsV1.String(database),
+		Sql:         awsV1.String("select point(1, 2)::text as p"),
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "(1,2)", awsV1.StringValue(textCastOut.Records[0][0].StringValue))
 
 	updateOut, err := dataSvc.ExecuteStatement(&rdsdataservice.ExecuteStatementInput{
 		ResourceArn: awsV1.String(resourceArn),
@@ -989,6 +1024,7 @@ func TestRdsDataApiGoSdkV2(t *testing.T) {
 	})
 	require.NoError(t, err)
 	assert.Equal(t, int64(1), insertOut.NumberOfRecordsUpdated)
+	assert.Nil(t, insertOut.Records, "AWS omits records for a statement that returns no result set")
 
 	readInTx, err := dataSvc.ExecuteStatement(ctx, &rdsdata.ExecuteStatementInput{
 		ResourceArn:   awsV2.String(resourceArn),
@@ -1242,6 +1278,7 @@ func TestRdsDataApiGoSdkPostgresV2(t *testing.T) {
 	})
 	require.NoError(t, err)
 	assert.Equal(t, int64(1), insertOut.NumberOfRecordsUpdated)
+	assert.Nil(t, insertOut.Records, "AWS omits records for a statement that returns no result set")
 
 	readInTx, err := dataSvc.ExecuteStatement(ctx, &rdsdata.ExecuteStatementInput{
 		ResourceArn:   awsV2.String(resourceArn),

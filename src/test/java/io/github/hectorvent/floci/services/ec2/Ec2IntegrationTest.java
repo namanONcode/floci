@@ -7,6 +7,8 @@ import static org.hamcrest.Matchers.not;
 import static org.hamcrest.Matchers.endsWith;
 import static org.hamcrest.Matchers.emptyOrNullString;
 import static org.hamcrest.Matchers.containsInAnyOrder;
+import static org.hamcrest.Matchers.hasItems;
+import static org.hamcrest.Matchers.hasItem;
 import static org.hamcrest.Matchers.everyItem;
 import static org.hamcrest.Matchers.greaterThan;
 import static org.hamcrest.Matchers.greaterThanOrEqualTo;
@@ -15,6 +17,7 @@ import static org.hamcrest.Matchers.nullValue;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.startsWith;
 
+import io.restassured.path.xml.XmlPath;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -22,6 +25,8 @@ import java.util.Base64;
 import java.util.List;
 import java.util.UUID;
 import java.util.zip.GZIPOutputStream;
+import io.restassured.response.ExtractableResponse;
+import io.restassured.response.Response;
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
@@ -301,7 +306,7 @@ class Ec2IntegrationTest {
      * absent from the body rather than compared as a value.
      */
     private void assertSynthesizedOwnership(String ownerScope, String expectedId, String expectedAlias) {
-        var response = given()
+        ExtractableResponse<Response> response = given()
             .formParam("Action", "DescribeImages")
             .formParam("Owner.1", ownerScope)
             .formParam("Filter.1.Name", "name")
@@ -343,7 +348,7 @@ class Ec2IntegrationTest {
     void anOwnerAliasFilterAloneStillAgreesWithTheOwnerId() {
         // The mirror of the above. Filtering on the alias with no Owner.N left the id at the
         // Amazon default, so the image reported aws-marketplace beside Amazon's account.
-        var response = given()
+        ExtractableResponse<Response> response = given()
             .formParam("Action", "DescribeImages")
             .formParam("Filter.1.Name", "name")
             .formParam("Filter.1.Value.1", "unmatched-alias-filter-only-*")
@@ -501,6 +506,31 @@ class Ec2IntegrationTest {
             .body("DescribeImagesResponse.imagesSet.item.imageId",
                     containsInAnyOrder("ami-ubuntu2404-arm64", "ami-ubuntu2404-cloud-arm64"))
             .body("DescribeImagesResponse.imagesSet.item.architecture", everyItem(equalTo("arm64")));
+    }
+
+    @Test
+    @Order(9)
+    void describeImagesWithAl2023Arm64Filters() {
+        given()
+            .formParam("Action", "DescribeImages")
+            .formParam("Owner.1", "amazon")
+            .formParam("Filter.1.Name", "name")
+            .formParam("Filter.1.Value.1", "al2023-ami-2023.*-arm64")
+            .formParam("Filter.2.Name", "architecture")
+            .formParam("Filter.2.Value.1", "arm64")
+            .formParam("Filter.3.Name", "state")
+            .formParam("Filter.3.Value.1", "available")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .contentType("application/xml")
+            .body("DescribeImagesResponse.imagesSet.item.size()", equalTo(1))
+            .body("DescribeImagesResponse.imagesSet.item.imageId", equalTo("ami-amazonlinux2023-arm64"))
+            .body("DescribeImagesResponse.imagesSet.item.architecture", equalTo("arm64"))
+            .body("DescribeImagesResponse.imagesSet.item.name",
+                    equalTo("al2023-ami-2023.0.20230315.0-kernel-6.1-arm64"));
     }
 
     @Test
@@ -790,6 +820,16 @@ class Ec2IntegrationTest {
             .body("DescribeInstanceTypesResponse.instanceTypeSet.item.instanceType", equalTo("m6gd.2xlarge"))
             .body("DescribeInstanceTypesResponse.instanceTypeSet.item.instanceStorageSupported", equalTo("true"))
             .body("DescribeInstanceTypesResponse.instanceTypeSet.item.instanceStorageInfo.totalSizeInGB", equalTo("474"))
+            .body("DescribeInstanceTypesResponse.instanceTypeSet.item.networkInfo.encryptionInTransitSupported",
+                    equalTo("false"))
+            .body("DescribeInstanceTypesResponse.instanceTypeSet.item.networkInfo.defaultNetworkCardIndex",
+                    equalTo("0"))
+            .body("DescribeInstanceTypesResponse.instanceTypeSet.item.networkInfo.ipv4AddressesPerInterface",
+                    equalTo("15"))
+            .body("DescribeInstanceTypesResponse.instanceTypeSet.item.networkInfo.networkCards.item.networkCardIndex",
+                    equalTo("0"))
+            .body("DescribeInstanceTypesResponse.instanceTypeSet.item.networkInfo.networkCards.item.maximumNetworkInterfaces",
+                    equalTo("4"))
             .body("DescribeInstanceTypesResponse.instanceTypeSet.item.processorInfo.supportedArchitectures.item",
                     equalTo("arm64"));
     }
@@ -819,6 +859,16 @@ class Ec2IntegrationTest {
                     everyItem(equalTo("true")))
             .body("DescribeInstanceTypesResponse.instanceTypeSet.item.instanceStorageInfo.totalSizeInGB",
                     everyItem(equalTo("118")))
+            .body("DescribeInstanceTypesResponse.instanceTypeSet.item.networkInfo.encryptionInTransitSupported",
+                    everyItem(equalTo("false")))
+            .body("DescribeInstanceTypesResponse.instanceTypeSet.item.networkInfo.defaultNetworkCardIndex",
+                    everyItem(equalTo("0")))
+            .body("DescribeInstanceTypesResponse.instanceTypeSet.item.networkInfo.ipv4AddressesPerInterface",
+                    everyItem(equalTo("10")))
+            .body("DescribeInstanceTypesResponse.instanceTypeSet.item.networkInfo.networkCards.item.networkCardIndex",
+                    everyItem(equalTo("0")))
+            .body("DescribeInstanceTypesResponse.instanceTypeSet.item.networkInfo.networkCards.item.maximumNetworkInterfaces",
+                    everyItem(equalTo("3")))
             .body("DescribeInstanceTypesResponse.instanceTypeSet.item.processorInfo.supportedArchitectures.item",
                     everyItem(equalTo("arm64")));
     }
@@ -918,6 +968,53 @@ class Ec2IntegrationTest {
                     everyItem(equalTo("us-east-1")));
     }
 
+    @Test
+    @Order(22)
+    void describeNanoInstanceTypeOfferingsInEveryAvailabilityZone() {
+        // terratest's GetRecommendedInstanceType picks the first type offered in every AZ.
+        given()
+            .formParam("Action", "DescribeInstanceTypeOfferings")
+            .formParam("LocationType", "availability-zone")
+            .formParam("Filter.1.Name", "instance-type")
+            .formParam("Filter.1.Value.1", "t2.nano")
+            .formParam("Filter.1.Value.2", "t3.nano")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .contentType("application/xml")
+            .body("DescribeInstanceTypeOfferingsResponse.instanceTypeOfferingSet.item.size()", equalTo(6))
+            .body("DescribeInstanceTypeOfferingsResponse.instanceTypeOfferingSet.item.findAll { it.instanceType == 't2.nano' }.location",
+                    containsInAnyOrder("us-east-1a", "us-east-1b", "us-east-1c"))
+            .body("DescribeInstanceTypeOfferingsResponse.instanceTypeOfferingSet.item.findAll { it.instanceType == 't3.nano' }.location",
+                    containsInAnyOrder("us-east-1a", "us-east-1b", "us-east-1c"));
+    }
+
+    @Test
+    @Order(22)
+    void describeSmallBurstableInstanceTypes() {
+        given()
+            .formParam("Action", "DescribeInstanceTypes")
+            .formParam("InstanceType.1", "t3a.nano")
+            .formParam("InstanceType.2", "t2.small")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .contentType("application/xml")
+            .body("DescribeInstanceTypesResponse.instanceTypeSet.item.size()", equalTo(2))
+            .body("DescribeInstanceTypesResponse.instanceTypeSet.item.find { it.instanceType == 't3a.nano' }.vCpuInfo.defaultVCpus",
+                    equalTo("2"))
+            .body("DescribeInstanceTypesResponse.instanceTypeSet.item.find { it.instanceType == 't3a.nano' }.memoryInfo.sizeInMiB",
+                    equalTo("512"))
+            .body("DescribeInstanceTypesResponse.instanceTypeSet.item.find { it.instanceType == 't2.small' }.vCpuInfo.defaultVCpus",
+                    equalTo("1"))
+            .body("DescribeInstanceTypesResponse.instanceTypeSet.item.find { it.instanceType == 't2.small' }.memoryInfo.sizeInMiB",
+                    equalTo("2048"));
+    }
+
     // =========================================================================
     // VPCs
     // =========================================================================
@@ -951,6 +1048,148 @@ class Ec2IntegrationTest {
         .then()
             .statusCode(200)
             .body("DescribeVpcsResponse.vpcSet.item.vpcId", equalTo(vpcId));
+    }
+
+    @Test
+    @Order(323)
+    void describeVpnGatewaysReturnsEmptySetAndNotFoundError() {
+        given()
+            .formParam("Action", "DescribeVpnGateways")
+            .formParam("Filter.1.Name", "attachment.vpc-id")
+            .formParam("Filter.1.Value.1", vpcId)
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeVpnGatewaysResponse.vpnGatewaySet.item.size()", equalTo(0));
+
+        given()
+            .formParam("Action", "DescribeVpnGateways")
+            .formParam("Filter.1.Name", "tag-value")
+            .formParam("Filter.1.Value.1", "TeamA")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeVpnGatewaysResponse.vpnGatewaySet.item.size()", equalTo(0));
+
+        given()
+            .formParam("Action", "DescribeVpnGateways")
+            .formParam("VpnGatewayId.1", "vgw-0123456789abcdef0")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("Response.Errors.Error.Code", equalTo("InvalidVpnGatewayID.NotFound"))
+            .body("Response.Errors.Error.Message",
+                    equalTo("The vpnGateway ID 'vgw-0123456789abcdef0' does not exist"));
+    }
+
+    @Test
+    @Order(324)
+    void describeEgressOnlyInternetGatewaysReturnsEmptySet() {
+        given()
+            .formParam("Action", "DescribeEgressOnlyInternetGateways")
+            .formParam("Filter.1.Name", "tag:Owner")
+            .formParam("Filter.1.Value.1", "TeamA")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeEgressOnlyInternetGatewaysResponse.egressOnlyInternetGatewaySet.item.size()",
+                    equalTo(0));
+
+        given()
+            .formParam("Action", "DescribeEgressOnlyInternetGateways")
+            .formParam("Filter.1.Name", "tag-value")
+            .formParam("Filter.1.Value.1", "TeamA")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeEgressOnlyInternetGatewaysResponse.egressOnlyInternetGatewaySet.item.size()",
+                    equalTo(0));
+
+        given()
+            .formParam("Action", "DescribeEgressOnlyInternetGateways")
+            .formParam("Filter.1.Name", "attachment.vpc-id")
+            .formParam("Filter.1.Value.1", vpcId)
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeEgressOnlyInternetGatewaysResponse.egressOnlyInternetGatewaySet.item.size()",
+                    equalTo(0));
+
+        given()
+            .formParam("Action", "DescribeEgressOnlyInternetGateways")
+            .formParam("Filter.1.Name", "unsupported")
+            .formParam("Filter.1.Value.1", "value")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("Response.Errors.Error.Code", equalTo("InvalidParameterValue"))
+            .body("Response.Errors.Error.Message",
+                    equalTo("The filter 'unsupported' is invalid"));
+
+        given()
+            .formParam("Action", "DescribeEgressOnlyInternetGateways")
+            .formParam("EgressOnlyInternetGatewayId.1", "eigw-0123456789abcdef0")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeEgressOnlyInternetGatewaysResponse.egressOnlyInternetGatewaySet.item.size()",
+                    equalTo(0));
+    }
+
+    @Test
+    @Order(325)
+    void emptyNetworkDiscoveryValidatesPaginationBeforeReturningResults() {
+        String action = "DescribeEgressOnlyInternetGateways";
+        int maximum = 255;
+        for (String maxResults : List.of("5", Integer.toString(maximum))) {
+            given()
+                .formParam("Action", action)
+                .formParam("MaxResults", maxResults)
+                .header("Authorization", AUTH_HEADER)
+            .when()
+                .post("/")
+            .then()
+                .statusCode(200)
+                .body(not(containsString("<nextToken>")));
+        }
+
+        for (String maxResults : List.of("4", Integer.toString(maximum + 1), "not-a-number")) {
+            given()
+                .formParam("Action", action)
+                .formParam("MaxResults", maxResults)
+                .header("Authorization", AUTH_HEADER)
+            .when()
+                .post("/")
+            .then()
+                .statusCode(400)
+                .body("Response.Errors.Error.Code", equalTo("InvalidMaxResults"));
+        }
+
+        given()
+            .formParam("Action", action)
+            .formParam("NextToken", "arbitrary-token")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("Response.Errors.Error.Code", equalTo("InvalidParameterValue"));
     }
 
     @Test
@@ -1095,6 +1334,24 @@ class Ec2IntegrationTest {
             .statusCode(400)
             .body("Response.Errors.Error.Code", equalTo("MissingParameter"))
             .body("Response.Errors.Error.Message", equalTo("The request must contain the parameter VpcId"));
+    }
+
+    @Test
+    @Order(21)
+    void createSubnetWithConflictingCidrReturnsInvalidSubnetConflict() {
+        given()
+            .formParam("Action", "CreateSubnet")
+            .formParam("VpcId", vpcId)
+            .formParam("CidrBlock", "10.0.1.128/25")
+            .formParam("AvailabilityZone", "us-east-1a")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("Response.Errors.Error.Code", equalTo("InvalidSubnet.Conflict"))
+            .body("Response.Errors.Error.Message",
+                    equalTo("The CIDR '10.0.1.128/25' conflicts with another subnet"));
     }
 
     @Test
@@ -1308,6 +1565,36 @@ class Ec2IntegrationTest {
     }
 
     @Test
+    void createSecurityGroupMissingGroupName() {
+        given()
+            .formParam("Action", "CreateSecurityGroup")
+            .formParam("GroupDescription", "Test security group")
+            .formParam("VpcId", vpcId)
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body(containsString("MissingParameter"))
+            .body(containsString("GroupName"));
+    }
+
+    @Test
+    void createSecurityGroupMissingDescription() {
+        given()
+            .formParam("Action", "CreateSecurityGroup")
+            .formParam("GroupName", "test-security-group")
+            .formParam("VpcId", vpcId)
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body(containsString("MissingParameter"))
+            .body(containsString("GroupDescription"));
+    }
+
+    @Test
     @Order(31)
     void authorizeSecurityGroupIngress() {
         given()
@@ -1419,6 +1706,428 @@ class Ec2IntegrationTest {
             .body(containsString("<ipProtocol>-1</ipProtocol>"));
     }
 
+    @Test
+    @Order(37)
+    void describeSecurityGroupsFiltersByDescription() {
+        // Issue #150: DescribeSecurityGroups' "description" filter (a real, AWS-documented
+        // filter) must actually narrow the result set to groups whose description matches
+        // the given value, not merely accept the filter name and return every group
+        // unconditionally. A permissive no-op would still pass a check that only asserts
+        // "my group is somewhere in the results", so this asserts an exact result set for
+        // both a matching and (crucially) a non-matching value: the negative case is what a
+        // no-op filter fails, since it has no way to return fewer groups than an unfiltered
+        // call would.
+        //
+        // Self-contained (own VPC, not the class's shared `vpcId`/`securityGroupId`): this
+        // lets the test run in isolation (`-Dtest=...#describeSecurityGroupsFiltersByDescription`)
+        // without depending on createVpc/createSecurityGroup at @Order(10)/@Order(30) having
+        // already populated those static fields, and it is how this test was proven
+        // load-bearing against the unfixed code.
+        String testVpcId = given()
+            .formParam("Action", "CreateVpc")
+            .formParam("CidrBlock", "10.99.0.0/16")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract().path("CreateVpcResponse.vpc.vpcId");
+
+        String targetGroupId = given()
+            .formParam("Action", "CreateSecurityGroup")
+            .formParam("GroupName", "description-filter-target")
+            .formParam("GroupDescription", "A security group")
+            .formParam("VpcId", testVpcId)
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract().path("CreateSecurityGroupResponse.groupId");
+
+        String decoyGroupId = given()
+            .formParam("Action", "CreateSecurityGroup")
+            .formParam("GroupName", "description-filter-decoy")
+            .formParam("GroupDescription", "A totally different description")
+            .formParam("VpcId", testVpcId)
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract().path("CreateSecurityGroupResponse.groupId");
+
+        // Positive case: filtering by the exact description of `targetGroupId` returns
+        // exactly that one group out of the three now in this VPC (its own default group,
+        // the decoy, and the target) - not the decoy, and not the default group.
+        given()
+            .formParam("Action", "DescribeSecurityGroups")
+            .formParam("Filter.1.Name", "vpc-id")
+            .formParam("Filter.1.Value.1", testVpcId)
+            .formParam("Filter.2.Name", "description")
+            .formParam("Filter.2.Value.1", "A security group")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeSecurityGroupsResponse.securityGroupInfo.item.size()", equalTo(1))
+            .body("DescribeSecurityGroupsResponse.securityGroupInfo.item.groupId",
+                    equalTo(targetGroupId));
+
+        // Negative case: a description value that cannot match anything in the store must
+        // return zero groups. An unimplemented filter (falling through to a "default ->
+        // true" arm) gets exactly this case wrong: it returns every group in the vpc
+        // regardless of the value asked for, including one guaranteed not to match anything.
+        given()
+            .formParam("Action", "DescribeSecurityGroups")
+            .formParam("Filter.1.Name", "vpc-id")
+            .formParam("Filter.1.Value.1", testVpcId)
+            .formParam("Filter.2.Name", "description")
+            .formParam("Filter.2.Value.1", "nonexistent-string-xyz")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeSecurityGroupsResponse.securityGroupInfo.item.size()", equalTo(0));
+
+        given()
+            .formParam("Action", "DeleteSecurityGroup")
+            .formParam("GroupId", targetGroupId)
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+            .formParam("Action", "DeleteSecurityGroup")
+            .formParam("GroupId", decoyGroupId)
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+            .formParam("Action", "DeleteVpc")
+            .formParam("VpcId", testVpcId)
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+    }
+
+    @Test
+    @Order(38)
+    void describeAddressesFiltersByTagAndPublicIp() {
+        // Issue #151: Ec2Service.describeAddresses took a `filters` parameter and never
+        // referenced it anywhere in its body - not a missing case in a switch (like #150,
+        // #152, #153) but the whole parameter dropped before any filtering could happen. This
+        // asserts both halves of the fix: the generic "tag:" family (which needed nothing but
+        // the parameter actually reaching matchesFilters()) and a resource-specific field
+        // filter this fix adds ("public-ip"), each with its positive and negative case. A
+        // no-op filter cannot produce the negative case - it has no way to return fewer
+        // addresses than an unfiltered call would.
+        //
+        // Self-contained: allocates and releases its own two addresses rather than touching
+        // the class's shared `allocationId` static field, and scopes every query with a
+        // per-test tag so pre-existing addresses from other tests can't change the counts.
+        String suiteTag = "eip-filter-suite-151";
+
+        String targetAllocationId = given()
+            .formParam("Action", "AllocateAddress")
+            .formParam("Domain", "vpc")
+            .formParam("TagSpecification.1.ResourceType", "elastic-ip")
+            .formParam("TagSpecification.1.Tag.1.Key", "Role")
+            .formParam("TagSpecification.1.Tag.1.Value", "target")
+            .formParam("TagSpecification.1.Tag.2.Key", "Suite")
+            .formParam("TagSpecification.1.Tag.2.Value", suiteTag)
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract().path("AllocateAddressResponse.allocationId");
+
+        String targetPublicIp = given()
+            .formParam("Action", "DescribeAddresses")
+            .formParam("AllocationId.1", targetAllocationId)
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract().path("DescribeAddressesResponse.addressesSet.item.publicIp");
+
+        String decoyAllocationId = given()
+            .formParam("Action", "AllocateAddress")
+            .formParam("Domain", "vpc")
+            .formParam("TagSpecification.1.ResourceType", "elastic-ip")
+            .formParam("TagSpecification.1.Tag.1.Key", "Role")
+            .formParam("TagSpecification.1.Tag.1.Value", "decoy")
+            .formParam("TagSpecification.1.Tag.2.Key", "Suite")
+            .formParam("TagSpecification.1.Tag.2.Value", suiteTag)
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract().path("AllocateAddressResponse.allocationId");
+
+        // Positive, tag: family: narrowed to this suite (Suite=<suiteTag>), then further
+        // narrowed to Role=target, returns exactly the target address.
+        given()
+            .formParam("Action", "DescribeAddresses")
+            .formParam("Filter.1.Name", "tag:Suite")
+            .formParam("Filter.1.Value.1", suiteTag)
+            .formParam("Filter.2.Name", "tag:Role")
+            .formParam("Filter.2.Value.1", "target")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeAddressesResponse.addressesSet.item.size()", equalTo(1))
+            .body("DescribeAddressesResponse.addressesSet.item.allocationId", equalTo(targetAllocationId));
+
+        // Negative, tag: family: a Role value that cannot match anything in this suite must
+        // return zero addresses, not both of them (or all addresses in the account, which is
+        // what the unpatched code returned regardless of any filter).
+        given()
+            .formParam("Action", "DescribeAddresses")
+            .formParam("Filter.1.Name", "tag:Suite")
+            .formParam("Filter.1.Value.1", suiteTag)
+            .formParam("Filter.2.Name", "tag:Role")
+            .formParam("Filter.2.Value.1", "nonexistent-role-xyz")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeAddressesResponse.addressesSet.item.size()", equalTo(0));
+
+        // Positive, resource-specific field filter: "public-ip" narrows to exactly the
+        // address with that public IP.
+        given()
+            .formParam("Action", "DescribeAddresses")
+            .formParam("Filter.1.Name", "tag:Suite")
+            .formParam("Filter.1.Value.1", suiteTag)
+            .formParam("Filter.2.Name", "public-ip")
+            .formParam("Filter.2.Value.1", targetPublicIp)
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeAddressesResponse.addressesSet.item.size()", equalTo(1))
+            .body("DescribeAddressesResponse.addressesSet.item.allocationId", equalTo(targetAllocationId));
+
+        // Negative, resource-specific field filter: floci's synthesized public IPs always
+        // start with "54." (Ec2Service.allocateAddress), so an RFC 5737 TEST-NET-3 address is
+        // guaranteed not to match anything this test (or any other) could have allocated.
+        given()
+            .formParam("Action", "DescribeAddresses")
+            .formParam("Filter.1.Name", "tag:Suite")
+            .formParam("Filter.1.Value.1", suiteTag)
+            .formParam("Filter.2.Name", "public-ip")
+            .formParam("Filter.2.Value.1", "203.0.113.99")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeAddressesResponse.addressesSet.item.size()", equalTo(0));
+
+        given()
+            .formParam("Action", "ReleaseAddress")
+            .formParam("AllocationId", targetAllocationId)
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+            .formParam("Action", "ReleaseAddress")
+            .formParam("AllocationId", decoyAllocationId)
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+    }
+
+    @Test
+    @Order(38)
+    void describeInstancesFiltersByImageId() {
+        // Issue #152: DescribeInstances' "image-id" filter (a real, AWS-documented filter -
+        // "The ID of the image used to launch the instance") fell through matchesFilter's
+        // Instance arm's `default -> true`, so it matched every instance in the region
+        // regardless of the AMI it was launched from. Same shape as #150: positive case plus
+        // the negative case a permissive no-op filter cannot pass.
+        //
+        // Self-contained: launches its own two instances with made-up ImageIds unique to this
+        // test (so no other fixture's instances can be mistaken for a match) and terminates
+        // both at the end, rather than touching the class's shared `instanceId` static field.
+        String targetInstanceId = given()
+            .formParam("Action", "RunInstances")
+            .formParam("ImageId", "ami-filter-target-152")
+            .formParam("InstanceType", "t3.micro")
+            .formParam("MinCount", "1")
+            .formParam("MaxCount", "1")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract().path("RunInstancesResponse.instancesSet.item.instanceId");
+
+        String decoyInstanceId = given()
+            .formParam("Action", "RunInstances")
+            .formParam("ImageId", "ami-filter-decoy-152")
+            .formParam("InstanceType", "t3.micro")
+            .formParam("MinCount", "1")
+            .formParam("MaxCount", "1")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract().path("RunInstancesResponse.instancesSet.item.instanceId");
+
+        // Positive: filtering by the target's exact image-id returns exactly that instance,
+        // not the decoy (launched from a different image-id) and not any other instance
+        // already running from earlier tests in this suite.
+        given()
+            .formParam("Action", "DescribeInstances")
+            .formParam("Filter.1.Name", "image-id")
+            .formParam("Filter.1.Value.1", "ami-filter-target-152")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeInstancesResponse.reservationSet.item.instancesSet.item.instanceId",
+                    equalTo(targetInstanceId));
+
+        // Negative: an image-id that was never used to launch anything must return zero
+        // instances. An unimplemented filter (falling through to `default -> true`) gets
+        // exactly this case wrong: it returns every instance in the region regardless of the
+        // value asked for.
+        given()
+            .formParam("Action", "DescribeInstances")
+            .formParam("Filter.1.Name", "image-id")
+            .formParam("Filter.1.Value.1", "ami-does-not-exist-anywhere-152")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeInstancesResponse.reservationSet.item.size()", equalTo(0));
+
+        given()
+            .formParam("Action", "TerminateInstances")
+            .formParam("InstanceId.1", targetInstanceId)
+            .formParam("InstanceId.2", decoyInstanceId)
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+    }
+
+    @Test
+    @Order(38)
+    void describeVpcEndpointsFiltersByVpcEndpointState() {
+        // Issue #153: DescribeVpcEndpoints implemented a filter under the key "state", but
+        // AWS documents this filter as "vpc-endpoint-state". That made it a silent rename
+        // rather than a missing case: a real caller sending the AWS-documented name fell
+        // through the default arm and got every endpoint back regardless of its actual state.
+        // This is what the negative case here catches - filtering by a state ("pending") that
+        // this emulator's one synthesized endpoint (always "available") can never be in must
+        // return zero endpoints, not the endpoint anyway.
+        //
+        // Self-contained: its own VPC and its own Gateway endpoint (no RouteTableId needed -
+        // createVpcEndpoint only validates route table ids that are actually supplied), rather
+        // than the class's shared `vpcId`/`vpcEndpointId`.
+        String testVpcId = given()
+            .formParam("Action", "CreateVpc")
+            .formParam("CidrBlock", "10.98.0.0/16")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract().path("CreateVpcResponse.vpc.vpcId");
+
+        String testEndpointId = given()
+            .formParam("Action", "CreateVpcEndpoint")
+            .formParam("VpcId", testVpcId)
+            .formParam("ServiceName", "com.amazonaws.us-east-1.s3")
+            .formParam("VpcEndpointType", "Gateway")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract().path("CreateVpcEndpointResponse.vpcEndpoint.vpcEndpointId");
+
+        // Positive: the endpoint is (and can only ever be, in this emulator) "available", so
+        // filtering this VPC's endpoints by vpc-endpoint-state=available returns exactly it.
+        given()
+            .formParam("Action", "DescribeVpcEndpoints")
+            .formParam("Filter.1.Name", "vpc-id")
+            .formParam("Filter.1.Value.1", testVpcId)
+            .formParam("Filter.2.Name", "vpc-endpoint-state")
+            .formParam("Filter.2.Value.1", "available")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeVpcEndpointsResponse.vpcEndpointSet.item.size()", equalTo(1))
+            .body("DescribeVpcEndpointsResponse.vpcEndpointSet.item.vpcEndpointId",
+                    equalTo(testEndpointId));
+
+        // Negative: a real AWS endpoint state ("pending") that no endpoint in this VPC is
+        // actually in must return zero endpoints. Under the old "state" key with the wrong
+        // documented name, or under any unimplemented filter name, this returns the endpoint
+        // anyway because the default arm ignores the value entirely.
+        given()
+            .formParam("Action", "DescribeVpcEndpoints")
+            .formParam("Filter.1.Name", "vpc-id")
+            .formParam("Filter.1.Value.1", testVpcId)
+            .formParam("Filter.2.Name", "vpc-endpoint-state")
+            .formParam("Filter.2.Value.1", "pending")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeVpcEndpointsResponse.vpcEndpointSet.item.size()", equalTo(0));
+
+        given()
+            .formParam("Action", "DeleteVpcEndpoints")
+            .formParam("VpcEndpointId.1", testEndpointId)
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+            .formParam("Action", "DeleteVpc")
+            .formParam("VpcId", testVpcId)
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+    }
+
     // =========================================================================
     // Key Pairs
     // =========================================================================
@@ -1506,6 +2215,55 @@ class Ec2IntegrationTest {
     }
 
     @Test
+    @Order(41)
+    void createKeyPairWithoutKeyNameReturnsMissingParameter() {
+        // #3356: a nameless key pair used to be stored, and its null name then broke every
+        // later CreateKeyPair with an InternalFailure.
+        given()
+            .formParam("Action", "CreateKeyPair")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("Response.Errors.Error.Code", equalTo("MissingParameter"));
+
+        given()
+            .formParam("Action", "ImportKeyPair")
+            .formParam("PublicKeyMaterial", "c3NoLXJzYSBBQUFB")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("Response.Errors.Error.Code", equalTo("MissingParameter"));
+
+        given()
+            .formParam("Action", "DeleteKeyPair")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("Response.Errors.Error.Code", equalTo("MissingParameter"));
+    }
+
+    @Test
+    @Order(41)
+    void importKeyPairWithInvalidBase64ReturnsInvalidKeyFormat() {
+        given()
+            .formParam("Action", "ImportKeyPair")
+            .formParam("KeyName", "bad-material-key")
+            .formParam("PublicKeyMaterial", "not base64!")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("Response.Errors.Error.Code", equalTo("InvalidKey.Format"));
+    }
+
+    @Test
     @Order(42)
     void createLaunchTemplateRejectsMalformedUserData() {
         given()
@@ -1573,6 +2331,35 @@ class Ec2IntegrationTest {
     }
 
     @Test
+    @Order(44)
+    void describeLaunchTemplatesRejectsMissingName() {
+        given()
+            .formParam("Action", "DescribeLaunchTemplates")
+            .formParam("LaunchTemplateName.1", "no-such-template")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("Response.Errors.Error.Code", equalTo("InvalidLaunchTemplateName.NotFoundException"));
+    }
+
+    @Test
+    @Order(44)
+    void describeLaunchTemplatesWithNoMatchingFilterStaysAnEmptyList() {
+        given()
+            .formParam("Action", "DescribeLaunchTemplates")
+            .formParam("Filter.1.Name", "launch-template-name")
+            .formParam("Filter.1.Value.1", "no-such-template")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(not(containsString("<item>")));
+    }
+
+    @Test
     @Order(45)
     void describeLaunchTemplateVersionsById() {
         given()
@@ -1592,8 +2379,10 @@ class Ec2IntegrationTest {
                     equalTo("t3.micro"))
             .body("DescribeLaunchTemplateVersionsResponse.launchTemplateVersionSet.item.launchTemplateData.userData",
                     equalTo(launchTemplateUserData))
-            .body("DescribeLaunchTemplateVersionsResponse.launchTemplateVersionSet.item.launchTemplateData.iamInstanceProfile.arn",
-                    equalTo("arn:aws:iam::000000000000:instance-profile/sample-profile"))
+            // Submitted as Name, so it reads back as Name. Rewriting it to an Arn is what made
+            // aws_launch_template.iam_instance_profile.name diff forever.
+            .body("DescribeLaunchTemplateVersionsResponse.launchTemplateVersionSet.item.launchTemplateData.iamInstanceProfile.name",
+                    equalTo("sample-profile"))
             .body("DescribeLaunchTemplateVersionsResponse.launchTemplateVersionSet.item.launchTemplateData.tagSpecificationSet.item.resourceType",
                     equalTo("instance"))
             .body("DescribeLaunchTemplateVersionsResponse.launchTemplateVersionSet.item.launchTemplateData.tagSpecificationSet.item.tagSet.item.find { it.key == 'example:ClusterId' }.value",
@@ -1636,8 +2425,8 @@ class Ec2IntegrationTest {
                     equalTo("t3.small"))
             .body("CreateLaunchTemplateVersionResponse.launchTemplateVersion.launchTemplateData.userData",
                     equalTo(launchTemplateVersionUserData))
-            .body("CreateLaunchTemplateVersionResponse.launchTemplateVersion.launchTemplateData.iamInstanceProfile.arn",
-                    equalTo("arn:aws:iam::000000000000:instance-profile/sample-profile-v2"))
+            .body("CreateLaunchTemplateVersionResponse.launchTemplateVersion.launchTemplateData.iamInstanceProfile.name",
+                    equalTo("sample-profile-v2"))
             .body("CreateLaunchTemplateVersionResponse.launchTemplateVersion.launchTemplateData.tagSpecificationSet.item.tagSet.item.find { it.key == 'example:NodeType' }.value",
                     equalTo("SECONDARY"));
 
@@ -1731,6 +2520,9 @@ class Ec2IntegrationTest {
     @Test
     @Order(49)
     void runInstancesResolvesLaunchTemplateDefaultsWithRequestOverrides() {
+        given().header("Authorization", AUTH_HEADER.replace("/ec2/", "/iam/"))
+                .formParam("Action", "CreateInstanceProfile").formParam("InstanceProfileName", "sample-profile-v2")
+                .post("/").then().statusCode(200);
         String launchedInstanceId = given()
             .formParam("Action", "RunInstances")
             .formParam("LaunchTemplate.LaunchTemplateId", launchTemplateId)
@@ -2312,6 +3104,41 @@ class Ec2IntegrationTest {
     }
 
     @Test
+    @Order(84)
+    void describeVolumesAttachmentFiltersMatchOnlyTheirOwnInstance() {
+        // attachment.* previously fell through matchesFilter's default arm, so
+        // DescribeVolumes --filters attachment.instance-id=<id> matched every volume in
+        // the region and Volumes[0] depended on iteration order, not on the filter.
+        given()
+            .formParam("Action", "DescribeVolumes")
+            .formParam("Filter.1.Name", "attachment.instance-id")
+            .formParam("Filter.1.Value.1", instanceId)
+            .formParam("Filter.2.Name", "attachment.device")
+            .formParam("Filter.2.Value.1", "/dev/xvda")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeVolumesResponse.volumeSet.item.size()", equalTo(1))
+            .body("DescribeVolumesResponse.volumeSet.item.attachmentSet.item.instanceId",
+                    equalTo(instanceId));
+
+        // The negative case an unimplemented filter gets wrong: an instance id that
+        // nothing is attached to must return zero volumes, not every volume.
+        given()
+            .formParam("Action", "DescribeVolumes")
+            .formParam("Filter.1.Name", "attachment.instance-id")
+            .formParam("Filter.1.Value.1", "i-00000000000000000")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeVolumesResponse.volumeSet.item.size()", equalTo(0));
+    }
+
+    @Test
     @Order(85)
     void describeInstanceAttributeDisableApiStop() {
         given()
@@ -2601,11 +3428,13 @@ class Ec2IntegrationTest {
             // availabilityZone from instance placement
             .body("DescribeNetworkInterfacesResponse.networkInterfaceSet.item[0].availabilityZone",
                     startsWith("us-east-1"))
-            // tagSet propagated from instance tags (created at Order 90)
-            .body("DescribeNetworkInterfacesResponse.networkInterfaceSet.item[0].tagSet.item[0].key",
-                    equalTo("Name"))
-            .body("DescribeNetworkInterfacesResponse.networkInterfaceSet.item[0].tagSet.item[0].value",
-                    equalTo("test-instance"))
+            // The interface's tagSet is its OWN, never the instance's. The instance
+            // carries Name=test-instance (CreateTags at Order 90) and nothing has
+            // tagged this eni- id, so AWS answers with an empty tagSet here: a
+            // RunInstances TagSpecification tags exactly the resource types it names,
+            // and ec2:DescribeTags never listed these tags for the interface either,
+            // so copying them made two calls disagree about one resource.
+            .body(not(containsString("test-instance")))
             // attachment: attachTime (from instance launchTime) and deleteOnTermination
             .body("DescribeNetworkInterfacesResponse.networkInterfaceSet.item[0].attachment.attachTime",
                     notNullValue())
@@ -2702,6 +3531,62 @@ class Ec2IntegrationTest {
     @Test
     @Order(92)
     void describeNetworkInterfacesFilterByTag() {
+        // A tag:N filter matches the interface's own tags, so the interface is tagged
+        // here first. Filtering on the INSTANCE's tags used to match, which is what
+        // describeNetworkInterfacesDoNotInheritInstanceTags now pins the other way.
+        given()
+            .formParam("Action", "CreateTags")
+            .formParam("ResourceId.1", networkInterfaceId)
+            .formParam("Tag.1.Key", "FilterProbe")
+            .formParam("Tag.1.Value", "eni-own-tag")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+            .formParam("Action", "DescribeNetworkInterfaces")
+            .formParam("Filter.1.Name", "tag:FilterProbe")
+            .formParam("Filter.1.Value.1", "eni-own-tag")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeNetworkInterfacesResponse.networkInterfaceSet.item.size()",
+                    equalTo(1))
+            .body("DescribeNetworkInterfacesResponse.networkInterfaceSet.item[0].networkInterfaceId",
+                    equalTo(networkInterfaceId))
+            .body(containsString("FilterProbe"));
+    }
+
+    /**
+     * Issue: DescribeNetworkInterfaces answered with the ATTACHED INSTANCE's tags as
+     * the interface's own tagSet, which AWS never does - RunInstances applies each
+     * TagSpecification to exactly the resource type it names, and this emulator's own
+     * ec2:DescribeTags never listed those tags for the eni- id either, so the two
+     * calls disagreed about one resource.
+     *
+     * <p>Read the promise, not the implementation: the instance carries
+     * Name=test-instance (Order 90) and must still carry it, while no interface in the
+     * account answers a tag:Name filter for it. Before the fix this filter returned the
+     * instance's own interface.
+     */
+    @Test
+    @Order(92)
+    void describeNetworkInterfacesDoNotInheritInstanceTags() {
+        given()
+            .formParam("Action", "DescribeTags")
+            .formParam("Filter.1.Name", "resource-id")
+            .formParam("Filter.1.Value.1", instanceId)
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("test-instance"));
+
         given()
             .formParam("Action", "DescribeNetworkInterfaces")
             .formParam("Filter.1.Name", "tag:Name")
@@ -2712,7 +3597,7 @@ class Ec2IntegrationTest {
         .then()
             .statusCode(200)
             .body("DescribeNetworkInterfacesResponse.networkInterfaceSet.item.size()",
-                    greaterThanOrEqualTo(1));
+                    equalTo(0));
     }
 
     @Test
@@ -3231,10 +4116,12 @@ class Ec2IntegrationTest {
         .when()
             .post("/")
         .then()
-            .statusCode(200);
+            .statusCode(200)
+            .body("DeleteKeyPairResponse.return", equalTo("true"))
+            .body("DeleteKeyPairResponse.keyPairId", equalTo(keyPairId));
 
-        // DeleteKeyPair always answers 200, so the delete is only proven by a
-        // follow-up describe.
+        // DeleteKeyPair answers 200 for a known and an unknown key pair alike, so the
+        // delete is only proven by a follow-up describe.
         given()
             .formParam("Action", "DescribeKeyPairs")
             .formParam("KeyPairId.1", keyPairId)
@@ -3468,6 +4355,77 @@ class Ec2IntegrationTest {
         given()
             .formParam("Action", "DeleteVpc")
             .formParam("VpcId", vpcId1)
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/");
+    }
+
+    @Test
+    @Order(302)
+    void describeVpcsWithCidrBlockFilterAlias() {
+        // "cidr" is the documented DescribeVpcs filter name for a VPC's primary CIDR block, but
+        // real EC2 also honours the undocumented alias "cidr-block" (confirmed against live AWS
+        // 2026-08-25: a filter naming an unrelated CIDR returns zero VPCs rather than every VPC,
+        // so the service is genuinely filtering, not ignoring the name). Before this fix floci's
+        // Vpc filter switch fell through its `default -> true` arm for "cidr-block" and matched
+        // every VPC regardless of the requested value.
+        String matching = given()
+            .formParam("Action", "CreateVpc")
+            .formParam("CidrBlock", "172.16.0.0/16")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract().path("CreateVpcResponse.vpc.vpcId");
+
+        String other = given()
+            .formParam("Action", "CreateVpc")
+            .formParam("CidrBlock", "10.9.0.0/16")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract().path("CreateVpcResponse.vpc.vpcId");
+
+        // Filtering on the matching VPC's own primary CIDR returns exactly that VPC, not the
+        // whole account (which, thanks to describeDefaultVpc's default VPC and "other" above,
+        // has at least two others in scope).
+        given()
+            .formParam("Action", "DescribeVpcs")
+            .formParam("Filter.1.Name", "cidr-block")
+            .formParam("Filter.1.Value.1", "172.16.0.0/16")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeVpcsResponse.vpcSet.item.size()", equalTo(1))
+            .body("DescribeVpcsResponse.vpcSet.item[0].vpcId", equalTo(matching));
+
+        // A "cidr-block" value that matches no VPC's primary CIDR must return none, not "the
+        // filter was ignored, return everything".
+        given()
+            .formParam("Action", "DescribeVpcs")
+            .formParam("Filter.1.Name", "cidr-block")
+            .formParam("Filter.1.Value.1", "203.0.113.0/24")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeVpcsResponse.vpcSet.item.size()", equalTo(0));
+
+        given()
+            .formParam("Action", "DeleteVpc")
+            .formParam("VpcId", matching)
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/");
+        given()
+            .formParam("Action", "DeleteVpc")
+            .formParam("VpcId", other)
             .header("Authorization", AUTH_HEADER)
         .when()
             .post("/");
@@ -3818,9 +4776,20 @@ class Ec2IntegrationTest {
             .formParam("TagSpecification.1.ResourceType", "subnet")
             .formParam("TagSpecification.1.Tag.1.Key", "Name")
             .formParam("TagSpecification.1.Tag.1.Value", "tagged-subnet")
+            .formParam("TagSpecification.2.ResourceType", "subnet")
+            .formParam("TagSpecification.2.Tag.1.Key", "omitted-value")
+            .formParam("TagSpecification.2.Tag.2.Key", "explicit-empty-value")
+            .formParam("TagSpecification.2.Tag.2.Value", "")
             .header("Authorization", AUTH_HEADER)
         .when().post("/")
-        .then().statusCode(200)
+        .then()
+            .statusCode(200)
+            .body("CreateSubnetResponse.subnet.tagSet.item.find { it.key == 'Name' }.value",
+                    equalTo("tagged-subnet"))
+            .body("CreateSubnetResponse.subnet.tagSet.item.find { it.key == 'omitted-value' }.value",
+                    equalTo(""))
+            .body("CreateSubnetResponse.subnet.tagSet.item.find { it.key == 'explicit-empty-value' }.value",
+                    equalTo(""))
             .extract().path("CreateSubnetResponse.subnet.subnetId");
 
         given()
@@ -3830,8 +4799,27 @@ class Ec2IntegrationTest {
         .when().post("/")
         .then()
             .statusCode(200)
-            .body("DescribeSubnetsResponse.subnetSet.item.tagSet.item.key", equalTo("Name"))
-            .body("DescribeSubnetsResponse.subnetSet.item.tagSet.item.value", equalTo("tagged-subnet"));
+            .body("DescribeSubnetsResponse.subnetSet.item.tagSet.item.find { it.key == 'Name' }.value",
+                    equalTo("tagged-subnet"))
+            .body("DescribeSubnetsResponse.subnetSet.item.tagSet.item.find { it.key == 'omitted-value' }.value",
+                    equalTo(""))
+            .body("DescribeSubnetsResponse.subnetSet.item.tagSet.item.find { it.key == 'explicit-empty-value' }.value",
+                    equalTo(""));
+
+        given()
+            .formParam("Action", "DescribeTags")
+            .formParam("Filter.1.Name", "resource-id")
+            .formParam("Filter.1.Value.1", subnet)
+            .header("Authorization", AUTH_HEADER)
+        .when().post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeTagsResponse.tagSet.item.find { it.key == 'Name' }.value",
+                    equalTo("tagged-subnet"))
+            .body("DescribeTagsResponse.tagSet.item.find { it.key == 'omitted-value' }.value",
+                    equalTo(""))
+            .body("DescribeTagsResponse.tagSet.item.find { it.key == 'explicit-empty-value' }.value",
+                    equalTo(""));
     }
 
     @Test
@@ -3964,5 +4952,340 @@ class Ec2IntegrationTest {
             .statusCode(200)
             .body("DescribeSecurityGroupRulesResponse.securityGroupRuleSet.item.securityGroupRuleId",
                     equalTo(ruleId));
+    }
+
+    @Test
+    @Order(321)
+    void modifyIpamUpdatesDescriptionAndOperatingRegionsOverQuery() {
+        String ipamId = given()
+            .formParam("Action", "CreateIpam")
+            .formParam("Description", "initial-ipam")
+            .formParam("OperatingRegion.1.RegionName", "us-east-1")
+            .formParam("OperatingRegion.2.RegionName", "us-west-1")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract().path("CreateIpamResponse.ipam.ipamId");
+
+        given()
+            .formParam("Action", "ModifyIpam")
+            .formParam("IpamId", ipamId)
+            .formParam("Description", "updated-ipam")
+            .formParam("AddOperatingRegion.1.RegionName", "us-west-2")
+            .formParam("RemoveOperatingRegion.1.RegionName", "us-east-1")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("ModifyIpamResponse.ipam.ipamId", equalTo(ipamId))
+            .body("ModifyIpamResponse.ipam.description", equalTo("updated-ipam"))
+            .body("ModifyIpamResponse.ipam.operatingRegionSet.item.regionName",
+                    hasItems("us-west-1", "us-west-2"));
+
+        given()
+            .formParam("Action", "DescribeIpams")
+            .formParam("IpamId.1", ipamId)
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeIpamsResponse.ipamSet.item.description", equalTo("updated-ipam"))
+            .body("DescribeIpamsResponse.ipamSet.item.operatingRegionSet.item.regionName",
+                    hasItems("us-west-1", "us-west-2"))
+            .body("DescribeIpamsResponse.ipamSet.item.operatingRegionSet.item.regionName",
+                    not(hasItem("us-east-1")));
+    }
+
+    @Test
+    @Order(322)
+    void modifyIpamUnknownIdsReturnAwsErrorShape() {
+        given()
+            .formParam("Action", "ModifyIpam")
+            .formParam("IpamId", "ipam-doesnotexist")
+            .formParam("Description", "updated-ipam")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("Response.Errors.Error.Code", equalTo("InvalidIpamId.NotFound"));
+    }
+
+    @Test
+    @Order(322)
+    void describeIpamScopesReturnsTheDefaultScopesOverQuery() {
+        // aws_vpc_ipam_pool reads its scope through DescribeIpamScopes before CreateIpamPool
+        XmlPath created = given()
+            .formParam("Action", "CreateIpam")
+            .formParam("Description", "scope-ipam")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract().xmlPath();
+        String ipamId = created.getString("CreateIpamResponse.ipam.ipamId");
+        String ipamArn = created.getString("CreateIpamResponse.ipam.ipamArn");
+        String scopeId = given()
+            .formParam("Action", "DescribeIpams")
+            .formParam("IpamId.1", ipamId)
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract().path("DescribeIpamsResponse.ipamSet.item.privateDefaultScopeId");
+
+        given()
+            .formParam("Action", "DescribeIpamScopes")
+            .formParam("IpamScopeId.1", scopeId)
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeIpamScopesResponse.ipamScopeSet.item.size()", equalTo(1))
+            .body("DescribeIpamScopesResponse.ipamScopeSet.item.ipamScopeId", equalTo(scopeId))
+            .body("DescribeIpamScopesResponse.ipamScopeSet.item.ipamArn", equalTo(ipamArn))
+            .body("DescribeIpamScopesResponse.ipamScopeSet.item.ipamScopeType", equalTo("private"))
+            .body("DescribeIpamScopesResponse.ipamScopeSet.item.isDefault", equalTo("true"))
+            .body("DescribeIpamScopesResponse.ipamScopeSet.item.ipamScopeArn", endsWith("ipam-scope/" + scopeId));
+
+        // aws_vpc_ipam_pool's Read splits ipamScopeArn on "/" and reads ipamScopeType off the pool
+        String poolId = given()
+            .formParam("Action", "CreateIpamPool")
+            .formParam("IpamScopeId", scopeId)
+            .formParam("AddressFamily", "ipv4")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract().path("CreateIpamPoolResponse.ipamPool.ipamPoolId");
+        given()
+            .formParam("Action", "DescribeIpamPools")
+            .formParam("IpamPoolId.1", poolId)
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeIpamPoolsResponse.ipamPoolSet.item.ipamScopeArn", endsWith("ipam-scope/" + scopeId))
+            .body("DescribeIpamPoolsResponse.ipamPoolSet.item.ipamScopeType", equalTo("private"))
+            .body("DescribeIpamPoolsResponse.ipamPoolSet.item.ipamArn", equalTo(ipamArn))
+            .body("DescribeIpamPoolsResponse.ipamPoolSet.item.ipamRegion", equalTo("us-east-1"));
+
+        given()
+            .formParam("Action", "DescribeIpamScopes")
+            .formParam("IpamScopeId.1", "ipam-scope-doesnotexist")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("Response.Errors.Error.Code", equalTo("InvalidIpamScopeId.NotFound"));
+    }
+
+    @Test
+    @Order(323)
+    void associateIpamByoasnSuccess() {
+        given()
+            .formParam("Action", "AssociateIpamByoasn")
+            .formParam("Asn", "65000")
+            .formParam("Cidr", "10.0.0.0/16")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("AssociateIpamByoasnResponse.asnAssociation.asn", equalTo("65000"))
+            .body("AssociateIpamByoasnResponse.asnAssociation.cidr", equalTo("10.0.0.0/16"))
+            .body("AssociateIpamByoasnResponse.asnAssociation.state", equalTo("associated"))
+            .body("AssociateIpamByoasnResponse.asnAssociation.statusMessage", equalTo(""));
+    }
+
+    @Test
+    @Order(324)
+    void associateIpamByoasnDryRunThrows() {
+        given()
+            .formParam("Action", "AssociateIpamByoasn")
+            .formParam("Asn", "65000")
+            .formParam("Cidr", "10.0.0.0/16")
+            .formParam("DryRun", "true")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(412)
+            .body("Response.Errors.Error.Code", equalTo("DryRunOperation"));
+    }
+
+    @Test
+    @Order(325)
+    void createIpamFullFieldsRoundTrip() {
+        String id = given()
+            .formParam("Action", "CreateIpam")
+            .formParam("ClientToken", "create-ipam-full-325")
+            .formParam("Description", "full-ipam")
+            .formParam("EnablePrivateGua", "true")
+            .formParam("MeteredAccount", "resource-owner")
+            .formParam("Tier", "advanced")
+            .formParam("OperatingRegion.1.RegionName", "us-east-1")
+            .formParam("TagSpecification.1.ResourceType", "ipam")
+            .formParam("TagSpecification.1.Tag.1.Key", "Name")
+            .formParam("TagSpecification.1.Tag.1.Value", "full")
+            .header("Authorization", AUTH_HEADER)
+        .when().post("/").then().statusCode(200)
+            .body("CreateIpamResponse.ipam.enablePrivateGua", equalTo("true"))
+            .body("CreateIpamResponse.ipam.meteredAccount", equalTo("resource-owner"))
+            .body("CreateIpamResponse.ipam.tier", equalTo("advanced"))
+            .body("CreateIpamResponse.ipam.tagSet.item.key", equalTo("Name"))
+            .extract().path("CreateIpamResponse.ipam.ipamId");
+
+        given().formParam("Action", "DescribeIpams").formParam("IpamId.1", id)
+            .header("Authorization", AUTH_HEADER).when().post("/").then().statusCode(200)
+            .body("DescribeIpamsResponse.ipamSet.item.ipamId", equalTo(id))
+            .body("DescribeIpamsResponse.ipamSet.item.tagSet.item.value", equalTo("full"));
+    }
+
+    @Test
+    @Order(326)
+    void createIpamDryRunDoesNotMutate() {
+        given().formParam("Action", "CreateIpam").formParam("ClientToken", "dry-run-326")
+            .formParam("DryRun", "true").header("Authorization", AUTH_HEADER)
+        .when().post("/").then().statusCode(412)
+            .body("Response.Errors.Error.Code", equalTo("DryRunOperation"));
+        given().formParam("Action", "DescribeIpams").formParam("Filter.1.Name", "state")
+            .formParam("Filter.1.Value.1", "create-complete")
+            .header("Authorization", AUTH_HEADER).when().post("/").then().statusCode(200);
+    }
+
+    @Test
+    @Order(327)
+    void describeAndDisassociateIpamByoasn() {
+        given().formParam("Action", "AssociateIpamByoasn").formParam("Asn", "65001")
+            .formParam("Cidr", "10.1.0.0/16").header("Authorization", AUTH_HEADER)
+            .when().post("/").then().statusCode(200);
+        given().formParam("Action", "DescribeIpamByoasn").header("Authorization", AUTH_HEADER)
+            .when().post("/").then().statusCode(200)
+            .body("DescribeIpamByoasnResponse.byoasnSet.item.asn", hasItem("65001"));
+        given().formParam("Action", "DisassociateIpamByoasn").formParam("Asn", "65001")
+            .formParam("Cidr", "10.1.0.0/16").header("Authorization", AUTH_HEADER)
+            .when().post("/").then().statusCode(200)
+            .body("DisassociateIpamByoasnResponse.asnAssociation.state", equalTo("disassociated"));
+    }
+
+    @Test
+    @Order(328)
+    void enableIpamOrganizationAdminAccountSucceedsForTheDefaultAccountCredential() {
+        // LZA's Organization-stage custom resource calls this over the query protocol with the
+        // same style of credential every other test in this suite uses (a non-12-digit access
+        // key, which AccountContextFilter/AccountResolver resolve to the configured default
+        // account). The management-account gate added alongside this test must not deny that
+        // path — only a caller whose credential resolves to a DIFFERENT 12-digit account should
+        // be denied.
+        given().formParam("Action", "EnableIpamOrganizationAdminAccount")
+            .formParam("DelegatedAdminAccountId", "111111111111")
+            .header("Authorization", AUTH_HEADER)
+            .when().post("/").then().statusCode(200);
+        given().formParam("Action", "DisableIpamOrganizationAdminAccount")
+            .formParam("DelegatedAdminAccountId", "111111111111")
+            .header("Authorization", AUTH_HEADER)
+            .when().post("/").then().statusCode(200);
+    }
+
+
+    /**
+     * The other half of "an interface's tags are its own": AWS DOES tag the interfaces
+     * RunInstances creates when the request carries a TagSpecification naming
+     * ResourceType=network-interface, and only then. This launches one instance with
+     * both specifications and asserts each landed on its own resource.
+     *
+     * <p>Runs last, like the other tests that launch extra instances: the
+     * DescribeNetworkInterfaces pagination tests at @Order(92) assert on exact ENI
+     * counts, so the instance is terminated before this returns.
+     */
+    @Test
+    @Order(323)
+    void runInstancesTagsTheInterfaceOnlyWhenTheSpecificationNamesIt() {
+        String taggedInstanceId = given()
+            .formParam("Action", "RunInstances")
+            .formParam("ImageId", "ami-12345678")
+            .formParam("InstanceType", "t3.micro")
+            .formParam("MinCount", "1")
+            .formParam("MaxCount", "1")
+            .formParam("TagSpecification.1.ResourceType", "instance")
+            .formParam("TagSpecification.1.Tag.1.Key", "Name")
+            .formParam("TagSpecification.1.Tag.1.Value", "eni-tagspec-instance")
+            .formParam("TagSpecification.2.ResourceType", "network-interface")
+            .formParam("TagSpecification.2.Tag.1.Key", "Name")
+            .formParam("TagSpecification.2.Tag.1.Value", "eni-tagspec-interface")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract().path("RunInstancesResponse.instancesSet.item.instanceId");
+
+        String eniId = given()
+            .formParam("Action", "DescribeNetworkInterfaces")
+            .formParam("Filter.1.Name", "attachment.instance-id")
+            .formParam("Filter.1.Value.1", taggedInstanceId)
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeNetworkInterfacesResponse.networkInterfaceSet.item.size()", equalTo(1))
+            // the interface's own specification, and not the instance's
+            .body("DescribeNetworkInterfacesResponse.networkInterfaceSet.item[0].tagSet.item[0].key",
+                    equalTo("Name"))
+            .body("DescribeNetworkInterfacesResponse.networkInterfaceSet.item[0].tagSet.item[0].value",
+                    equalTo("eni-tagspec-interface"))
+            .body(not(containsString("eni-tagspec-instance")))
+            .extract().path("DescribeNetworkInterfacesResponse.networkInterfaceSet.item[0].networkInterfaceId");
+
+        // The launch-time interface tag must also surface through DescribeTags under its own
+        // resource type: eni- ids classify as network-interface, not as an unknown type the
+        // resource-type filter then drops. Pinned to the interface's id, not just the tag pair,
+        // so the whole RunInstances -> createTags -> DescribeTags path is exercised.
+        given()
+            .formParam("Action", "DescribeTags")
+            .formParam("Filter.1.Name", "resource-type")
+            .formParam("Filter.1.Value.1", "network-interface")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeTagsResponse.tagSet.item.find { it.resourceId == '" + eniId + "' }.key",
+                    equalTo("Name"))
+            .body("DescribeTagsResponse.tagSet.item.find { it.resourceId == '" + eniId + "' }.value",
+                    equalTo("eni-tagspec-interface"))
+            .body("DescribeTagsResponse.tagSet.item.find { it.resourceId == '" + eniId + "' }.resourceType",
+                    equalTo("network-interface"));
+
+        given()
+            .formParam("Action", "DescribeInstances")
+            .formParam("InstanceId.1", taggedInstanceId)
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("eni-tagspec-instance"));
+
+        given()
+            .formParam("Action", "TerminateInstances")
+            .formParam("InstanceId.1", taggedInstanceId)
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
     }
 }

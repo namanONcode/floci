@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.config;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.dataformat.yaml.YAMLMapper;
+import io.smallrye.config.WithDefault;
 import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
@@ -35,8 +36,40 @@ class ApplicationDefaultsTest {
         JsonNode config = new YAMLMapper().readTree(Path.of("src/main/resources/application.yml").toFile());
 
         assertEquals(2048,
-                config.path("floci").path("max-request-size").asInt(),
+                config.path("floci").path("protocols").path("max-request-size").asInt(),
                 "production application.yml should allow 2048 MB request bodies by default");
+    }
+
+    @Test
+    void productionConfigUsesTheAwsSqsMaximumMessageSize() throws IOException, NoSuchMethodException {
+        JsonNode config = new YAMLMapper().readTree(Path.of("src/main/resources/application.yml").toFile());
+
+        assertEquals(1048576,
+                config.path("floci").path("services").path("sqs").path("max-message-size").asInt(),
+                "production application.yml should use the AWS SQS maximum of 1048576 bytes");
+
+        WithDefault fallback = EmulatorConfig.SqsServiceConfig.class
+                .getMethod("maxMessageSize")
+                .getAnnotation(WithDefault.class);
+        assertNotNull(fallback, "maxMessageSize should declare a fallback default");
+        assertEquals("1048576", fallback.value(),
+                "the EmulatorConfig fallback should match the AWS SQS maximum too");
+    }
+
+    @Test
+    void productionConfigListensOnLoopbackWithoutNetworkExposureConsent() throws IOException, NoSuchMethodException {
+        JsonNode config = new YAMLMapper().readTree(Path.of("src/main/resources/application.yml").toFile());
+
+        assertEquals("127.0.0.1", config.path("quarkus").path("http").path("host").asText(),
+                "production application.yml should listen on loopback by default");
+        assertFalse(config.path("floci").path("security").path("allow-unsafe-network-exposure").asBoolean(true),
+                "production application.yml should not allow a non-loopback listener by default");
+
+        WithDefault fallback = EmulatorConfig.SecurityConfig.class
+                .getMethod("allowUnsafeNetworkExposure")
+                .getAnnotation(WithDefault.class);
+        assertNotNull(fallback, "allowUnsafeNetworkExposure should declare a fallback default");
+        assertEquals("false", fallback.value(), "the EmulatorConfig fallback should refuse exposure too");
     }
 
     @Test
@@ -49,5 +82,74 @@ class ApplicationDefaultsTest {
                         .path("seed-deployer-principal")
                         .asBoolean(true),
                 "production application.yml should not create default admin credentials unless enabled");
+    }
+
+    @Test
+    void productionConfigRejectsPrivateJwtTargetsByDefault() throws Exception {
+        JsonNode config = new YAMLMapper().readTree(Path.of("src/main/resources/application.yml").toFile());
+
+        assertFalse(config.path("floci")
+                        .path("security")
+                        .path("allow-private-jwt-targets")
+                        .asBoolean(true),
+                "production application.yml should reject private JWT issuer and JWKS targets");
+
+        WithDefault fallback = EmulatorConfig.SecurityConfig.class
+                .getMethod("allowPrivateJwtTargets")
+                .getAnnotation(WithDefault.class);
+        assertNotNull(fallback, "allowPrivateJwtTargets should declare a fallback default");
+        assertEquals("false", fallback.value());
+    }
+
+    @Test
+    void productionConfigBindsRdsIamTokensToTheEndpointByDefault() throws NoSuchMethodException {
+        WithDefault fallback = EmulatorConfig.RdsServiceConfig.class
+                .getMethod("iamTokenEndpointBinding")
+                .getAnnotation(WithDefault.class);
+        assertNotNull(fallback, "iamTokenEndpointBinding should declare a fallback default");
+        assertEquals("true", fallback.value(),
+                "a stock Floci should refuse a PostgreSQL IAM token generated for another endpoint, as RDS does");
+    }
+
+    @Test
+    void productionConfigSizesTheDockerPoolForTheLambdaRuntimeApiPortRange() throws IOException, NoSuchMethodException {
+        JsonNode floci = new YAMLMapper().readTree(Path.of("src/main/resources/application.yml").toFile())
+                .path("floci");
+        int maxConnections = floci.path("docker").path("max-connections").asInt();
+        JsonNode lambda = floci.path("services").path("lambda");
+        int runtimeApiPorts = lambda.path("runtime-api-max-port").asInt()
+                - lambda.path("runtime-api-base-port").asInt() + 1;
+
+        assertTrue(maxConnections >= 2 * runtimeApiPorts,
+                "each live Lambda container holds two Docker connections (log follow and exit watcher), so "
+                        + "max-connections " + maxConnections + " should cover the " + runtimeApiPorts
+                        + " containers the runtime API port range allows");
+
+        WithDefault fallback = EmulatorConfig.DockerConfig.class
+                .getMethod("maxConnections")
+                .getAnnotation(WithDefault.class);
+        assertNotNull(fallback, "maxConnections should declare a fallback default");
+        assertEquals(String.valueOf(maxConnections), fallback.value(),
+                "the @WithDefault must match application.yml, which wins over it");
+    }
+
+    // Catches: streaming-max-connections declared and documented but absent from the shipped
+    // application.yml, or a yml value that silently disagrees with the @WithDefault fallback.
+    @Test
+    void productionConfigDeclaresTheStreamingDockerPoolAtItsDefault() throws IOException, NoSuchMethodException {
+        JsonNode streamingMaxConnections = new YAMLMapper()
+                .readTree(Path.of("src/main/resources/application.yml").toFile())
+                .path("floci").path("docker").path("streaming-max-connections");
+
+        assertFalse(streamingMaxConnections.isMissingNode(),
+                "streaming-max-connections should be declared in application.yml");
+        assertEquals(512, streamingMaxConnections.asInt());
+
+        WithDefault fallback = EmulatorConfig.DockerConfig.class
+                .getMethod("streamingMaxConnections")
+                .getAnnotation(WithDefault.class);
+        assertNotNull(fallback, "streamingMaxConnections should declare a fallback default");
+        assertEquals("512", fallback.value(),
+                "the @WithDefault must match application.yml, which wins over it");
     }
 }

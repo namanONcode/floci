@@ -11,6 +11,8 @@ import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
 import jakarta.ws.rs.ext.Provider;
 
+import java.util.Optional;
+
 @Provider
 public class ServiceEnabledFilter implements ContainerRequestFilter {
 
@@ -52,13 +54,15 @@ public class ServiceEnabledFilter implements ContainerRequestFilter {
             return null;
         }
 
-        var resourceMatch = catalog.byResourceClass(resourceClass());
+        Optional<ServiceDescriptor> resourceMatch = catalog.byResourceClass(resourceClass());
         if (resourceMatch.isPresent()) {
             ServiceDescriptor descriptor = resourceMatch.get();
             return new ResolvedRequest(descriptor.externalKey(), descriptor.defaultProtocol());
         }
 
         return SigV4CredentialScope.serviceName(ctx.getHeaderString("Authorization"))
+                .or(() -> SigV4CredentialScope.serviceNameFromCredential(
+                        ctx.getUriInfo().getQueryParameters().getFirst("X-Amz-Credential")))
                 .flatMap(catalog::byCredentialScope)
                 .map(descriptor -> new ResolvedRequest(
                         descriptor.externalKey(), protocolFor(claim, descriptor)))

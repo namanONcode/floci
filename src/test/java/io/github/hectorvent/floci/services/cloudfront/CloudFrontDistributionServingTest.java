@@ -14,6 +14,7 @@ import io.github.hectorvent.floci.services.s3.S3Service;
 import io.github.hectorvent.floci.services.s3.model.PutObjectOptions;
 import io.github.hectorvent.floci.services.s3.model.S3Object;
 import io.quarkus.test.junit.QuarkusTest;
+import io.restassured.response.Response;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.Test;
 
@@ -431,7 +432,7 @@ class CloudFrontDistributionServingTest {
                         defaultSigner.keyGroupId(),
                         privateSigner.keyGroupId()));
 
-        var created = given()
+        Response created = given()
                 .contentType("application/xml")
                 .body(body)
             .when()
@@ -450,7 +451,7 @@ class CloudFrontDistributionServingTest {
                 .extract().response();
 
         String configPath = created.header("Location") + "/config";
-        var config = given()
+        Response config = given()
             .when()
                 .get(configPath)
             .then()
@@ -518,7 +519,7 @@ class CloudFrontDistributionServingTest {
                         defaultSigner.keyGroupId(),
                         privateSigner.keyGroupId()));
 
-        var created = given()
+        Response created = given()
                 .contentType("application/xml")
                 .body(body)
             .when()
@@ -532,7 +533,7 @@ class CloudFrontDistributionServingTest {
                 .extract().response();
 
         String configPath = created.header("Location") + "/config";
-        var config = given()
+        Response config = given()
             .when()
                 .get(configPath)
             .then()
@@ -1422,6 +1423,34 @@ class CloudFrontDistributionServingTest {
                 .header("Access-Control-Request-Method", "GET")
                 .when().options("/resource")
                 .then().statusCode(200);
+    }
+
+    @Test
+    void writeMethodsAreNotForwardedToInProcessS3Origins() {
+        String suffix = suffix();
+        String bucket = "cf-writes-" + suffix;
+        createBucket(bucket);
+        putObject(bucket, "doc.txt", "ORIGINAL-" + suffix, "text/plain");
+
+        DefaultCacheBehavior dflt = defaultBehavior("only-origin");
+        dflt.setAllowedMethods(List.of("GET", "HEAD", "OPTIONS", "PUT", "POST", "PATCH", "DELETE"));
+        DistributionConfig config = new DistributionConfig();
+        config.setEnabled(true);
+        config.setOrigins(List.of(s3Origin("only-origin", bucket)));
+        config.setDefaultCacheBehavior(dflt);
+        Distribution distribution = cloudFrontService.createDistribution(distribution(config), Map.of());
+
+        for (String method : List.of("POST", "PUT", "PATCH", "DELETE")) {
+            given()
+                    .header("Host", distribution.getDomainName())
+                    .body("REPLACED-" + suffix)
+                    .when().request(method, "/doc.txt")
+                    .then().statusCode(403)
+                    .body(equalTo("Access Denied"));
+        }
+
+        given().header("Host", distribution.getDomainName()).when().get("/doc.txt")
+                .then().statusCode(200).body(equalTo("ORIGINAL-" + suffix));
     }
 
     @Test

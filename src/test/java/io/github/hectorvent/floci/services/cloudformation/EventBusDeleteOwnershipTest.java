@@ -1,16 +1,14 @@
 package io.github.hectorvent.floci.services.cloudformation;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
-import io.github.hectorvent.floci.services.cloudformation.provisioners.CloudFormationResourceRegistry;
+import io.github.hectorvent.floci.services.cloudformation.provisioners.CfnResourceDispatcher;
 import io.github.hectorvent.floci.services.eventbridge.EventBridgeService;
 import io.github.hectorvent.floci.services.eventbridge.model.EventBus;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.time.Instant;
-import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -33,20 +31,14 @@ class EventBusDeleteOwnershipTest {
     private static final String CREATED_TIME_ATTR = "FlociEventBusCreatedTime";
 
     private EventBridgeService eventBridgeService;
-    private CloudFormationResourceProvisioner provisioner;
+    private CfnResourceDispatcher provisioner;
 
     @BeforeEach
     void setUp() {
         eventBridgeService = mock(EventBridgeService.class);
-        provisioner = new CloudFormationResourceProvisioner(
-                null, null, null, null, null,
-                null, null, null, null, eventBridgeService,
-                null, null, null, null, null, null,
-                new ObjectMapper(),
-                null, null, null, null, null, null, null,
-                null, null, null, null, null, null, null,
-                null, null,
-                new CloudFormationResourceRegistry(List.of()));
+        provisioner = CfnProvisionerFixture.builder()
+                .eventBridge(eventBridgeService)
+                .build();
     }
 
     @Test

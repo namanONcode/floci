@@ -1,6 +1,8 @@
 package io.github.hectorvent.floci.core.common;
 
+import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
 import static io.restassured.RestAssured.given;
@@ -17,15 +19,20 @@ import static org.hamcrest.Matchers.not;
 @QuarkusTest
 class UnknownServiceScopeGuardIntegrationTest {
 
+    @BeforeAll
+    static void configureRestAssured() {
+        RestAssuredJsonUtils.configureAwsContentTypes();
+    }
+
     private static String authorization(String service) {
         return "AWS4-HMAC-SHA256 Credential=test/20260707/us-east-1/" + service
                 + "/aws4_request, SignedHeaders=host;x-amz-date, Signature=deadbeef";
     }
 
     @Test
-    void accountScopedRestRequestGetsUnknownOperation() {
+    void unsupportedRestServiceScopeGetsUnknownOperation() {
         given()
-            .header("Authorization", authorization("account"))
+            .header("Authorization", authorization("support"))
             .contentType("application/json")
             .body("{}")
         .when()
@@ -39,14 +46,32 @@ class UnknownServiceScopeGuardIntegrationTest {
     }
 
     @Test
-    void securityhubScopedRestRequestGetsUnknownOperation() {
+    void knownRestJsonScopeCannotFallThroughToS3Wildcard() {
         given()
-            .header("Authorization", authorization("securityhub"))
+            .header("Authorization", authorization("bedrock"))
+            .contentType("application/x-amz-json-1.1")
+            .body("{\"name\":\"probe\"}")
         .when()
-            .get("/accounts")
+            .post("/prompts")
         .then()
             .statusCode(404)
-            .body("__type", equalTo("UnknownOperationException"));
+            .contentType(containsString("application/json"))
+            .header("X-Amzn-Errortype", "UnknownOperationException")
+            .body("__type", equalTo("UnknownOperationException"))
+            .body("message", equalTo("Unknown operation: POST /prompts"));
+    }
+
+    @Test
+    void bedrockScopeStillReachesBedrockRuntimeRoutes() {
+        given()
+            .header("Authorization", authorization("bedrock"))
+            .contentType("application/json")
+            .body("{\"prompt\":\"hello\"}")
+        .when()
+            .post("/model/test-model/invoke")
+        .then()
+            .statusCode(200)
+            .contentType(containsString("application/json"));
     }
 
     @Test
@@ -88,6 +113,45 @@ class UnknownServiceScopeGuardIntegrationTest {
             .statusCode(404)
             .body("message", containsString("guard-test-thing"))
             .body("__type", not(equalTo("UnknownOperationException")));
+    }
+
+    @Test
+    void sesv2IsNotASigningScope() {
+        // Every SDK signs SES v2 as ses (botocore sesv2 signingName), so a REST request signed
+        // sesv2 names no service Floci serves.
+        given()
+            .header("Authorization", authorization("sesv2"))
+        .when()
+            .get("/v2/email/account")
+        .then()
+            .statusCode(404)
+            .body("__type", equalTo("UnknownOperationException"));
+
+        given()
+            .header("Authorization", authorization("ses"))
+        .when()
+            .get("/v2/email/account")
+        .then()
+            .statusCode(200);
+    }
+
+    @Test
+    void apigatewayv2IsNotASigningScope() {
+        // API Gateway v2 signs as apigateway in every SDK (botocore apigatewayv2 signingName).
+        given()
+            .header("Authorization", authorization("apigatewayv2"))
+        .when()
+            .get("/v2/apis")
+        .then()
+            .statusCode(404)
+            .body("__type", equalTo("UnknownOperationException"));
+
+        given()
+            .header("Authorization", authorization("apigateway"))
+        .when()
+            .get("/v2/apis")
+        .then()
+            .statusCode(200);
     }
 
     @Test

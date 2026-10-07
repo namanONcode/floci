@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import io.github.hectorvent.floci.services.cloudwatch.metrics.CloudWatchMetricsService;
 import io.github.hectorvent.floci.services.eventbridge.EventBridgeService;
 import io.github.hectorvent.floci.services.firehose.FirehoseService;
+import io.github.hectorvent.floci.services.ses.SesRecipientEvent.Cause;
 import io.github.hectorvent.floci.services.ses.model.ConfigurationSet;
 import io.github.hectorvent.floci.services.ses.model.EventBridgeDestination;
 import io.github.hectorvent.floci.services.ses.model.EventDestination;
@@ -20,6 +21,7 @@ import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -72,10 +74,7 @@ class SesEventPublisherTest {
         when(eventBridgeService.putEvents(any(), anyString()))
                 .thenReturn(new EventBridgeService.PutEventsResult(0, List.of()));
 
-        publisher.publish(configurationSetWithEventBridgeDestination(DEFAULT_BUS_ARN),
-                "SEND", "msg-1", null, null, "000000000000", "subj",
-                List.of("to@example.com"), null, null, List.of("to@example.com"),
-                null, null, null, null, Instant.now(), "us-east-1");
+        publisher.publish(configurationSetWithEventBridgeDestination(DEFAULT_BUS_ARN), SesRecipientEvent.of("SEND", Cause.SIMULATOR, List.of()), "msg-1", null, null, "000000000000", "subj", List.of("to@example.com"), null, null, List.of("to@example.com"), null, null, Instant.now(), "us-east-1");
 
         Map<String, Object> entry = captureSingleEntry();
         assertTrue(entry.containsKey("Resources"),
@@ -94,10 +93,7 @@ class SesEventPublisherTest {
         when(eventBridgeService.putEvents(any(), anyString()))
                 .thenReturn(new EventBridgeService.PutEventsResult(0, List.of()));
 
-        publisher.publish(configurationSetWithEventBridgeDestination(DEFAULT_BUS_ARN),
-                "SEND", "msg-1", "sender@example.com", arn, "000000000000", "subj",
-                List.of("to@example.com"), null, null, List.of("to@example.com"),
-                null, null, null, null, Instant.now(), "us-east-1");
+        publisher.publish(configurationSetWithEventBridgeDestination(DEFAULT_BUS_ARN), SesRecipientEvent.of("SEND", Cause.SIMULATOR, List.of()), "msg-1", "sender@example.com", arn, "000000000000", "subj", List.of("to@example.com"), null, null, List.of("to@example.com"), null, null, Instant.now(), "us-east-1");
 
         Map<String, Object> entry = captureSingleEntry();
         Object resources = entry.get("Resources");
@@ -106,6 +102,35 @@ class SesEventPublisherTest {
         ArrayNode arr = (ArrayNode) resources;
         assertEquals(1, arr.size());
         assertEquals(arn, arr.get(0).asText());
+    }
+
+    @Test
+    void publishEventBridge_failedEntries_doesNotThrow() {
+        when(eventBridgeService.putEvents(any(), anyString()))
+                .thenReturn(new EventBridgeService.PutEventsResult(1, List.of(Map.of("ErrorCode", "InternalFailure"))));
+
+        // A failed PutEvents entry is logged by the publisher but must not propagate
+        // back into the SES send path.
+        assertDoesNotThrow(() -> publisher.publish(
+                configurationSetWithEventBridgeDestination(DEFAULT_BUS_ARN),
+                SesRecipientEvent.of("SEND", Cause.SIMULATOR, List.of()), "msg-2", null, null,
+                "000000000000", "subj", List.of("to@example.com"), null, null,
+                List.of("to@example.com"), null, null, Instant.now(), "us-east-1"));
+        verify(eventBridgeService).putEvents(any(), anyString());
+    }
+
+    @Test
+    void publishEventBridge_putEventsThrows_doesNotThrow() {
+        when(eventBridgeService.putEvents(any(), anyString()))
+                .thenThrow(new RuntimeException("event bridge unavailable"));
+
+        // Downstream delivery failures must never fail the email send.
+        assertDoesNotThrow(() -> publisher.publish(
+                configurationSetWithEventBridgeDestination(DEFAULT_BUS_ARN),
+                SesRecipientEvent.of("SEND", Cause.SIMULATOR, List.of()), "msg-3", null, null,
+                "000000000000", "subj", List.of("to@example.com"), null, null,
+                List.of("to@example.com"), null, null, Instant.now(), "us-east-1"));
+        verify(eventBridgeService).putEvents(any(), anyString());
     }
 
     @SuppressWarnings("unchecked")

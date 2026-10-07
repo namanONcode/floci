@@ -45,8 +45,9 @@ public class SsmCommandService implements Resettable {
 
     private static final Logger LOG = Logger.getLogger(SsmCommandService.class);
     private static final int MIN_TIMEOUT_SECONDS = 30;
-    private static final int MAX_STDOUT_CHARS = 24000;
-    private static final int MAX_STDERR_CHARS = 8000;
+    private static final int MAX_INSTANCE_IDS = 50;
+    static final int MAX_STDOUT_CHARS = 24000;
+    static final int MAX_STDERR_CHARS = 8000;
 
     private final StorageBackend<String, InstanceInformation> instanceStore;
     private final StorageBackend<String, Command> commandStore;
@@ -73,11 +74,10 @@ public class SsmCommandService implements Resettable {
         this.objectMapper = objectMapper;
         this.regionResolver = regionResolver;
         this.directCommandExecutor = directCommandExecutor;
-        this.directExecutionExecutor = Executors.newCachedThreadPool(runnable -> {
-            Thread thread = new Thread(runnable, "floci-ssm-direct-execution");
-            thread.setDaemon(true);
-            return thread;
-        });
+        // Each direct execution blocks for the whole container exec, up to TimeoutSeconds, so every
+        // target gets its own virtual thread instead of a platform thread.
+        this.directExecutionExecutor = Executors.newThreadPerTaskExecutor(
+                Thread.ofVirtual().name("floci-ssm-direct-execution").factory());
     }
 
     @PreDestroy
@@ -114,12 +114,23 @@ public class SsmCommandService implements Resettable {
         info.setComputerName(request.path("Hostname").asText(instanceId));
         info.setRegion(region);
 
-        if (info.getRegistrationDate() == null) {
+        boolean firstRegistration = info.getRegistrationDate() == null;
+        if (firstRegistration) {
             info.setRegistrationDate(Instant.now());
         }
 
         instanceStore.put(instanceKey(region, instanceId), info);
         LOG.infov("SSM agent registered: instanceId={0} platform={1}/{2}", instanceId, info.getPlatformType(), info.getPlatformName());
+
+        // Registering with SSM does not create an EC2 instance record. Make it obvious when the
+        // agent lives in a container Floci did not launch through RunInstances: SendCommand falls
+        // back to agent polling and IMDS (169.254.169.254) has nothing to serve for that container.
+        if (firstRegistration && !directCommandExecutor.isContainerBacked(instanceId)) {
+            LOG.warnv("SSM managed instance {0} is not backed by a running Floci EC2 container. "
+                    + "SendCommand will use the agent polling flow and IMDS will not answer for it. "
+                    + "To get both, launch the container with EC2 RunInstances before registering its SSM agent.",
+                    instanceId);
+        }
     }
 
     public List<InstanceInformation> describeInstanceInformation(String region) {
@@ -139,6 +150,12 @@ public class SsmCommandService implements Resettable {
         request.path("InstanceIds").forEach(n -> instanceIds.add(n.asText()));
         if (instanceIds.isEmpty()) {
             throw new AwsException("InvalidInstanceId", "At least one InstanceId is required.", 400);
+        }
+        if (instanceIds.size() > MAX_INSTANCE_IDS) {
+            throw new AwsException(
+                    "ValidationException",
+                    "1 validation error detected: Value at 'instanceIds' failed to satisfy constraint: Member must have length less than or equal to " + MAX_INSTANCE_IDS,
+                    400);
         }
 
         Map<String, List<String>> parameters = parseParameters(request.path("Parameters"));
@@ -188,11 +205,12 @@ public class SsmCommandService implements Resettable {
             inv.setStatusDetails(statusDetails("Pending"));
             inv.setRegion(region);
 
-            if (directCommandExecutor.supports(instanceId, documentName)) {
+            String callerAccountId = regionResolver != null ? regionResolver.getAccountId() : null;
+            if (directCommandExecutor.supports(callerAccountId, instanceId, documentName)) {
                 inv.setStatus("InProgress");
                 inv.setStatusDetails(statusDetails("InProgress"));
                 invocationStore.put(invocationKey(region, commandId, instanceId), inv);
-                directExecutionRequests.add(new DirectExecutionRequest(instanceId, documentName, parameters));
+                directExecutionRequests.add(new DirectExecutionRequest(callerAccountId, instanceId, documentName, parameters));
             }
             else {
                 invocationStore.put(invocationKey(region, commandId, instanceId), inv);
@@ -204,6 +222,7 @@ public class SsmCommandService implements Resettable {
         Command response = copyCommand(command);
         for (DirectExecutionRequest directExecutionRequest : directExecutionRequests) {
             runDirectCommandAsync(
+                    directExecutionRequest.accountId(),
                     commandId,
                     directExecutionRequest.instanceId(),
                     directExecutionRequest.documentName(),
@@ -534,6 +553,7 @@ public class SsmCommandService implements Resettable {
     // ── Internal helpers ────────────────────────────────────────────────────
 
     private void runDirectCommandAsync(
+            String accountId,
             String commandId,
             String instanceId,
             String documentName,
@@ -548,10 +568,13 @@ public class SsmCommandService implements Resettable {
             }
 
             SsmDirectCommandExecutor.ExecutionResult result = directCommandExecutor
-                    .executeIfSupported(instanceId, documentName, parameters, timeoutSeconds)
+                    .executeIfSupported(accountId, instanceId, documentName, parameters, timeoutSeconds)
                     .orElse(null);
             if (result == null) {
                 synchronized (invocation) {
+                    if (!"InProgress".equals(invocation.getStatus())) {
+                        return;
+                    }
                     invocation.setStatus("Pending");
                     invocation.setStatusDetails(statusDetails("Pending"));
                     invocationStore.put(invKey, invocation);
@@ -561,6 +584,9 @@ public class SsmCommandService implements Resettable {
                 return;
             }
             synchronized (invocation) {
+                if (!"InProgress".equals(invocation.getStatus())) {
+                    return;
+                }
                 applyDirectResult(invocation, result);
                 invocationStore.put(invKey, invocation);
             }
@@ -790,6 +816,7 @@ public class SsmCommandService implements Resettable {
     }
 
     private record DirectExecutionRequest(
+            String accountId,
             String instanceId,
             String documentName,
             Map<String, List<String>> parameters) {}

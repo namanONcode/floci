@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.ecs.container;
 
 import com.github.dockerjava.api.DockerClient;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
 import io.github.hectorvent.floci.core.common.docker.ContainerDetector;
@@ -9,12 +10,17 @@ import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager.ContainerInfo;
 import io.github.hectorvent.floci.core.common.docker.ContainerLogStreamer;
 import io.github.hectorvent.floci.core.common.docker.LaunchedContainerAwsEnv;
+import io.github.hectorvent.floci.services.ecr.registry.EcrRegistryManager;
 import io.github.hectorvent.floci.services.ecs.model.ContainerDefinition;
 import io.github.hectorvent.floci.services.ecs.model.EcsTask;
+import io.github.hectorvent.floci.services.ecs.model.FirelensConfiguration;
+import io.github.hectorvent.floci.services.ecs.model.LogConfiguration;
 import io.github.hectorvent.floci.services.ecs.model.NetworkMode;
 import io.github.hectorvent.floci.services.ecs.model.PortMapping;
 import io.github.hectorvent.floci.services.ecs.model.TaskDefinition;
+import io.github.hectorvent.floci.services.lambda.launcher.ImageCacheService.LaunchImage;
 import io.github.hectorvent.floci.services.secretsmanager.SecretsManagerService;
+import io.github.hectorvent.floci.services.s3.S3Service;
 import io.github.hectorvent.floci.services.ssm.SsmService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -22,6 +28,8 @@ import org.junit.jupiter.api.Test;
 import java.util.List;
 import java.util.Map;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -60,6 +68,7 @@ class EcsContainerManagerPortMappingsTest {
     private ContainerBuilder.Builder builder;
     private ContainerLifecycleManager lifecycleManager;
     private ContainerDetector containerDetector;
+    private EmulatorConfig config;
     private RegionResolver regionResolver;
     private EcsContainerManager manager;
 
@@ -68,8 +77,11 @@ class EcsContainerManagerPortMappingsTest {
         builder = mock(ContainerBuilder.Builder.class, RETURNS_SELF);
         containerBuilder = mock(ContainerBuilder.class);
         when(containerBuilder.newContainer(anyString())).thenReturn(builder);
+        when(containerBuilder.resolveImage(anyString())).thenAnswer(invocation -> invocation.getArgument(0));
 
         lifecycleManager = mock(ContainerLifecycleManager.class);
+        when(lifecycleManager.resolveImageForLaunch(any(), any()))
+                .thenAnswer(invocation -> new LaunchImage(invocation.getArgument(0), null));
         when(lifecycleManager.createAndStart(any()))
                 .thenReturn(new ContainerInfo("docker-id", Map.of()));
         // resolveNetworkBindings() inspects the container after launch; deep stubs
@@ -79,15 +91,18 @@ class EcsContainerManagerPortMappingsTest {
 
         ContainerLogStreamer logStreamer = mock(ContainerLogStreamer.class);
         containerDetector = mock(ContainerDetector.class);
-        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
         regionResolver = mock(RegionResolver.class);
         LaunchedContainerAwsEnv awsEnv = mock(LaunchedContainerAwsEnv.class);
         when(awsEnv.sdkBaselineEnv(any(), any())).thenReturn(List.of());
         SsmService ssmService = mock(SsmService.class);
         SecretsManagerService secretsManagerService = mock(SecretsManagerService.class);
+        EcrRegistryManager ecrRegistryManager = mock(EcrRegistryManager.class);
+        when(ecrRegistryManager.rewriteImageUri(anyString())).thenAnswer(inv -> inv.getArgument(0));
 
         manager = new EcsContainerManager(containerBuilder, lifecycleManager, logStreamer,
-                containerDetector, config, regionResolver, awsEnv, ssmService, secretsManagerService);
+                containerDetector, config, regionResolver, awsEnv, ssmService, secretsManagerService, mock(S3Service.class),
+                ecrRegistryManager, mock(HostVolumePolicy.class));
     }
 
     private void startWith(List<PortMapping> portMappings) {
@@ -184,6 +199,71 @@ class EcsContainerManagerPortMappingsTest {
     }
 
     @Test
+    void awsvpcPortCanBePublishedStablyForHostRunners() {
+        when(containerDetector.isRunningInContainer()).thenReturn(true);
+        when(config.services().ecs().publishAwsvpcPortsToHost()).thenReturn(true);
+
+        startWith(List.of(new PortMapping(15_672)), NetworkMode.awsvpc);
+
+        verify(builder, times(1)).withPortBinding(15_672, 15_672);
+        verify(builder, never()).withExposedPort(15_672);
+        verify(builder, never()).withDynamicPort(15_672);
+    }
+
+    @Test
+    void awsvpcHostPublishingHonorsAnExplicitHostPort() {
+        when(containerDetector.isRunningInContainer()).thenReturn(true);
+        when(config.services().ecs().publishAwsvpcPortsToHost()).thenReturn(true);
+
+        startWith(List.of(new PortMapping(8080, 18_080, "tcp")), NetworkMode.awsvpc);
+
+        verify(builder, times(1)).withPortBinding(8080, 18_080);
+    }
+
+    @Test
+    void protectedAwsvpcNamespaceUsesTheStableHostBindings() {
+        ContainerDefinition app = new ContainerDefinition();
+        app.setPortMappings(List.of(
+                new PortMapping(6379),
+                new PortMapping(8080, 18_080, "tcp")));
+        TaskDefinition taskDefinition = new TaskDefinition();
+        taskDefinition.setContainerDefinitions(List.of(app));
+
+        Map<Integer, Integer> bindings = EcsContainerManager.namespacePortBindings(
+                taskDefinition, true, true);
+
+        assertEquals(Map.of(6379, 6379, 8080, 18_080), bindings);
+    }
+
+    @Test
+    void protectedAwsvpcNamespaceKeepsDefaultContainerModePrivate() {
+        ContainerDefinition app = new ContainerDefinition();
+        app.setPortMappings(List.of(new PortMapping(6379)));
+        TaskDefinition taskDefinition = new TaskDefinition();
+        taskDefinition.setContainerDefinitions(List.of(app));
+
+        Map<Integer, Integer> bindings = EcsContainerManager.namespacePortBindings(
+                taskDefinition, true, false);
+
+        assertEquals(Map.of(), bindings);
+    }
+
+    @Test
+    void protectedAwsvpcNamespaceUsesStableBindingsInNativeModeWithOptIn() {
+        ContainerDefinition app = new ContainerDefinition();
+        app.setPortMappings(List.of(
+                new PortMapping(6379),
+                new PortMapping(8080, 18_080, "tcp")));
+        TaskDefinition taskDefinition = new TaskDefinition();
+        taskDefinition.setContainerDefinitions(List.of(app));
+
+        Map<Integer, Integer> bindings = EcsContainerManager.namespacePortBindings(
+                taskDefinition, false, true);
+
+        assertEquals(Map.of(6379, 6379, 8080, 18_080), bindings);
+    }
+
+    @Test
     void twoAwsvpcTasksWithSameHostPortNeverBindLiterally() {
         when(containerDetector.isRunningInContainer()).thenReturn(false);
 
@@ -216,5 +296,34 @@ class EcsContainerManagerPortMappingsTest {
         verify(builder, times(1)).withExposedPort(9090);
         verify(builder, never()).withDynamicPort(9090);
         verify(builder, never()).withPortBinding(eq(9090), anyInt());
+    }
+
+    @Test
+    void firelensRouterDeclaringTheForwardPortIsRejected() {
+        when(containerDetector.isRunningInContainer()).thenReturn(false);
+
+        ContainerDefinition router = new ContainerDefinition();
+        router.setName("router");
+        router.setImage("fluent/fluent-bit:latest");
+        router.setPortMappings(List.of(new PortMapping(24224)));
+        router.setFirelensConfiguration(new FirelensConfiguration("fluentbit", Map.of()));
+
+        ContainerDefinition app = new ContainerDefinition();
+        app.setName("app");
+        app.setImage("app:latest");
+        app.setLogConfiguration(new LogConfiguration("awsfirelens", Map.of(), null));
+
+        TaskDefinition taskDef = new TaskDefinition();
+        taskDef.setFamily("test-family");
+        taskDef.setContainerDefinitions(List.of(app, router));
+
+        EcsTask task = new EcsTask();
+        task.setTaskArn("arn:aws:ecs:us-east-1:000000000000:task/test-cluster/abc123");
+
+        AwsException failure = assertThrows(AwsException.class,
+                () -> manager.startTask(task, taskDef, List.of(), "us-east-1"));
+
+        assertEquals("FireLens port 24224 must not be exposed.", failure.getMessage());
+        verify(builder, never()).withDynamicPort(24224);
     }
 }

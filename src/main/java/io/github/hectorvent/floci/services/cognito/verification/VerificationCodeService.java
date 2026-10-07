@@ -41,10 +41,18 @@ public final class VerificationCodeService {
     private static final Duration RATE_LIMIT_WINDOW = Duration.ofSeconds(30);
     private static final int MAX_ATTEMPTS = 5;
     private static final int SALT_BYTES = 16;
+    private static final int CODE_LOCK_STRIPES = 256;
 
     private final StorageBackend<String, VerificationCode> store;
     private final Clock clock;
     private final SecureRandom random;
+    /**
+     * Stripes, by storage key, that make issuing, consuming and invalidating a code one step each: only
+     * codes whose keys share a stripe wait on each other. Nothing but this service's store is called under
+     * one, never a Lambda trigger or a Cognito lock, so no lock a caller holds around these methods can form
+     * a cycle with it.
+     */
+    private final Object[] codeLocks = newCodeLocks();
 
     public VerificationCodeService(StorageFactory storageFactory, Clock clock) {
         this.store = storageFactory.create(
@@ -58,11 +66,20 @@ public final class VerificationCodeService {
 
     /**
      * Issue a new code for the given user/purpose. Returns the plaintext code
-     * (caller must dispatch via SES/SNS). Subject to {@link #RATE_LIMIT_WINDOW}.
+     * (caller must dispatch via SES/SNS). Subject to {@link #RATE_LIMIT_WINDOW}. Takes turns
+     * with {@link #consume} for the same key, so redeeming the previous code cannot delete
+     * this one.
      */
     public String issue(String userPoolId, String username,
                         VerificationCode.Purpose purpose, Duration ttl) {
         String key = VerificationCode.storageKey(userPoolId, username, purpose);
+        synchronized (lockFor(key)) {
+            return issueUnderLock(key, userPoolId, username, purpose, ttl);
+        }
+    }
+
+    private String issueUnderLock(String key, String userPoolId, String username,
+                                  VerificationCode.Purpose purpose, Duration ttl) {
         Optional<VerificationCode> existing = store.get(key);
         if (existing.isPresent() && !existing.get().isConsumed()) {
             Duration since = Duration.between(existing.get().getIssuedAt(), clock.instant());
@@ -86,28 +103,39 @@ public final class VerificationCodeService {
     }
 
     /**
-     * Validate a code. On success, marks it consumed and removes it. On any
-     * failure, throws {@link VerificationCodeException} with the specific
-     * {@link VerificationCodeException.Kind}.
+     * Validate a code. On success, marks it consumed. For the attribute-verification
+     * purposes, retains the tombstone until it expires or a new code replaces it, so a
+     * reused code answers {@code EXPIRED} rather than {@code NOT_FOUND}, validated against
+     * a real Cognito pool for {@code VerifyUserAttribute} (see CognitoServiceTest /
+     * CognitoAttributeVerificationIntegrationTest). {@link VerificationCode.Purpose#SIGNUP_CONFIRMATION}
+     * and {@link VerificationCode.Purpose#PASSWORD_RESET} keep the original delete-on-consume
+     * behavior instead, since that reuse case was never validated against real Cognito for
+     * {@code ConfirmSignUp} or {@code ConfirmForgotPassword}. On any failure, throws
+     * {@link VerificationCodeException} with the specific {@link VerificationCodeException.Kind}.
      *
-     * <p>Note: not thread-safe under concurrent {@code consume()} of the same
-     * (poolId, username, purpose) key — two racing wrong-code calls may
-     * decrement the attempts counter by 1 instead of 2. Acceptable for the
-     * single-user local-dev profile; revisit if floci grows multi-tenant.
+     * <p>Concurrent calls for the same (poolId, username, purpose) key take turns, so a code
+     * is redeemed once however many requests present it at the same moment, and every wrong
+     * attempt counts.
      */
     public void consume(String userPoolId, String username,
                         VerificationCode.Purpose purpose, String code) {
         String key = VerificationCode.storageKey(userPoolId, username, purpose);
+        synchronized (lockFor(key)) {
+            consumeUnderLock(key, purpose, code);
+        }
+    }
+
+    private void consumeUnderLock(String key, VerificationCode.Purpose purpose, String code) {
         VerificationCode vc = store.get(key).orElseThrow(() -> new VerificationCodeException(
             VerificationCodeException.Kind.NOT_FOUND,
             "Invalid verification code provided, please try again"));
-        if (vc.isConsumed()) {
-            throw new VerificationCodeException(
-                VerificationCodeException.Kind.NOT_FOUND,
-                "Invalid verification code provided, please try again");
-        }
         if (vc.isExpired(clock.instant())) {
             store.delete(key);
+            throw new VerificationCodeException(
+                VerificationCodeException.Kind.EXPIRED,
+                "Invalid code provided, please request a code again");
+        }
+        if (vc.isConsumed()) {
             throw new VerificationCodeException(
                 VerificationCodeException.Kind.EXPIRED,
                 "Invalid code provided, please request a code again");
@@ -136,13 +164,56 @@ public final class VerificationCodeService {
         }
 
         vc.markConsumed();
-        store.delete(key);
+        if (retainsConsumedTombstone(purpose)) {
+            store.put(key, vc);
+        } else {
+            store.delete(key);
+        }
+    }
+
+    private boolean retainsConsumedTombstone(VerificationCode.Purpose purpose) {
+        return purpose == VerificationCode.Purpose.EMAIL_ATTRIBUTE_VERIFICATION
+            || purpose == VerificationCode.Purpose.PHONE_ATTRIBUTE_VERIFICATION;
     }
 
     /** Remove any active code for the (pool, user, purpose). Idempotent. */
     public void invalidatePrevious(String userPoolId, String username,
                                    VerificationCode.Purpose purpose) {
-        store.delete(VerificationCode.storageKey(userPoolId, username, purpose));
+        invalidate(VerificationCode.storageKey(userPoolId, username, purpose));
+    }
+
+    /**
+     * Removes every code issued for a pool, for DeleteUserPool. Pool ids are caller-chosen via
+     * floci:override-id and may contain a colon, so the key prefix alone also matches a distinct
+     * pool whose id extends this one. The stored record's own userPoolId settles the boundary.
+     * Keys are collected before deleting so the backing key set is not modified while iterated.
+     */
+    public void invalidateForPool(String userPoolId) {
+        String prefix = userPoolId + ":";
+        store.keys().stream()
+            .filter(k -> k.startsWith(prefix))
+            .filter(k -> store.get(k).map(c -> userPoolId.equals(c.getUserPoolId())).orElse(false))
+            .toList()
+            .forEach(this::invalidate);
+    }
+
+    /** Deletes a code in turn with {@link #consume}, which could otherwise write a wrong attempt back after it. */
+    private void invalidate(String key) {
+        synchronized (lockFor(key)) {
+            store.delete(key);
+        }
+    }
+
+    private Object lockFor(String key) {
+        return codeLocks[Math.floorMod(key.hashCode(), CODE_LOCK_STRIPES)];
+    }
+
+    private static Object[] newCodeLocks() {
+        Object[] locks = new Object[CODE_LOCK_STRIPES];
+        for (int i = 0; i < locks.length; i++) {
+            locks[i] = new Object();
+        }
+        return locks;
     }
 
     private byte[] randomBytes(int n) {

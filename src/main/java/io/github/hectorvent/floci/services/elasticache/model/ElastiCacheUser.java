@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.elasticache.model;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 
 import java.time.Instant;
@@ -17,6 +18,8 @@ public class ElastiCacheUser {
     private String engine = "redis";
     private String status;
     private Instant createdAt;
+    // Minted once in the region of the CreateUser request; null for users persisted before it was stored.
+    private String arn;
 
     public ElastiCacheUser() {}
 
@@ -56,4 +59,27 @@ public class ElastiCacheUser {
 
     public Instant getCreatedAt() { return createdAt; }
     public void setCreatedAt(Instant createdAt) { this.createdAt = createdAt; }
+
+    public String getArn() { return arn; }
+    public void setArn(String arn) { this.arn = arn; }
+
+    @JsonIgnore
+    public boolean isEnabled() {
+        return isAccessStringOn(accessString);
+    }
+
+    public static boolean isAccessStringOn(String accessString) {
+        if (accessString == null || accessString.isBlank()) {
+            return false;
+        }
+        boolean on = false;
+        for (String token : accessString.trim().split("\\s+")) {
+            if ("on".equalsIgnoreCase(token)) {
+                on = true;
+            } else if ("off".equalsIgnoreCase(token)) {
+                on = false;
+            }
+        }
+        return on;
+    }
 }

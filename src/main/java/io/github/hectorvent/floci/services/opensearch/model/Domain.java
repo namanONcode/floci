@@ -65,11 +65,22 @@ public class Domain {
     @JsonProperty("ContainerId")
     private String containerId;
 
+    @JsonProperty("HostPort")
+    private Integer hostPort;
+
     @JsonIgnore
     private String accountId;
 
     @JsonProperty("VolumeId")
     private String volumeId;
+
+    /**
+     * The domain's Docker volume name. Stamped at creation with the current prefix; null on
+     * records written before this field existed, which are backfilled with the frozen legacy
+     * name so their data stays reachable.
+     */
+    @JsonProperty("DockerVolumeName")
+    private String dockerVolumeName;
 
     @JsonProperty("CreatedAt")
     @JsonFormat(shape = JsonFormat.Shape.NUMBER)
@@ -213,12 +224,28 @@ public class Domain {
         this.containerId = containerId;
     }
 
+    public Integer getHostPort() {
+        return hostPort;
+    }
+
+    public void setHostPort(Integer hostPort) {
+        this.hostPort = hostPort;
+    }
+
     public String getVolumeId() {
         return volumeId;
     }
 
     public void setVolumeId(String volumeId) {
         this.volumeId = volumeId;
+    }
+
+    public String getDockerVolumeName() {
+        return dockerVolumeName;
+    }
+
+    public void setDockerVolumeName(String dockerVolumeName) {
+        this.dockerVolumeName = dockerVolumeName;
     }
 
     public Instant getCreatedAt() {

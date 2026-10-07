@@ -3,18 +3,34 @@ package io.github.hectorvent.floci.services.ec2;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.ec2.model.Placement;
 import io.github.hectorvent.floci.services.ec2.model.Tag;
-import io.github.hectorvent.floci.services.iam.IamService;
-import io.github.hectorvent.floci.services.iam.model.InstanceProfile;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.when;
 
 class Ec2MetadataServerTest {
+
+    @Test
+    void reconciliationAndTerminationPreserveOtherInstances() {
+        Ec2MetadataServer server = new Ec2MetadataServer(null, null, null);
+        Instance first = new Instance();
+        first.setInstanceId("i-first");
+        Instance second = new Instance();
+        second.setInstanceId("i-second");
+        server.reconcileContainerAddresses(Set.of("192.0.2.1", "192.0.2.2"), first);
+        server.reconcileContainerAddresses(Set.of("192.0.2.2", "192.0.2.3"), second);
+        server.reconcileContainerAddresses(Set.of("192.0.2.4"), first);
+        assertTrue(server.registeredContainer("192.0.2.1").isEmpty());
+        assertEquals(second, server.registeredContainer("192.0.2.2").orElseThrow());
+        server.unregisterInstance(null);
+        assertEquals(first, server.registeredContainer("192.0.2.4").orElseThrow());
+        server.unregisterInstance(first);
+        assertTrue(server.registeredContainer("192.0.2.4").isEmpty());
+        assertEquals(second, server.registeredContainer("192.0.2.3").orElseThrow());
+    }
 
     @Test
     void instanceMetadataListsTagKeys() {
@@ -64,12 +80,22 @@ class Ec2MetadataServerTest {
         instance.setPrivateIpAddress("10.0.0.10");
         instance.setRegion("us-west-2");
 
-        assertTrue(Ec2MetadataServer.instanceIdentityDocument(instance, "000000000000")
+        assertTrue(Ec2MetadataServer.instanceIdentityDocument(instance, "000000000000", "us-west-2a")
                 .contains("\"architecture\":\"arm64\""));
 
         instance.setArchitecture(null);
-        assertTrue(Ec2MetadataServer.instanceIdentityDocument(instance, "000000000000")
+        assertTrue(Ec2MetadataServer.instanceIdentityDocument(instance, "000000000000", "us-west-2a")
                 .contains("\"architecture\":\"x86_64\""));
+    }
+
+    @Test
+    void identityDocumentOfAnInstanceWithoutPlacementReportsTheConfiguredZone() {
+        Instance instance = new Instance();
+        instance.setInstanceId("i-china");
+        instance.setRegion("cn-north-1");
+
+        assertTrue(Ec2MetadataServer.instanceIdentityDocument(instance, "000000000000", "cn-north-1b")
+                .contains("\"availabilityZone\":\"cn-north-1b\""));
     }
 
     @Test
@@ -90,16 +116,13 @@ class Ec2MetadataServerTest {
     }
 
     @Test
-    void iamCredentialRoleNameComesFromInstanceProfileRole() {
-        IamService iamService = mock(IamService.class);
-        InstanceProfile profile = new InstanceProfile();
-        profile.setInstanceProfileName("sample-profile");
-        profile.setRoleNames(List.of("sample-role"));
-        when(iamService.getInstanceProfile("sample-profile")).thenReturn(profile);
+    void unregisteredContainerMessageExplainsMissingEc2Record() {
+        String message = Ec2MetadataServer.unregisteredContainerMessage("172.17.0.9");
 
-        Ec2MetadataServer server = new Ec2MetadataServer(null, null, iamService);
-
-        assertEquals("sample-role", server.resolveRoleName(
-                "arn:aws:iam::000000000000:instance-profile/sample-profile"));
+        assertTrue(message.startsWith("Instance not found"));
+        assertTrue(message.contains("172.17.0.9"));
+        assertTrue(message.contains("RunInstances"));
+        assertTrue(message.contains("SSM managed instance"));
     }
+
 }

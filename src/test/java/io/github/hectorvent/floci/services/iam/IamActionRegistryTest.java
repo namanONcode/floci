@@ -6,10 +6,13 @@ import jakarta.ws.rs.core.MultivaluedHashMap;
 import jakarta.ws.rs.core.MultivaluedMap;
 import jakarta.ws.rs.core.UriInfo;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvFileSource;
 import org.mockito.Mockito;
 
 import java.io.ByteArrayInputStream;
 import java.io.InputStream;
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -41,6 +44,53 @@ class IamActionRegistryTest {
     }
 
     @Test
+    void resolvesOperationFromFormEncodedBody() {
+        ContainerRequestContext ctx = mockCtx(
+                "POST", "/",
+                new MultivaluedHashMap<>(),
+                MediaType.APPLICATION_FORM_URLENCODED_TYPE,
+                "Operation=CreateUser&Version=2010-05-08&UserName=alice");
+        assertEquals("CreateUser", registry.queryAction(ctx));
+    }
+
+    @Test
+    void actionTakesPrecedenceOverOperation() {
+        ContainerRequestContext ctx = mockCtx(
+                "POST", "/",
+                new MultivaluedHashMap<>(),
+                MediaType.APPLICATION_FORM_URLENCODED_TYPE,
+                "Action=ListUsers&Operation=CreateUser");
+        assertEquals("ListUsers", registry.queryAction(ctx));
+    }
+
+    @Test
+    void restActionIgnoresOperationFromFormBody() {
+        ContainerRequestContext ctx = mockCtx(
+                "PUT", "/bucket/key",
+                new MultivaluedHashMap<>(),
+                MediaType.APPLICATION_FORM_URLENCODED_TYPE,
+                "Operation=ListBucket");
+        assertEquals("s3:PutObject", registry.resolve("s3", ctx));
+    }
+
+    @Test
+    void restActionIgnoresActionFromUrl() {
+        MultivaluedMap<String, String> query = new MultivaluedHashMap<>();
+        query.add("Action", "ListBucket");
+        ContainerRequestContext ctx = mockCtx(
+                "PUT", "/bucket/key", query, null, "");
+        assertEquals("s3:PutObject", registry.resolve("s3", ctx));
+    }
+
+    @Test
+    void restActionIgnoresActionFromFormBody() {
+        ContainerRequestContext ctx = mockCtx(
+                "PUT", "/bucket/key", new MultivaluedHashMap<>(),
+                MediaType.APPLICATION_FORM_URLENCODED_TYPE, "Action=ListBucket");
+        assertEquals("s3:PutObject", registry.resolve("s3", ctx));
+    }
+
+    @Test
     void resolvesUrlEncodedActionValueFromFormBody() {
         ContainerRequestContext ctx = mockCtx(
                 "POST", "/",
@@ -51,9 +101,8 @@ class IamActionRegistryTest {
     }
 
     @Test
-    void prefersUrlQueryActionOverFormBody() {
-        // Some clients (older AWS CLI, curl) send Query-protocol requests with
-        // Action in the URL query string; that path must keep working.
+    void formBodyActionTakesPrecedenceOverUrlQueryAction() {
+        // The controller dispatches the form body, even when the URL names another action.
         MultivaluedMap<String, String> query = new MultivaluedHashMap<>();
         query.add("Action", "ListUsers");
         ContainerRequestContext ctx = mockCtx(
@@ -61,7 +110,17 @@ class IamActionRegistryTest {
                 query,
                 MediaType.APPLICATION_FORM_URLENCODED_TYPE,
                 "Action=DeleteUser");
-        assertEquals("iam:ListUsers", registry.resolve("iam", ctx));
+        assertEquals("iam:DeleteUser", registry.resolve("iam", ctx));
+    }
+
+    @Test
+    void urlQueryActionDoesNotAuthorizeAnAbsentFormAction() {
+        MultivaluedMap<String, String> query = new MultivaluedHashMap<>();
+        query.add("Action", "ListUsers");
+        ContainerRequestContext ctx = mockCtx(
+                "POST", "/", query, MediaType.APPLICATION_FORM_URLENCODED_TYPE,
+                "Version=2010-05-08");
+        assertNull(registry.queryAction(ctx));
     }
 
     @Test
@@ -109,6 +168,79 @@ class IamActionRegistryTest {
                 mockCtx("POST", "/CommitTransaction", new MultivaluedHashMap<>(), MediaType.APPLICATION_JSON_TYPE, "{}")));
         assertEquals("rds-data:RollbackTransaction", registry.resolve("rds-data",
                 mockCtx("POST", "/RollbackTransaction", new MultivaluedHashMap<>(), MediaType.APPLICATION_JSON_TYPE, "{}")));
+    }
+
+    /**
+     * The table is generated from the SES v2 model and AWS's service reference, not from the rule
+     * table, so it checks the rules rather than restating them: each operation's path has to
+     * resolve to the action AWS lists for it, and to no other operation's.
+     */
+    @ParameterizedTest(name = "{0}")
+    @CsvFileSource(resources = "/iam/sesv2-operation-actions.csv")
+    void resolvesEverySesV2OperationToItsAction(String operation, String method, String path, String action) {
+        assertEquals(action, registry.resolve("ses",
+                mockCtx(method, path, new MultivaluedHashMap<>(), MediaType.APPLICATION_JSON_TYPE, "{}")));
+    }
+
+    @Test
+    void sesV2RulesMatchTheWholePath() {
+        // A rule for /v2/email/configuration-sets must not also claim a path below it.
+        assertEquals("ses:ListConfigurationSets", registry.resolve("ses",
+                mockCtx("GET", "/v2/email/configuration-sets", new MultivaluedHashMap<>(),
+                        MediaType.APPLICATION_JSON_TYPE, "{}")));
+        assertEquals("ses:GetConfigurationSetEventDestinations", registry.resolve("ses",
+                mockCtx("GET", "/v2/email/configuration-sets/my-set/event-destinations/", new MultivaluedHashMap<>(),
+                        MediaType.APPLICATION_JSON_TYPE, "{}")));
+        assertNull(registry.resolve("ses",
+                mockCtx("GET", "/v2/email/configuration-sets/my-set/unknown", new MultivaluedHashMap<>(),
+                        MediaType.APPLICATION_JSON_TYPE, "{}")));
+    }
+
+    @Test
+    void aRestRouteIsNotRenamedByATargetHeader() {
+        // The route decides a REST request's action; a caller-supplied target must not name another.
+        ContainerRequestContext send = mockCtx("POST", "/v2/email/outbound-emails", new MultivaluedHashMap<>(),
+                MediaType.APPLICATION_JSON_TYPE, "{}");
+        when(send.getHeaderString("X-Amz-Target")).thenReturn("SES.GetAccount");
+        assertEquals("ses:SendEmail", registry.resolveRoute("ses", send));
+
+        ContainerRequestContext invoke = mockCtx("POST", "/2015-03-31/functions/f/invocations",
+                new MultivaluedHashMap<>(), MediaType.APPLICATION_JSON_TYPE, "{}");
+        when(invoke.getHeaderString("X-Amz-Target")).thenReturn("AWSLambda.GetFunction");
+        assertEquals("lambda:InvokeFunction", registry.resolveRoute("lambda", invoke));
+    }
+
+    @Test
+    void durableExecutionRoutesResolveToTheirActions() {
+        String arn = "arn%3Aaws%3Alambda%3Aus-east-1%3A000000000000%3Afunction%3Af%3A%24LATEST"
+                + "%2Fdurable-execution%2Fname%2Fid";
+        String base = "/2025-12-01/durable-executions/" + arn;
+        assertEquals("lambda:CheckpointDurableExecution", lambdaAction("POST", base + "/checkpoint"));
+        assertEquals("lambda:GetDurableExecutionState", lambdaAction("GET", base + "/state"));
+        assertEquals("lambda:GetDurableExecutionHistory", lambdaAction("GET", base + "/history"));
+        assertEquals("lambda:StopDurableExecution", lambdaAction("POST", base + "/stop"));
+        assertEquals("lambda:GetDurableExecution", lambdaAction("GET", base));
+        assertEquals("lambda:ListDurableExecutionsByFunction",
+                lambdaAction("GET", "/2025-12-01/functions/f/durable-executions"));
+        String callback = "/2025-12-01/durable-execution-callbacks/QUJD%2BREVG%2FR0g%3D";
+        assertEquals("lambda:SendDurableExecutionCallbackSuccess", lambdaAction("POST", callback + "/succeed"));
+        assertEquals("lambda:SendDurableExecutionCallbackFailure", lambdaAction("POST", callback + "/fail"));
+        assertEquals("lambda:SendDurableExecutionCallbackHeartbeat", lambdaAction("POST", callback + "/heartbeat"));
+    }
+
+    private String lambdaAction(String method, String path) {
+        return registry.resolveRoute("lambda",
+                mockCtx(method, path, new MultivaluedHashMap<>(), MediaType.APPLICATION_JSON_TYPE, "{}"));
+    }
+
+    @Test
+    void anEncodedSlashStaysInsideItsPathParameter() {
+        assertEquals("ses:GetSuppressedDestination", registry.resolveRoute("ses",
+                mockCtx("GET", "/v2/email/suppression/addresses/a%2Fb@example.com", new MultivaluedHashMap<>(),
+                        MediaType.APPLICATION_JSON_TYPE, "{}")));
+        assertEquals("ses:DeleteSuppressedDestination", registry.resolveRoute("ses",
+                mockCtx("DELETE", "/v2/email/suppression/addresses/a%2Fb@example.com", new MultivaluedHashMap<>(),
+                        MediaType.APPLICATION_JSON_TYPE, "{}")));
     }
 
     @Test
@@ -176,18 +308,15 @@ class IamActionRegistryTest {
 
     @Test
     void s3AccelerateYieldsToSubresourcesDispatchedFirst() {
-        // The controller executes the requestPayment operation for this request, so the
-        // accelerate mapping must not claim it; resolution falls back to the rule table,
-        // exactly like a plain ?requestPayment request today.
         MultivaluedMap<String, String> withRequestPayment = new MultivaluedHashMap<>();
         withRequestPayment.add("requestPayment", "");
         withRequestPayment.add("accelerate", "");
-        assertEquals("s3:CreateBucket",
+        assertEquals("s3:PutBucketRequestPayment",
                 registry.resolve("s3", mockCtx("PUT", "/bucket", withRequestPayment, null, "")));
         MultivaluedMap<String, String> withLocation = new MultivaluedHashMap<>();
         withLocation.add("location", "");
         withLocation.add("accelerate", "");
-        assertEquals("s3:ListBucket",
+        assertEquals("s3:GetBucketLocation",
                 registry.resolve("s3", mockCtx("GET", "/bucket", withLocation, null, "")));
         // uploads is a GET-only dispatch branch; on PUT it is inert and accelerate executes,
         // so the mapping must still claim the request there.
@@ -230,23 +359,22 @@ class IamActionRegistryTest {
 
     @Test
     void s3ReplicationYieldsToSubresourcesDispatchedFirst() {
-        // The controller executes the requestPayment operation for this request, so the
-        // replication mapping must not claim it; resolution falls back to the rule table.
+        // The first dispatched subresource determines the required permission.
         MultivaluedMap<String, String> withRequestPayment = new MultivaluedHashMap<>();
         withRequestPayment.add("requestPayment", "");
         withRequestPayment.add("replication", "");
-        assertEquals("s3:CreateBucket",
+        assertEquals("s3:PutBucketRequestPayment",
                 registry.resolve("s3", mockCtx("PUT", "/bucket", withRequestPayment, null, "")));
         MultivaluedMap<String, String> withLocation = new MultivaluedHashMap<>();
         withLocation.add("location", "");
         withLocation.add("replication", "");
-        assertEquals("s3:ListBucket",
+        assertEquals("s3:GetBucketLocation",
                 registry.resolve("s3", mockCtx("GET", "/bucket", withLocation, null, "")));
         // The DELETE chain dispatches website ahead of replication.
         MultivaluedMap<String, String> withWebsite = new MultivaluedHashMap<>();
         withWebsite.add("website", "");
         withWebsite.add("replication", "");
-        assertEquals("s3:DeleteBucket",
+        assertEquals("s3:DeleteBucketWebsite",
                 registry.resolve("s3", mockCtx("DELETE", "/bucket", withWebsite, null, "")));
         // requestPayment has no DELETE dispatch branch; it is inert there and
         // replication executes, so the mapping must still claim the request.
@@ -309,6 +437,67 @@ class IamActionRegistryTest {
                 registry.resolve("s3", mockCtx("DELETE", "/bucket/key.txt", withTagging, null, "")));
     }
 
+    @Test
+    void s3BucketSubResourceWritesResolveToTheirOwnActionNotCreateBucket() {
+        // The live failure: CDK's BucketNotificationsHandler role grants s3:PutBucketNotification
+        // on "*", exactly what real AWS requires, and the deploy died on
+        // "not authorized to perform: s3:CreateBucket" because method + path alone decided.
+        assertEquals("s3:PutBucketNotification", bucketAction("PUT", "notification"));
+        assertEquals("s3:GetBucketNotification", bucketAction("GET", "notification"));
+
+        assertEquals("s3:PutBucketPolicy", bucketAction("PUT", "policy"));
+        assertEquals("s3:PutBucketVersioning", bucketAction("PUT", "versioning"));
+        assertEquals("s3:PutEncryptionConfiguration", bucketAction("PUT", "encryption"));
+        assertEquals("s3:PutLifecycleConfiguration", bucketAction("PUT", "lifecycle"));
+        assertEquals("s3:PutBucketCORS", bucketAction("PUT", "cors"));
+        assertEquals("s3:PutBucketPublicAccessBlock", bucketAction("PUT", "publicAccessBlock"));
+    }
+
+    @Test
+    void s3BucketSubResourceReadsResolveToTheirOwnActionNotListBucket() {
+        assertEquals("s3:GetBucketLocation", bucketAction("GET", "location"));
+        assertEquals("s3:GetBucketVersioning", bucketAction("GET", "versioning"));
+        assertEquals("s3:ListBucketVersions", bucketAction("GET", "versions"));
+        assertEquals("s3:ListBucketMultipartUploads", bucketAction("GET", "uploads"));
+        assertEquals("s3:GetBucketPolicy", bucketAction("GET", "policy"));
+        assertEquals("s3:GetLifecycleConfiguration", bucketAction("GET", "lifecycle"));
+        assertEquals("s3:GetEncryptionConfiguration", bucketAction("GET", "encryption"));
+    }
+
+    @Test
+    void s3BucketSubResourceDeletesDoNotDemandDeleteBucket() {
+        // Removing a CORS rule asked for permission to delete the whole bucket. AWS authorises
+        // most sub-resource removals with the same Put* action that sets them; only policy and
+        // website have their own Delete action.
+        assertEquals("s3:PutBucketCORS", bucketAction("DELETE", "cors"));
+        assertEquals("s3:PutLifecycleConfiguration", bucketAction("DELETE", "lifecycle"));
+        assertEquals("s3:PutEncryptionConfiguration", bucketAction("DELETE", "encryption"));
+        assertEquals("s3:PutReplicationConfiguration", bucketAction("DELETE", "replication"));
+        assertEquals("s3:DeleteBucketPolicy", bucketAction("DELETE", "policy"));
+        assertEquals("s3:DeleteBucketWebsite", bucketAction("DELETE", "website"));
+        // A plain DELETE with no sub-resource still deletes the bucket.
+        assertEquals("s3:DeleteBucket",
+                registry.resolve("s3", mockCtx("DELETE", "/bucket", new MultivaluedHashMap<>(), null, "")));
+    }
+
+    @Test
+    void s3BucketOnlySubResourcesStayInertOnAnObjectPath() {
+        // ?notification on an object path is ignored by the object routes, so the request really
+        // is a GetObject/PutObject and must resolve as one.
+        MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+        params.add("notification", "");
+        assertEquals("s3:GetObject",
+                registry.resolve("s3", mockCtx("GET", "/bucket/key.txt", params, null, "")));
+        assertEquals("s3:PutObject",
+                registry.resolve("s3", mockCtx("PUT", "/bucket/key.txt", params, null, "")));
+    }
+
+    private String bucketAction(String method, String subResource) {
+        MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+        params.add(subResource, "");
+        return registry.resolve("s3", mockCtx(method, "/bucket", params, null, ""));
+    }
+
     // -------------------------------------------------------------------------
 
     private static ContainerRequestContext mockCtx(String method, String path,
@@ -327,6 +516,8 @@ class IamActionRegistryTest {
         UriInfo uriInfo = Mockito.mock(UriInfo.class);
         when(uriInfo.getQueryParameters()).thenReturn(queryParams);
         when(uriInfo.getPath()).thenReturn(path);
+        when(uriInfo.getRequestUri()).thenReturn(URI.create("http://localhost:4566" + path));
+        when(uriInfo.getBaseUri()).thenReturn(URI.create("http://localhost:4566/"));
         when(ctx.getUriInfo()).thenReturn(uriInfo);
         when(ctx.getMediaType()).thenReturn(mediaType);
         when(ctx.getMethod()).thenReturn(method);

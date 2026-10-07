@@ -4,12 +4,14 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.core.storage.PersistentStorage;
 import io.github.hectorvent.floci.services.guardduty.model.AdminAccount;
 import io.github.hectorvent.floci.services.guardduty.model.Detector;
 import io.github.hectorvent.floci.services.guardduty.model.DetectorAdditionalConfiguration;
 import io.github.hectorvent.floci.services.guardduty.model.DetectorFeature;
+import io.github.hectorvent.floci.services.guardduty.model.MemberAccount;
 import io.github.hectorvent.floci.services.guardduty.model.OrganizationAdditionalConfiguration;
 import io.github.hectorvent.floci.services.guardduty.model.OrganizationConfiguration;
 import io.github.hectorvent.floci.services.guardduty.model.OrganizationFeature;
@@ -32,7 +34,7 @@ class GuardDutyServiceTest {
 
     private final ObjectMapper objectMapper = new ObjectMapper();
     private final GuardDutyService service =
-            new GuardDutyService(new InMemoryStorage<>(), new InMemoryStorage<>());
+            new GuardDutyService(new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>());
 
     @Test
     void createDetectorAppliesDefaultsAndGeneratesIdentifiers() throws Exception {
@@ -177,17 +179,27 @@ class GuardDutyServiceTest {
         AwsException error = assertThrows(
                 AwsException.class, () -> service.deleteDetector(REGION, detector.getId()));
         assertEquals(GuardDutyService.DETECTOR_NOT_FOUND_MESSAGE, error.getMessage());
-        assertTrue(service.listDetectorIds(REGION, null, null).items().isEmpty());
+        assertTrue(service.listDetectorIds(REGION, ACCOUNT, null, null).items().isEmpty());
     }
 
     @Test
     void listDetectorIdsReturnsTheRegionalDetector() throws Exception {
         Detector detector = service.createDetector(REGION, ACCOUNT, request("{\"enable\":true}"));
 
-        GuardDutyService.Page<String> page = service.listDetectorIds(REGION, null, null);
+        GuardDutyService.Page<String> page = service.listDetectorIds(REGION, ACCOUNT, null, null);
 
         assertEquals(List.of(detector.getId()), page.items());
         assertNull(page.nextToken());
+    }
+
+    @Test
+    void detectorsAreScopedByAccountWithinTheSameRegion() throws Exception {
+        String otherAccount = "222222222222";
+        Detector first = service.createDetector(REGION, ACCOUNT, request("{\"enable\":true}"));
+        Detector second = service.createDetector(REGION, otherAccount, request("{\"enable\":true}"));
+
+        assertEquals(List.of(first.getId()), service.listDetectorIds(REGION, ACCOUNT, null, null).items());
+        assertEquals(List.of(second.getId()), service.listDetectorIds(REGION, otherAccount, null, null).items());
     }
 
     @Test
@@ -262,6 +274,46 @@ class GuardDutyServiceTest {
     }
 
     @Test
+    void delegatedAdministratorCreatesEnabledOrganizationMembers() throws Exception {
+        String adminAccount = "111111111111";
+        String managementAccount = "222222222222";
+        service.enableOrganizationAdminAccount(REGION, request("{\"adminAccountId\":\"" + adminAccount + "\"}"));
+        Detector adminDetector = service.createDetector(REGION, adminAccount, request("{\"enable\":true}"));
+        service.createDetector(REGION, managementAccount, request("{\"enable\":true}"));
+
+        service.createMembers(REGION, adminDetector.getId(), request(
+                "{\"accountDetails\":[{\"accountId\":\"" + managementAccount
+                        + "\",\"email\":\"management@example.com\"}]}"));
+
+        List<MemberAccount> members = service.listMembers(REGION, adminDetector.getId(), null, null, "true").items();
+        assertEquals(1, members.size());
+        assertEquals(managementAccount, members.get(0).accountId());
+        assertEquals("Enabled", members.get(0).relationshipStatus());
+    }
+
+    @Test
+    void delegatedAdministratorIsVisibleAcrossAccountPartitions() throws Exception {
+        String adminAccount = "111111111111";
+        String managementAccount = "222222222222";
+        AccountAwareStorageBackend<Detector> detectors = AccountAwareStorageBackend.inMemory(adminAccount);
+        AccountAwareStorageBackend<AdminAccount> admins = AccountAwareStorageBackend.inMemory(adminAccount);
+        AccountAwareStorageBackend<MemberAccount> members = AccountAwareStorageBackend.inMemory(adminAccount);
+        admins.putForAccount(managementAccount, REGION + "::" + adminAccount,
+                new AdminAccount(adminAccount, "ENABLED"));
+        GuardDutyService partitioned = new GuardDutyService(detectors, admins, members);
+        Detector adminDetector = partitioned.createDetector(REGION, adminAccount, request("{\"enable\":true}"));
+
+        partitioned.createMembers(REGION, adminDetector.getId(), request(
+                "{\"accountDetails\":[{\"accountId\":\"" + managementAccount
+                        + "\",\"email\":\"management@example.com\"}]}"));
+
+        List<MemberAccount> listed = partitioned.listMembers(
+                REGION, adminDetector.getId(), null, null, "true").items();
+        assertEquals(1, listed.size());
+        assertEquals("Enabled", listed.get(0).relationshipStatus());
+    }
+
+    @Test
     void adminAccountLifecycle() throws Exception {
         service.enableOrganizationAdminAccount(REGION, request("{\"adminAccountId\":\"111111111111\"}"));
 
@@ -319,10 +371,13 @@ class GuardDutyServiceTest {
     void detectorSurvivesPersistentStorageReloadWithOrderIntact(@TempDir Path tempDir) throws Exception {
         Path detectorFile = tempDir.resolve("detectors.json");
         Path adminFile = tempDir.resolve("admins.json");
+        Path memberFile = tempDir.resolve("members.json");
         GuardDutyService firstService = new GuardDutyService(
                 loadedStore(detectorFile, new TypeReference<Map<String, Detector>>() {
                 }),
                 loadedStore(adminFile, new TypeReference<Map<String, AdminAccount>>() {
+                }),
+                loadedStore(memberFile, new TypeReference<Map<String, MemberAccount>>() {
                 }));
         Detector created = firstService.createDetector(REGION, ACCOUNT, request("""
                 {"enable":true,"tags":{"env":"test"},"features":[
@@ -340,6 +395,8 @@ class GuardDutyServiceTest {
                 loadedStore(detectorFile, new TypeReference<Map<String, Detector>>() {
                 }),
                 loadedStore(adminFile, new TypeReference<Map<String, AdminAccount>>() {
+                }),
+                loadedStore(memberFile, new TypeReference<Map<String, MemberAccount>>() {
                 }));
         Detector reloaded = reloadedService.getDetector(REGION, created.getId());
 

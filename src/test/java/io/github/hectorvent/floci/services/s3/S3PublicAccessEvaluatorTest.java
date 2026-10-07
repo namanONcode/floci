@@ -126,6 +126,28 @@ class S3PublicAccessEvaluatorTest {
     }
 
     @Test
+    void principalIsAwsServiceBoolRequiresTheMatchingContextValue() {
+        String userArn = "arn:aws:iam::123456789012:user/alice";
+        String policy = """
+                {"Version":"2012-10-17","Statement":{
+                  "Effect":"Allow",
+                  "Principal":{"AWS":"%s"},
+                  "Action":"s3:GetObject",
+                  "Resource":"arn:aws:s3:::public-bucket/*",
+                  "Condition":{"Bool":{"aws:PrincipalIsAWSService":"false"}}
+                }}""".formatted(userArn);
+
+        assertEquals(ALLOW, S3PublicAccessEvaluator.principalPolicyDecision(
+                OBJECT_MAPPER, policy, "AWS", userArn, "s3:GetObject", OBJECT_ARN,
+                Map.of("aws:PrincipalIsAWSService", "false")));
+        assertEquals(NEUTRAL, S3PublicAccessEvaluator.principalPolicyDecision(
+                OBJECT_MAPPER, policy, "AWS", userArn, "s3:GetObject", OBJECT_ARN,
+                Map.of("aws:PrincipalIsAWSService", "true")));
+        assertEquals(NEUTRAL, S3PublicAccessEvaluator.principalPolicyDecision(
+                OBJECT_MAPPER, policy, "AWS", userArn, "s3:GetObject", OBJECT_ARN, Map.of()));
+    }
+
+    @Test
     void cloudFrontOaiPrincipalMatchesAwsPrincipal() {
         String oaiArn =
                 "arn:aws:iam::cloudfront:user/CloudFront Origin Access Identity EIDENTITY";
@@ -382,7 +404,14 @@ class S3PublicAccessEvaluatorTest {
 
     @Test
     void arnHelpersBuildBucketAndObjectArns() {
-        assertEquals(BUCKET_ARN, S3PublicAccessEvaluator.bucketArn(BUCKET));
-        assertEquals(OBJECT_ARN, S3PublicAccessEvaluator.objectArn(BUCKET, "folder/object.txt"));
+        assertEquals(BUCKET_ARN, S3PublicAccessEvaluator.bucketArn("aws", BUCKET));
+        assertEquals(OBJECT_ARN, S3PublicAccessEvaluator.objectArn("aws", BUCKET, "folder/object.txt"));
+    }
+
+    /** The policy-evaluation ARNs carry the request's partition, or a China bucket policy never matches. */
+    @Test
+    void arnHelpersCarryTheGivenPartition() {
+        assertEquals("arn:aws-cn:s3:::" + BUCKET, S3PublicAccessEvaluator.bucketArn("aws-cn", BUCKET));
+        assertEquals("arn:aws-us-gov:s3:::" + BUCKET + "/k", S3PublicAccessEvaluator.objectArn("aws-us-gov", BUCKET, "k"));
     }
 }

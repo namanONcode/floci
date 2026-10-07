@@ -1,7 +1,12 @@
 package io.github.hectorvent.floci.services.resourceexplorer2;
 
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
+import io.github.hectorvent.floci.core.common.AwsArnUtils.Arn;
+import io.github.hectorvent.floci.core.common.AwsPartitions;
+import io.github.hectorvent.floci.core.common.AwsRegions;
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
+import io.restassured.response.Response;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.MethodOrderer;
@@ -427,6 +432,19 @@ class ResourceExplorer2IntegrationTest {
         }
 
         @Test
+        void listResourcesInvalidNextTokenReturnsValidationError() {
+            given()
+                .header("Authorization", AUTH)
+                .contentType("application/json")
+                .body("{\"NextToken\":\"!!!not-base64!!!\"}")
+            .when()
+                .post("/ListResources")
+            .then()
+                .statusCode(400)
+                .body("__type", equalTo("ValidationException"));
+        }
+
+        @Test
         void listResourcesInvalidFilterReturns400() {
             given()
                 .header("Authorization", AUTH)
@@ -464,7 +482,7 @@ class ResourceExplorer2IntegrationTest {
 
         @Test
         void searchWithEmptyQueryReturnsAllResources() {
-            var response = given()
+            Response response = given()
                 .header("Authorization", AUTH)
                 .contentType("application/json")
                 .body("""
@@ -1291,7 +1309,7 @@ class ResourceExplorer2IntegrationTest {
                         : "{\"MaxResults\": 1, \"NextToken\": \"" + nextToken
                                 + "\", \"Filters\": {\"FilterString\": \"" + BOUNDED_SCOPE + "\"}}";
 
-                var response = given()
+                Response response = given()
                     .header("Authorization", AUTH)
                     .contentType("application/json")
                     .body(body)
@@ -1429,7 +1447,7 @@ class ResourceExplorer2IntegrationTest {
                 .statusCode(200)
                 .extract().path("Resources");
 
-            for (var resource : resources) {
+            for (Map<String, Object> resource : resources) {
                 assertNotNull(resource.get("Arn"), "Resource missing Arn: " + resource);
                 assertNotNull(resource.get("ResourceType"), "Resource missing ResourceType: " + resource);
                 assertNotNull(resource.get("Service"), "Resource missing Service: " + resource);
@@ -1467,7 +1485,7 @@ class ResourceExplorer2IntegrationTest {
             .then()
                 .extract().path("Resources");
 
-            for (var resource : resources) {
+            for (Map<String, Object> resource : resources) {
                 String service = (String) resource.get("Service");
                 String resourceType = (String) resource.get("ResourceType");
                 assertTrue(
@@ -1487,11 +1505,17 @@ class ResourceExplorer2IntegrationTest {
             .then()
                 .extract().path("Resources");
 
-            for (var resource : resources) {
+            for (Map<String, Object> resource : resources) {
                 String arn = (String) resource.get("Arn");
                 String service = (String) resource.get("Service");
-                assertTrue(arn.startsWith("arn:aws:"),
-                        "ARN must start with arn:aws:, got: " + arn);
+                Arn parsed = AwsArnUtils.parse(arn);
+                // A regionless ARN (an S3 bucket) is in the partition of the region the resource
+                // lives in, which the listing reports; a global one ("global") says nothing.
+                String region = parsed.region().isEmpty() ? (String) resource.get("Region") : parsed.region();
+                if (AwsPartitions.isPublishedRegion(region)) {
+                    assertEquals(AwsRegions.partitionFor(region), parsed.partition(),
+                            "ARN partition must be the one its region belongs to, got: " + arn);
+                }
                 assertTrue(arn.contains(service),
                         "ARN should contain service '" + service + "', got: " + arn);
             }

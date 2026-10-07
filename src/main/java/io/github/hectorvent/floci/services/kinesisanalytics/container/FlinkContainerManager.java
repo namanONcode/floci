@@ -4,10 +4,12 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
 import io.github.hectorvent.floci.core.common.docker.ContainerDetector;
+import io.github.hectorvent.floci.core.common.docker.ContainerExec;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager.ContainerInfo;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager.EndpointInfo;
@@ -23,9 +25,6 @@ import io.github.hectorvent.floci.services.s3.S3Service;
 import io.github.hectorvent.floci.services.s3.model.S3Object;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
-import com.github.dockerjava.api.async.ResultCallback;
-import com.github.dockerjava.api.model.Frame;
-import com.github.dockerjava.api.model.StreamType;
 import org.apache.commons.compress.archivers.tar.TarArchiveEntry;
 import org.apache.commons.compress.archivers.tar.TarArchiveOutputStream;
 import org.jboss.logging.Logger;
@@ -39,9 +38,9 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.OptionalInt;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.TimeUnit;
 
 /**
  * Manages the backing Apache Flink cluster for a Managed Service for Apache Flink application.
@@ -64,6 +63,8 @@ public class FlinkContainerManager {
     private static final Logger LOG = Logger.getLogger(FlinkContainerManager.class);
     private static final int JOBMANAGER_REST_PORT = 8081;
     private static final String SAVEPOINTS_MOUNT = "/opt/flink/savepoints";
+    private static final int FLINK_UID = 9999;
+    private static final int FLINK_GID = 9999;
 
     private final ContainerBuilder containerBuilder;
     private final ContainerLifecycleManager lifecycleManager;
@@ -117,8 +118,22 @@ public class FlinkContainerManager {
      * accounts using the same application name would map to the same container. This mirrors AWS, where
      * an application name is account-and-region unique, and matches the accepted OpenSearch trade-off.
      */
-    private String containerName(String applicationName) {
-        return ContainerStorageHelper.resourceName(config, "kinesisanalytics", null, applicationName);
+    private String runtimeKey(FlinkApplication app) {
+        String arn = app.getApplicationArn();
+        if (arn == null || arn.isBlank()) {
+            arn = AwsArnUtils.Arn.of("kinesisanalytics", regionResolver.getDefaultRegion(),
+                    regionResolver.getAccountId(), "application/" + app.getApplicationName()).toString();
+        }
+        return arn.replace(':', '-').replace('/', '-');
+    }
+
+    private String containerName(FlinkApplication app) {
+        return ContainerStorageHelper.resourceName(config, "kinesisanalytics", null, runtimeKey(app));
+    }
+
+    private String regionOf(FlinkApplication app) {
+        String arn = app.getApplicationArn();
+        return arn == null || arn.isBlank() ? regionResolver.getDefaultRegion() : AwsArnUtils.parse(arn).region();
     }
 
     /**
@@ -129,13 +144,14 @@ public class FlinkContainerManager {
     public void startCluster(FlinkApplication app) {
         String image = KinesisAnalyticsRuntimes.resolveImage(
                 config.services().kinesisAnalytics().defaultImage(), app.getRuntimeEnvironment());
-        String jmName = containerName(app.getApplicationName());
+        String jmName = containerName(app);
         String tmName = jmName + "-tm";
 
         // Read the JAR before starting anything so a missing/empty artifact fails fast, before any
         // container is created. (S3 read runs on the request thread → account context is available.)
         byte[] jarBytes = app.hasCode() ? readJar(app) : null;
-        List<String> awsBaselineEnv = awsEnv.sdkBaselineEnv(config.defaultRegion(), Optional.empty());
+        String region = regionOf(app);
+        List<String> awsBaselineEnv = awsEnv.sdkBaselineEnv(region, Optional.empty());
 
         LOG.infov("Starting Flink cluster for application {0} using image {1}{2}",
                 app.getApplicationName(), image, app.hasCode() ? " (with TaskManager)" : "");
@@ -155,30 +171,41 @@ public class FlinkContainerManager {
                 .withEmbeddedDns()
                 .withLogRotation()
                 .withLabels(ContainerStorageHelper.resourceIdentityLabels(
-                        "kinesisanalytics", app.getApplicationName(), regionResolver.getAccountId(),
-                        regionResolver.getDefaultRegion()));
+                        "kinesisanalytics", app.getApplicationName(),
+                        app.getAccountId() != null ? app.getAccountId() : regionResolver.getAccountId(), region));
         // Named volume (not the container's ephemeral filesystem) so snapshots survive a
         // Stop/StartApplication cycle — stopCluster() removes the JobManager container, but this
         // volume is only removed on DeleteApplication (removeSavepointsVolume), mirroring how other
         // Docker-backed services keep persistent data outside the container lifecycle.
-        ContainerStorageHelper.applyStorage(jmSpec, lifecycleManager, config, "kinesisanalytics",
-                app.getApplicationName() + "-savepoints", app.getApplicationName() + "-savepoints",
-                SAVEPOINTS_MOUNT);
+        // Docker creates the volume root:root, but the official apache/flink images run Flink as
+        // uid/gid 9999, so the volume root is chowned to that user before the JobManager starts.
+        String savepointsVolume = resolveVolumeName(app);
+        lifecycleManager.ensureSharedVolume(savepointsVolume, OptionalInt.of(FLINK_UID),
+                OptionalInt.of(FLINK_GID), Optional.empty(), config.storage().efs().initImage());
+        jmSpec.withNamedVolume(savepointsVolume, SAVEPOINTS_MOUNT);
         if (!containerDetector.isRunningInContainer()) {
             jmSpec.withDynamicPort(JOBMANAGER_REST_PORT);
         } else {
             jmSpec.withExposedPort(JOBMANAGER_REST_PORT);
         }
 
+        ContainerSpec jmBuiltSpec = jmSpec.build();
         ContainerInfo jm;
         try {
-            jm = lifecycleManager.createAndStart(jmSpec.build());
+            String jmContainerId = lifecycleManager.create(jmBuiltSpec);
+            // Written before start (not via the post-start copyFileIntoContainer used for
+            // application_properties.json below) because log4j2 reads its config file at JVM
+            // startup -- copying it in after the process is already running would be too late for
+            // anything the JobManager logs from its own boot onward.
+            copyFileIntoContainer(jmContainerId, "/opt/flink/conf", "log4j-console.properties",
+                    msfStyleLog4j2Config(app), true);
+            jm = lifecycleManager.startCreated(jmContainerId, jmBuiltSpec);
         } catch (RuntimeException e) {
             lifecycleManager.removeIfExists(jmName);
             throw e;
         }
         app.setContainerId(jm.containerId());
-        containerIds.put(app.getApplicationName(), jm.containerId());
+        containerIds.put(runtimeKey(app), jm.containerId());
         EndpointInfo rest = jm.getEndpoint(JOBMANAGER_REST_PORT);
         app.setRestEndpoint("http://" + rest.host() + ":" + rest.port());
         attachLogs(app, jm.containerId());
@@ -198,13 +225,16 @@ public class FlinkContainerManager {
                     .withNetworkMode("container:" + jm.containerId())
                     .withLogRotation()
                     .withLabels(ContainerStorageHelper.resourceIdentityLabels(
-                            "kinesisanalytics", app.getApplicationName(), regionResolver.getAccountId(),
-                            regionResolver.getDefaultRegion()))
+                            "kinesisanalytics", app.getApplicationName(),
+                            app.getAccountId() != null ? app.getAccountId() : regionResolver.getAccountId(), region))
                     .build();
             try {
-                ContainerInfo tm = lifecycleManager.createAndStart(tmSpec);
+                String tmContainerId = lifecycleManager.create(tmSpec);
+                copyFileIntoContainer(tmContainerId, "/opt/flink/conf", "log4j-console.properties",
+                        msfStyleLog4j2Config(app), true);
+                ContainerInfo tm = lifecycleManager.startCreated(tmContainerId, tmSpec);
                 app.setTaskManagerContainerId(tm.containerId());
-                taskManagerIds.put(app.getApplicationName(), tm.containerId());
+                taskManagerIds.put(runtimeKey(app), tm.containerId());
             } catch (RuntimeException e) {
                 // Roll back the whole cluster so a failed start leaves nothing behind.
                 lifecycleManager.removeIfExists(tmName);
@@ -225,8 +255,8 @@ public class FlinkContainerManager {
             copyFileIntoContainer(jm.containerId(), "/etc", "flink/application_properties.json", propertiesJson);
             copyFileIntoContainer(app.getTaskManagerContainerId(), "/etc", "flink/application_properties.json",
                     propertiesJson);
-            pendingJars.put(app.getApplicationName(), jarBytes);
-            submissionFailed.remove(app.getApplicationName());
+            pendingJars.put(runtimeKey(app), jarBytes);
+            submissionFailed.remove(runtimeKey(app));
         }
     }
 
@@ -249,7 +279,88 @@ public class FlinkContainerManager {
         }
     }
 
+    /** Builds a log4j2 {@code log4j-console.properties} that makes the JobManager/TaskManager emit
+     *  one JSON object per log line, matching the schema real Managed Service for Apache Flink
+     *  writes to CloudWatch Logs (applicationARN/applicationVersionId/locationInformation/logger/
+     *  message/messageSchemaVersion/messageType/threadName/throwableInformation) -- so a JAR relying
+     *  on that shape for its own log-based tests sees the same thing here as on real MSF. Overwrites
+     *  the stock image's default (non-JSON) config entirely; not re-applied on {@link #redeployCode},
+     *  so applicationVersionId in already-emitted log lines does not advance across an in-place code
+     *  update (the JobManager/TaskManager JVMs, and therefore log4j2, are not restarted for that --
+     *  matching real MSF, which also keeps the same processes running across an UpdateApplication).
+     *  Package-private (not private) so FlinkContainerManagerTest can assert on the pattern shape
+     *  directly. */
+    byte[] msfStyleLog4j2Config(FlinkApplication app) {
+        String pattern = "{"
+                + "\"applicationARN\":\"%enc{"
+                + literalForLog4j2Pattern(String.valueOf(app.getApplicationArn())) + "}{JSON}\","
+                + "\"applicationVersionId\":\"%enc{"
+                + literalForLog4j2Pattern(String.valueOf(app.getApplicationVersionId())) + "}{JSON}\","
+                + "\"locationInformation\":\"%C.%M(%F:%L)\","
+                + "\"logger\":\"%logger\","
+                + "\"message\":\"%enc{%message}{JSON}\","
+                + "\"messageSchemaVersion\":\"1\","
+                + "\"messageType\":\"%level\","
+                + "\"threadName\":\"%enc{%thread}{JSON}\","
+                + "\"throwableInformation\":\"%enc{%ex}{JSON}\""
+                + "}%n";
+        String properties = "rootLogger.level = INFO\n"
+                + "rootLogger.appenderRef.console.ref = ConsoleAppender\n"
+                + "appender.console.type = Console\n"
+                + "appender.console.name = ConsoleAppender\n"
+                + "appender.console.layout.type = PatternLayout\n"
+                + "appender.console.layout.pattern = " + pattern + "\n";
+        return properties.getBytes(StandardCharsets.UTF_8);
+    }
+
+    /** Escapes an application-supplied value (e.g. the ARN, built from the caller's ApplicationName --
+     *  {@link io.github.hectorvent.floci.services.kinesisanalytics.KinesisAnalyticsV2Service} restricts
+     *  that to AWS's own {@code [a-zA-Z0-9_.-]} charset, but this stays defensive in case some other
+     *  caller ever feeds it something else) so it can be embedded as literal text inside a log4j2
+     *  {@code PatternLayout} pattern written to a {@code .properties} file: doubles {@code %} so
+     *  log4j2's pattern parser can't interpret it as the start of a conversion specifier, drops
+     *  {@code $} so it can't start a {@code ${...}} Lookup (log4j2 resolves those against config
+     *  values -- including this pattern -- at config-load time, so an unescaped one could leak an
+     *  environment variable or system property into every log line; doubling it like {@code %} only
+     *  defers the lookup to render time rather than neutralizing it, so it isn't a safe escape here),
+     *  then backslash-escapes control characters so the value survives
+     *  {@code java.util.Properties}-style parsing of the config file intact. The surrounding
+     *  {@code %enc{...}{JSON}} wrapper (already used for %message/%thread/%ex above) then JSON-escapes
+     *  the resulting literal at log time, so quotes/backslashes in the original value can't break the
+     *  emitted JSON. */
+    private static String literalForLog4j2Pattern(String value) {
+        String percentEscaped = value.replace("%", "%%");
+        StringBuilder escaped = new StringBuilder(percentEscaped.length());
+        for (int i = 0; i < percentEscaped.length(); i++) {
+            char c = percentEscaped.charAt(i);
+            switch (c) {
+                case '\\' -> escaped.append("\\\\");
+                case '$' -> { /* dropped: see method Javadoc -- can't be escaped to a safe literal */ }
+                case '\n' -> escaped.append("\\n");
+                case '\r' -> escaped.append("\\r");
+                case '\t' -> escaped.append("\\t");
+                default -> {
+                    if (c < 0x20) {
+                        escaped.append(String.format("\\u%04x", (int) c));
+                    } else {
+                        escaped.append(c);
+                    }
+                }
+            }
+        }
+        return escaped.toString();
+    }
+
     private void copyFileIntoContainer(String containerId, String remoteDir, String relativePath, byte[] content) {
+        copyFileIntoContainer(containerId, remoteDir, relativePath, content, false);
+    }
+
+    /** @param required when {@code true}, a failed copy is rethrown instead of only logged, so a
+     *  caller for whom the file is not optional (e.g. the log4j2 config that this cluster's whole
+     *  CloudWatch-log-shape guarantee depends on) fails the start instead of silently running with
+     *  the stock config. */
+    private void copyFileIntoContainer(String containerId, String remoteDir, String relativePath, byte[] content,
+            boolean required) {
         if (containerId == null) {
             return;
         }
@@ -260,6 +371,10 @@ public class FlinkContainerManager {
                     .withRemotePath(remoteDir)
                     .exec();
         } catch (Exception e) {
+            if (required) {
+                throw new IllegalStateException(
+                        "Could not copy " + relativePath + " into Flink container " + containerId, e);
+            }
             LOG.warnv("Could not copy {0} into Flink container {1}: {2}", relativePath, containerId, e.getMessage());
         }
     }
@@ -316,13 +431,13 @@ public class FlinkContainerManager {
             return true;
         }
         if (app.getFlinkJobId() == null) {
-            if (submissionFailed.contains(app.getApplicationName())) {
+            if (submissionFailed.contains(runtimeKey(app))) {
                 return false;
             }
             if (flinkRest.totalSlots(rest) < Math.max(1, app.getParallelism())) {
                 return false; // TaskManager not registered yet
             }
-            byte[] jar = pendingJars.get(app.getApplicationName());
+            byte[] jar = pendingJars.get(runtimeKey(app));
             if (jar == null) {
                 return false; // stashed at StartApplication; absent only after an emulator restart
             }
@@ -330,11 +445,11 @@ public class FlinkContainerManager {
                 String jarId = flinkRest.uploadJar(rest, jar);
                 String jobId = flinkRest.runJob(rest, jarId, app.getParallelism());
                 app.setFlinkJobId(jobId);
-                pendingJars.remove(app.getApplicationName());
+                pendingJars.remove(runtimeKey(app));
                 LOG.infov("Submitted Flink job {0} for application {1}", jobId, app.getApplicationName());
             } catch (Exception e) {
                 // Hard failure (e.g. a JAR with no main class) — do not resubmit every tick.
-                submissionFailed.add(app.getApplicationName());
+                submissionFailed.add(runtimeKey(app));
                 LOG.errorv(e, "Failed to submit Flink job for application {0}", app.getApplicationName());
             }
             return false;
@@ -361,8 +476,8 @@ public class FlinkContainerManager {
         copyFileIntoContainer(app.getContainerId(), "/etc", "flink/application_properties.json", propertiesJson);
         copyFileIntoContainer(app.getTaskManagerContainerId(), "/etc", "flink/application_properties.json",
                 propertiesJson);
-        pendingJars.put(app.getApplicationName(), readJar(app));
-        submissionFailed.remove(app.getApplicationName());
+        pendingJars.put(runtimeKey(app), readJar(app));
+        submissionFailed.remove(runtimeKey(app));
         LOG.infov("Redeployed code for Kinesis Analytics V2 application {0}", app.getApplicationName());
     }
 
@@ -371,28 +486,28 @@ public class FlinkContainerManager {
         if (rest != null && app.getFlinkJobId() != null) {
             flinkRest.cancelJob(rest, app.getFlinkJobId());
         }
-        pendingJars.remove(app.getApplicationName());
-        submissionFailed.remove(app.getApplicationName());
+        pendingJars.remove(runtimeKey(app));
+        submissionFailed.remove(runtimeKey(app));
 
         // Stop the TaskManager first, then the JobManager (whose netns it shares).
-        String tmId = taskManagerIds.remove(app.getApplicationName());
+        String tmId = taskManagerIds.remove(runtimeKey(app));
         if (tmId == null) {
             tmId = app.getTaskManagerContainerId();
         }
         if (tmId != null) {
             lifecycleManager.stopAndRemove(tmId, null);
         } else {
-            lifecycleManager.removeIfExists(containerName(app.getApplicationName()) + "-tm");
+            lifecycleManager.removeIfExists(containerName(app) + "-tm");
         }
 
-        containerIds.remove(app.getApplicationName());
-        Closeable logHandle = logStreams.remove(app.getApplicationName());
+        containerIds.remove(runtimeKey(app));
+        Closeable logHandle = logStreams.remove(runtimeKey(app));
         String jmId = app.getContainerId();
         if (jmId != null) {
             lifecycleManager.stopAndRemove(jmId, logHandle);
             LOG.infov("Flink cluster for application {0} stopped and removed", app.getApplicationName());
         } else {
-            lifecycleManager.removeIfExists(containerName(app.getApplicationName()));
+            lifecycleManager.removeIfExists(containerName(app));
         }
         app.setContainerId(null);
         app.setRestEndpoint(null);
@@ -467,8 +582,35 @@ public class FlinkContainerManager {
     /** Removes the persistent savepoints volume. Called only on DeleteApplication, never on a plain
      *  StopApplication (stopCluster), so snapshots survive a stop/restart cycle. */
     public void removeSavepointsVolume(FlinkApplication app) {
-        ContainerStorageHelper.removeStorage(config, lifecycleManager, "kinesisanalytics",
-                app.getApplicationName() + "-savepoints", app.getApplicationName() + "-savepoints");
+        ContainerStorageHelper.removeNamedVolume(config, lifecycleManager, resolveVolumeName(app));
+    }
+
+    /**
+     * The savepoints volume name a newly created application is stamped with: the current
+     * prefix over the account-and-region scoped runtime key, so the name is persisted rather
+     * than recomputed later.
+     */
+    public String savepointsVolumeName(FlinkApplication app) {
+        return ContainerStorageHelper.dockerName(config, savepointsVolumeToken(app));
+    }
+
+    /** The savepoints volume token; the name is this with a prefix applied. */
+    private String savepointsVolumeToken(FlinkApplication app) {
+        return "kinesisanalytics-" + runtimeKey(app) + "-savepoints";
+    }
+
+    /**
+     * The savepoints volume name, backfilled once for applications created before the field
+     * existed: those predate the {@code floci-aws-} migration, so their savepoints are in the
+     * legacy-named volume and must keep resolving there. Never use the live helper here, which
+     * would strand them under a freshly created volume.
+     */
+    private String resolveVolumeName(FlinkApplication app) {
+        if (app.getDockerVolumeName() == null || app.getDockerVolumeName().isBlank()) {
+            app.setDockerVolumeName(
+                    ContainerStorageHelper.legacyDockerName(config, savepointsVolumeToken(app)));
+        }
+        return app.getDockerVolumeName();
     }
 
     /**
@@ -500,44 +642,15 @@ public class FlinkContainerManager {
         String shortId = containerId.length() >= 8 ? containerId.substring(0, 8) : containerId;
         String logGroup = "/aws/kinesis-analytics/" + app.getApplicationName();
         String logStream = logStreamer.generateLogStreamName(shortId);
-        String region = regionResolver.getDefaultRegion();
+        String region = regionOf(app);
         Closeable logHandle = logStreamer.attach(containerId, logGroup, logStream, region,
-                "kinesisanalytics:" + app.getApplicationName());
+                "kinesisanalytics:" + runtimeKey(app));
         if (logHandle != null) {
-            logStreams.put(app.getApplicationName(), logHandle);
+            logStreams.put(runtimeKey(app), logHandle);
         }
     }
 
-    private ExecResult execInContainer(String containerId, String[] cmd) throws Exception {
-        var dockerClient = lifecycleManager.getDockerClient();
-        var exec = dockerClient.execCreateCmd(containerId)
-                .withCmd(cmd)
-                .withAttachStdout(true)
-                .withAttachStderr(true)
-                .exec();
-
-        ByteArrayOutputStream stdout = new ByteArrayOutputStream();
-        ByteArrayOutputStream stderr = new ByteArrayOutputStream();
-        boolean completed = dockerClient.execStartCmd(exec.getId())
-                .exec(new ResultCallback.Adapter<Frame>() {
-                    @Override
-                    public void onNext(Frame frame) {
-                        if (frame.getStreamType() == StreamType.STDERR) {
-                            stderr.writeBytes(frame.getPayload());
-                        } else {
-                            stdout.writeBytes(frame.getPayload());
-                        }
-                    }
-                })
-                .awaitCompletion(15, TimeUnit.SECONDS);
-
-        if (!completed) {
-            throw new RuntimeException("exec timed out in container " + containerId);
-        }
-        Long exitCode = dockerClient.inspectExecCmd(exec.getId()).exec().getExitCodeLong();
-        return new ExecResult(exitCode != null ? exitCode : -1,
-                stdout.toString(StandardCharsets.UTF_8), stderr.toString(StandardCharsets.UTF_8));
+    private ContainerExec.Result execInContainer(String containerId, String[] cmd) throws Exception {
+        return ContainerExec.run(lifecycleManager.getDockerClient(), containerId, cmd, 15).throwIfTimedOut(containerId);
     }
-
-    private record ExecResult(long exitCode, String stdout, String stderr) {}
 }

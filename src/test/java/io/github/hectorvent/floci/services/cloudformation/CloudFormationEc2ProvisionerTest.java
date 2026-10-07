@@ -4,8 +4,8 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
+import io.github.hectorvent.floci.services.cloudformation.provisioners.CfnResourceDispatcher;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.CfnRollback;
-import io.github.hectorvent.floci.services.cloudformation.provisioners.CloudFormationResourceRegistry;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.ec2.model.InstanceState;
@@ -13,7 +13,6 @@ import io.github.hectorvent.floci.services.ec2.model.Reservation;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
-import java.util.List;
 import java.util.Map;
 import java.util.function.Function;
 
@@ -33,16 +32,15 @@ class CloudFormationEc2ProvisionerTest {
 
     private final ObjectMapper mapper = new ObjectMapper();
     private Ec2Service ec2Service;
-    private CloudFormationResourceProvisioner provisioner;
+    private CfnResourceDispatcher provisioner;
 
     @BeforeEach
     void setUp() {
         ec2Service = mock(Ec2Service.class);
-        provisioner = new CloudFormationResourceProvisioner(
-                null, null, null, null, null, null, null, null, null, null,
-                null, null, null, null, null, null, mapper, null, null, null, null, null, null,
-                ec2Service, null, null, null, null, null, null, null,
-                null, null, new CloudFormationResourceRegistry(List.of()));
+        provisioner = CfnProvisionerFixture.builder()
+                .objectMapper(mapper)
+                .ec2(ec2Service)
+                .build();
     }
 
     @Test

@@ -1,6 +1,9 @@
 package io.github.hectorvent.floci.services.elasticache;
 
+import io.github.hectorvent.floci.testing.PartitionMatrix;
 import io.quarkus.test.junit.QuarkusTest;
+import io.restassured.specification.RequestSpecification;
+import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
@@ -28,7 +31,7 @@ class ElastiCacheParameterGroupIntegrationTest {
     private static final String AUTH_HEADER =
             "AWS4-HMAC-SHA256 Credential=test/20260412/us-east-1/elasticache/aws4_request";
 
-    private static io.restassured.specification.RequestSpecification query(String action) {
+    private static RequestSpecification query(String action) {
         return given()
                 .header("Authorization", AUTH_HEADER)
                 .formParam("Action", action)
@@ -200,6 +203,17 @@ class ElastiCacheParameterGroupIntegrationTest {
         .then()
             .statusCode(404)
             .body(containsString("no-such-pg is not present"));
+        // In China the expected partition is aws-cn, so a China ARN passes the partition check
+        // and reaches the resource lookup like a commercial one does in us-east-1.
+        given()
+                .header("Authorization", PartitionMatrix.sigV4Auth("cn-north-1", "elasticache"))
+                .formParam("Action", "ListTagsForResource")
+                .formParam("Version", "2015-02-02")
+                .formParam("ResourceName", "arn:aws-cn:elasticache:cn-north-1:000000000000:parametergroup:no-such-pg")
+        .when().post("/")
+        .then()
+            .statusCode(404)
+            .body(containsString("no-such-pg is not present"));
     }
 
     @Test
@@ -266,6 +280,75 @@ class ElastiCacheParameterGroupIntegrationTest {
         .then()
             .statusCode(404)
             .body(containsString("CacheParameterGroupnot found: absent-pg"));
+    }
+
+    @Test
+    @Order(4)
+    void aReplicationGroupCannotReferenceAnUnknownParameterGroup() {
+        // The lookup runs with the other validations, before any container is started, so the
+        // refusal carries the parameter group's own not-found rather than a provisioning failure.
+        query("CreateReplicationGroup")
+                .formParam("ReplicationGroupId", "pg-absent-rg")
+                .formParam("ReplicationGroupDescription", "references a missing group")
+                .formParam("CacheParameterGroupName", "absent-pg")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(404)
+            .body(containsString("<Code>CacheParameterGroupNotFound</Code>"))
+            .body(containsString("CacheParameterGroup absent-pg not found."));
+
+        query("DescribeReplicationGroups")
+                .formParam("ReplicationGroupId", "pg-absent-rg")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(404);
+    }
+
+    @Test
+    @Order(4)
+    void aParameterGroupInUseByAReplicationGroupCannotBeDeleted() {
+        // The replication group is a real one behind a container, so this case needs Docker
+        // where the rest of the class does not.
+        Assumptions.assumeTrue(ElastiCacheIntegrationTest.isDockerAvailable(),
+                "Docker daemon must be available to create a replication group");
+        String replicationGroupId = "pg-in-use-rg";
+        query("CreateReplicationGroup")
+                .formParam("ReplicationGroupId", replicationGroupId)
+                .formParam("ReplicationGroupDescription", "holds the parameter group in use")
+                .formParam("CacheParameterGroupName", GROUP)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        try {
+            query("DeleteCacheParameterGroup")
+                    .formParam("CacheParameterGroupName", GROUP)
+            .when()
+                .post("/")
+            .then()
+                .statusCode(400)
+                .body(containsString("<Code>InvalidCacheParameterGroupState</Code>"))
+                .body(containsString("One or more cache clusters are still members of this parameter group "
+                        + GROUP + ", so the group cannot be deleted."));
+
+            query("DescribeCacheParameterGroups")
+                    .formParam("CacheParameterGroupName", GROUP)
+            .when()
+                .post("/")
+            .then()
+                .statusCode(200)
+                .body(containsString("<CacheParameterGroupName>" + GROUP + "</CacheParameterGroupName>"));
+        } finally {
+            query("DeleteReplicationGroup")
+                    .formParam("ReplicationGroupId", replicationGroupId)
+            .when()
+                .post("/")
+            .then()
+                .statusCode(200);
+        }
     }
 
     @Test

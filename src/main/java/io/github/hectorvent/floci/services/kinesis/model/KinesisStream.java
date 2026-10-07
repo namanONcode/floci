@@ -10,6 +10,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CopyOnWriteArrayList;
 
 @RegisterForReflection
 @JsonIgnoreProperties(ignoreUnknown = true)
@@ -18,7 +19,7 @@ public class KinesisStream {
     private String streamArn;
     private String accountId;
     private String streamStatus;
-    private List<KinesisShard> shards = new ArrayList<>();
+    private volatile List<KinesisShard> shards = new CopyOnWriteArrayList<>();
     private int retentionPeriodHours = 24;
     private Instant streamCreationTimestamp;
     private Map<String, String> tags = new HashMap<>();
@@ -28,6 +29,11 @@ public class KinesisStream {
     private Set<String> enhancedMonitoringMetrics = new HashSet<>();
     // AWS's default; streams persisted before this field existed read as the default too.
     private int maxRecordSizeInKiB = 1024;
+    /**
+     * UpdateShardCount call timestamps, kept to enforce the rolling 24-hour scaling-operation
+     * limit. Streams persisted before this field existed read back as an empty history.
+     */
+    private List<Instant> shardCountUpdateTimestamps = new ArrayList<>();
 
     public KinesisStream() {}
 
@@ -51,7 +57,9 @@ public class KinesisStream {
     public void setStreamStatus(String streamStatus) { this.streamStatus = streamStatus; }
 
     public List<KinesisShard> getShards() { return shards; }
-    public void setShards(List<KinesisShard> shards) { this.shards = shards; }
+    public void setShards(List<KinesisShard> shards) {
+        this.shards = shards == null ? new CopyOnWriteArrayList<>() : new CopyOnWriteArrayList<>(shards);
+    }
 
     public int getRetentionPeriodHours() { return retentionPeriodHours; }
     public void setRetentionPeriodHours(int retentionPeriodHours) { this.retentionPeriodHours = retentionPeriodHours; }
@@ -76,4 +84,9 @@ public class KinesisStream {
 
     public Set<String> getEnhancedMonitoringMetrics() { return enhancedMonitoringMetrics; }
     public void setEnhancedMonitoringMetrics(Set<String> enhancedMonitoringMetrics) { this.enhancedMonitoringMetrics = enhancedMonitoringMetrics; }
+
+    public List<Instant> getShardCountUpdateTimestamps() { return shardCountUpdateTimestamps; }
+    public void setShardCountUpdateTimestamps(List<Instant> shardCountUpdateTimestamps) {
+        this.shardCountUpdateTimestamps = shardCountUpdateTimestamps == null ? new ArrayList<>() : shardCountUpdateTimestamps;
+    }
 }

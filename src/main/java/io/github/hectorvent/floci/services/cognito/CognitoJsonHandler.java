@@ -9,16 +9,21 @@ import io.github.hectorvent.floci.core.common.AwsErrorResponse;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.cognito.model.CognitoGroup;
 import io.github.hectorvent.floci.services.cognito.model.CognitoUser;
+import io.github.hectorvent.floci.services.cognito.model.IdentityProvider;
 import io.github.hectorvent.floci.services.cognito.model.ResourceServer;
 import io.github.hectorvent.floci.services.cognito.model.ResourceServerScope;
 import io.github.hectorvent.floci.services.cognito.model.UserPool;
 import io.github.hectorvent.floci.services.cognito.model.UserPoolClient;
 import io.github.hectorvent.floci.services.cognito.model.UserPoolClientSecret;
+import io.github.hectorvent.floci.services.cognito.model.UserPoolDomain;
+import io.github.hectorvent.floci.services.cognito.model.ManagedLoginBranding;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.core.Response;
 
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -36,6 +41,21 @@ public class CognitoJsonHandler {
     }
 
     public Response handle(String action, JsonNode request, String region) {
+        // Every operation naming a UserPoolId is signed for the caller's region, except the unsigned
+        // UpdateAuthEventFeedback, whose region Floci cannot know.
+        if (region != null && request.hasNonNull("UserPoolId") && !"UpdateAuthEventFeedback".equals(action)) {
+            service.requireUserPoolInRegion(request.path("UserPoolId").asText(), region);
+        }
+        // The tag operations name the pool by ARN, and a domain is looked up by its name.
+        if (region != null) {
+            switch (action) {
+                case "TagResource", "UntagResource", "ListTagsForResource" ->
+                        service.requireUserPoolArnInRegion(request.path("ResourceArn").asText(), region);
+                case "DescribeUserPoolDomain" ->
+                        service.requireUserPoolDomainInRegion(request.path("Domain").asText(), region);
+                default -> { }
+            }
+        }
         return switch (action) {
             case "CreateUserPool" -> handleCreateUserPool(request, region);
             case "DescribeUserPool" -> handleDescribeUserPool(request);
@@ -46,6 +66,7 @@ public class CognitoJsonHandler {
             case "UntagResource" -> handleUntagResource(request);
             case "ListTagsForResource" -> handleListTagsForResource(request);
             case "GetUserPoolMfaConfig" -> handleGetUserPoolMfaConfig(request);
+            case "SetUserPoolMfaConfig" -> handleSetUserPoolMfaConfig(request);
             case "DeleteUserPool" -> handleDeleteUserPool(request);
             case "CreateUserPoolClient" -> handleCreateUserPoolClient(request);
             case "DescribeUserPoolClient" -> handleDescribeUserPoolClient(request);
@@ -57,6 +78,17 @@ public class CognitoJsonHandler {
             case "ListResourceServers" -> handleListResourceServers(request);
             case "UpdateResourceServer" -> handleUpdateResourceServer(request);
             case "DeleteResourceServer" -> handleDeleteResourceServer(request);
+            case "CreateIdentityProvider" -> handleCreateIdentityProvider(request);
+            case "DescribeIdentityProvider" -> handleDescribeIdentityProvider(request);
+            case "ListIdentityProviders" -> handleListIdentityProviders(request);
+            case "UpdateIdentityProvider" -> handleUpdateIdentityProvider(request);
+            case "DeleteIdentityProvider" -> handleDeleteIdentityProvider(request);
+            case "CreateUserPoolDomain" -> handleCreateUserPoolDomain(request);
+            case "DescribeUserPoolDomain" -> handleDescribeUserPoolDomain(request);
+            case "UpdateUserPoolDomain" -> handleUpdateUserPoolDomain(request);
+            case "DeleteUserPoolDomain" -> handleDeleteUserPoolDomain(request);
+            case "SetLogDeliveryConfiguration" -> handleSetLogDeliveryConfiguration(request);
+            case "GetLogDeliveryConfiguration" -> handleGetLogDeliveryConfiguration(request);
             case "AdminResetUserPassword" -> handleAdminResetUserPassword(request);
             case "AdminCreateUser" -> handleAdminCreateUser(request);
             case "AdminGetUser" -> handleAdminGetUser(request);
@@ -68,11 +100,18 @@ public class CognitoJsonHandler {
             case "AdminEnableUser" -> handleAdminEnableUser(request);
             case "AdminDisableUser" -> handleAdminDisableUser(request);
             case "AdminLinkProviderForUser" -> handleAdminLinkProviderForUser(request);
+            case "CreateManagedLoginBranding" -> handleCreateManagedLoginBranding(request);
+            case "DescribeManagedLoginBranding" -> handleDescribeManagedLoginBranding(request);
+            case "DescribeManagedLoginBrandingByClient" -> handleDescribeManagedLoginBrandingByClient(request);
+            case "UpdateManagedLoginBranding" -> handleUpdateManagedLoginBranding(request);
+            case "DeleteManagedLoginBranding" -> handleDeleteManagedLoginBranding(request);
             case "ListUsers" -> handleListUsers(request);
             case "InitiateAuth" -> handleInitiateAuth(request);
             case "AdminInitiateAuth" -> handleAdminInitiateAuth(request);
             case "RespondToAuthChallenge" -> handleRespondToAuthChallenge(request);
             case "AdminRespondToAuthChallenge" -> handleAdminRespondToAuthChallenge(request);
+            case "AssociateSoftwareToken" -> handleAssociateSoftwareToken(request);
+            case "VerifySoftwareToken" -> handleVerifySoftwareToken(request);
             case "SignUp" -> handleSignUp(request);
             case "ConfirmSignUp" -> handleConfirmSignUp(request);
             case "ResendConfirmationCode" -> handleResendConfirmationCode(request);
@@ -81,10 +120,13 @@ public class CognitoJsonHandler {
             case "ForgotPassword" -> handleForgotPassword(request);
             case "ConfirmForgotPassword" -> handleConfirmForgotPassword(request);
             case "GetUser" -> handleGetUser(request);
+            case "GetUserAuthFactors" -> handleGetUserAuthFactors(request);
             case "GetUserAttributeVerificationCode" -> handleGetUserAttributeVerificationCode(request);
+            case "VerifyUserAttribute" -> handleVerifyUserAttribute(request);
             case "UpdateUserAttributes" -> handleUpdateUserAttributes(request);
             case "DeleteUserAttributes" -> handleDeleteUserAttributes(request);
             case "GlobalSignOut" -> handleGlobalSignOut(request);
+            case "DeleteUser" -> handleDeleteUser(request);
             case "CreateGroup" -> handleCreateGroup(request);
             case "GetGroup" -> handleGetGroup(request);
             case "ListGroups" -> handleListGroups(request);
@@ -99,6 +141,8 @@ public class CognitoJsonHandler {
             case "ListUserPoolClientSecrets" -> handleListUserPoolClientSecrets(request);
             case "AddUserPoolClientSecret" -> handleAddUserPoolClientSecret(request);
             case "DeleteUserPoolClientSecret" -> handleDeleteUserPoolClientSecret(request);
+            case "AdminSetUserMFAPreference" -> handleAdminSetUserMFAPreference(request);
+            case "SetUserMFAPreference" -> handleSetUserMFAPreference(request);
             default -> Response.status(400)
                     .entity(new AwsErrorResponse("UnsupportedOperation", "Operation " + action + " is not supported."))
                     .build();
@@ -175,9 +219,34 @@ public class CognitoJsonHandler {
 
     private Response handleGetUserPoolMfaConfig(JsonNode request) {
         UserPool pool = service.describeUserPool(request.path("UserPoolId").asText());
+        return Response.ok(buildMfaConfigResponse(pool)).build();
+    }
+
+    private Response handleSetUserPoolMfaConfig(JsonNode request) {
+        JsonNode softwareToken = request.path("SoftwareTokenMfaConfiguration");
+        boolean otherFactorConfigured = request.hasNonNull("EmailMfaConfiguration")
+                || request.hasNonNull("SmsMfaConfiguration");
+        UserPool pool = service.setUserPoolMfaConfig(
+                request.path("UserPoolId").asText(),
+                request.hasNonNull("MfaConfiguration") ? request.path("MfaConfiguration").asText() : null,
+                softwareToken.hasNonNull("Enabled") ? softwareToken.path("Enabled").asBoolean() : null,
+                otherFactorConfigured);
+        return Response.ok(buildMfaConfigResponse(pool)).build();
+    }
+
+    /**
+     * Shared by Get and Set, which answer with the same members. SoftwareTokenMfaConfiguration
+     * is omitted while unset, matching the live service, which returns only the factors that
+     * have been configured.
+     */
+    private ObjectNode buildMfaConfigResponse(UserPool pool) {
         ObjectNode response = objectMapper.createObjectNode();
+        if (pool.getSoftwareTokenMfaEnabled() != null) {
+            response.putObject("SoftwareTokenMfaConfiguration")
+                    .put("Enabled", pool.getSoftwareTokenMfaEnabled());
+        }
         response.put("MfaConfiguration", pool.getMfaConfiguration());
-        return Response.ok(response).build();
+        return response;
     }
 
     private Response handleDeleteUserPool(JsonNode request) {
@@ -220,7 +289,8 @@ public class CognitoJsonHandler {
                         : null,
                 request.has("EnableTokenRevocation")
                         ? request.path("EnableTokenRevocation").asBoolean()
-                        : null
+                        : null,
+                authSessionValidity(request)
         );
         ObjectNode response = objectMapper.createObjectNode();
         response.set("UserPoolClient", clientToNode(client));
@@ -284,7 +354,8 @@ public class CognitoJsonHandler {
                         ? objectMapper.convertValue(request.path("RefreshTokenRotation"),
                         new TypeReference<Map<String, Object>>() {})
                         : null,
-                request.has("EnableTokenRevocation") ? request.path("EnableTokenRevocation").asBoolean() : null
+                request.has("EnableTokenRevocation") ? request.path("EnableTokenRevocation").asBoolean() : null,
+                authSessionValidity(request)
         );
         ObjectNode response = objectMapper.createObjectNode();
         response.set("UserPoolClient", clientToNode(client));
@@ -341,6 +412,198 @@ public class CognitoJsonHandler {
         return Response.ok(objectMapper.createObjectNode()).build();
     }
 
+    private Response handleCreateIdentityProvider(JsonNode request) {
+        IdentityProvider provider = service.createIdentityProvider(
+                request.path("UserPoolId").asText(),
+                request.path("ProviderName").asText(),
+                request.path("ProviderType").asText(null),
+                readStringMap(request, "ProviderDetails"),
+                readStringMap(request, "AttributeMapping"),
+                readStringList(request, "IdpIdentifiers")
+        );
+        ObjectNode response = objectMapper.createObjectNode();
+        response.set("IdentityProvider", identityProviderToNode(provider, request.has("IdpIdentifiers")));
+        return Response.ok(response).build();
+    }
+
+    private Response handleDescribeIdentityProvider(JsonNode request) {
+        IdentityProvider provider = service.describeIdentityProvider(
+                request.path("UserPoolId").asText(),
+                request.path("ProviderName").asText()
+        );
+        ObjectNode response = objectMapper.createObjectNode();
+        response.set("IdentityProvider", identityProviderToNode(provider, true));
+        return Response.ok(response).build();
+    }
+
+    private Response handleListIdentityProviders(JsonNode request) {
+        List<IdentityProvider> providers = service.listIdentityProviders(request.path("UserPoolId").asText());
+        ObjectNode response = objectMapper.createObjectNode();
+        ArrayNode items = response.putArray("Providers");
+        providers.forEach(provider -> items.add(providerDescriptionToNode(provider)));
+        return Response.ok(response).build();
+    }
+
+    private Response handleUpdateIdentityProvider(JsonNode request) {
+        IdentityProvider provider = service.updateIdentityProvider(
+                request.path("UserPoolId").asText(),
+                request.path("ProviderName").asText(),
+                readStringMap(request, "ProviderDetails"),
+                readStringMap(request, "AttributeMapping"),
+                readStringList(request, "IdpIdentifiers")
+        );
+        ObjectNode response = objectMapper.createObjectNode();
+        response.set("IdentityProvider", identityProviderToNode(provider, request.has("IdpIdentifiers")));
+        return Response.ok(response).build();
+    }
+
+    private Response handleDeleteIdentityProvider(JsonNode request) {
+        service.deleteIdentityProvider(
+                request.path("UserPoolId").asText(),
+                request.path("ProviderName").asText()
+        );
+        return Response.ok(objectMapper.createObjectNode()).build();
+    }
+
+    private Response handleCreateUserPoolDomain(JsonNode request) {
+        UserPoolDomain domain = service.createUserPoolDomain(
+                request.path("Domain").asText(),
+                request.path("UserPoolId").asText(),
+                customDomainConfig(request),
+                managedLoginVersion(request)
+        );
+        return Response.ok(userPoolDomainResultToNode(domain)).build();
+    }
+
+    private Response handleUpdateUserPoolDomain(JsonNode request) {
+        UserPoolDomain domain = service.updateUserPoolDomain(
+                request.path("Domain").asText(),
+                request.path("UserPoolId").asText(),
+                customDomainConfig(request),
+                managedLoginVersion(request)
+        );
+        return Response.ok(userPoolDomainResultToNode(domain)).build();
+    }
+
+    private Map<String, Object> customDomainConfig(JsonNode request) {
+        JsonNode node = request.path("CustomDomainConfig");
+        return node.isObject()
+                ? objectMapper.convertValue(node, new TypeReference<Map<String, Object>>() {})
+                : null;
+    }
+
+    /** Absent or null yields null; a value of another JSON type is a SerializationException, as on AWS. */
+    private static Integer managedLoginVersion(JsonNode request) {
+        JsonNode node = request.get("ManagedLoginVersion");
+        if (node == null || node.isNull()) {
+            return null;
+        }
+        if (!node.isIntegralNumber()) {
+            throw new AwsException("SerializationException", "Expected integer or null", 400);
+        }
+        return node.intValue();
+    }
+
+    /** CreateUserPoolDomain and UpdateUserPoolDomain share this result shape. */
+    private ObjectNode userPoolDomainResultToNode(UserPoolDomain domain) {
+        ObjectNode response = objectMapper.createObjectNode();
+        if (domain.isCustomDomain()) {
+            response.put("CloudFrontDomain", domain.getCloudFrontDistribution());
+        }
+        if (domain.getManagedLoginVersion() != null) {
+            response.put("ManagedLoginVersion", domain.getManagedLoginVersion());
+        }
+        return response;
+    }
+
+    private Response handleDescribeUserPoolDomain(JsonNode request) {
+        UserPoolDomain domain = service.describeUserPoolDomain(request.path("Domain").asText());
+        ObjectNode response = objectMapper.createObjectNode();
+        response.set("DomainDescription", userPoolDomainToNode(domain));
+        return Response.ok(response).build();
+    }
+
+    private Response handleSetLogDeliveryConfiguration(JsonNode request) {
+        UserPool pool = service.setLogDeliveryConfiguration(
+                request.path("UserPoolId").asText(),
+                readObjectList(request, "LogConfigurations")
+        );
+        ObjectNode response = objectMapper.createObjectNode();
+        response.set("LogDeliveryConfiguration", logDeliveryConfigurationToNode(pool));
+        return Response.ok(response).build();
+    }
+
+    private Response handleGetLogDeliveryConfiguration(JsonNode request) {
+        UserPool pool = service.getLogDeliveryConfiguration(request.path("UserPoolId").asText());
+        ObjectNode response = objectMapper.createObjectNode();
+        response.set("LogDeliveryConfiguration", logDeliveryConfigurationToNode(pool));
+        return Response.ok(response).build();
+    }
+
+    private ObjectNode logDeliveryConfigurationToNode(UserPool pool) {
+        ObjectNode node = objectMapper.createObjectNode();
+        node.put("UserPoolId", pool.getId());
+        ArrayNode configurations = node.putArray("LogConfigurations");
+        pool.getLogConfigurations().forEach(config -> configurations.add(objectMapper.valueToTree(config)));
+        return node;
+    }
+
+    /**
+     * Absent or null yields null so the service can reject it. A value of the wrong JSON type is
+     * a deserialization failure, which AWS reports as SerializationException, and a null element
+     * inside the array is dropped, which is what AWS does with it.
+     */
+    private List<Map<String, Object>> readObjectList(JsonNode request, String member) {
+        JsonNode node = request.get(member);
+        if (node == null || node.isNull()) {
+            return null;
+        }
+        if (!node.isArray()) {
+            throw new AwsException("SerializationException", "Expected list or null", 400);
+        }
+        List<Map<String, Object>> values = new ArrayList<>();
+        for (JsonNode element : node) {
+            if (element.isNull()) {
+                continue;
+            }
+            if (!element.isObject()) {
+                throw new AwsException("SerializationException", "Expected null", 400);
+            }
+            values.add(objectMapper.convertValue(element, new TypeReference<Map<String, Object>>() {}));
+        }
+        return values;
+    }
+
+    private Response handleDeleteUserPoolDomain(JsonNode request) {
+        service.deleteUserPoolDomain(
+                request.path("Domain").asText(),
+                request.path("UserPoolId").asText()
+        );
+        return Response.ok(objectMapper.createObjectNode()).build();
+    }
+
+    private ObjectNode userPoolDomainToNode(UserPoolDomain d) {
+        ObjectNode node = objectMapper.createObjectNode();
+        node.put("AWSAccountId", d.getAwsAccountId());
+        if (d.getCloudFrontDistribution() != null) {
+            node.put("CloudFrontDistribution", d.getCloudFrontDistribution());
+        }
+        if (d.isCustomDomain()) {
+            ObjectNode customDomainConfig = node.putObject("CustomDomainConfig");
+            customDomainConfig.put("CertificateArn", d.getCertificateArn());
+            customDomainConfig.put("SecurityPolicy", d.getSecurityPolicy());
+        }
+        node.put("Domain", d.getDomain());
+        if (d.getManagedLoginVersion() != null) {
+            node.put("ManagedLoginVersion", d.getManagedLoginVersion());
+        }
+        node.put("S3Bucket", d.getS3Bucket());
+        node.put("Status", d.getStatus());
+        node.put("UserPoolId", d.getUserPoolId());
+        node.put("Version", d.getVersion());
+        return node;
+    }
+
     private Response handleAdminCreateUser(JsonNode request) {
         Map<String, String> attrs = new HashMap<>();
         request.path("UserAttributes").forEach(a -> attrs.put(a.path("Name").asText(), a.path("Value").asText()));
@@ -348,6 +611,10 @@ public class CognitoJsonHandler {
                 : request.path("TemporaryPassword").asText(null);
         String messageAction = request.path("MessageAction").isMissingNode() ? null
                 : request.path("MessageAction").asText(null);
+        Map<String, String> validationData = new HashMap<>();
+        request.path("ValidationData").forEach(a -> validationData.put(a.path("Name").asText(), a.path("Value").asText()));
+        Map<String, String> clientMetadata = new HashMap<>();
+        request.path("ClientMetadata").fields().forEachRemaining(e -> clientMetadata.put(e.getKey(), e.getValue().asText()));
 
         CognitoUser user = service.adminCreateUser(
                 request.path("UserPoolId").asText(),
@@ -355,7 +622,9 @@ public class CognitoJsonHandler {
                 attrs,
                 tempPassword,
                 messageAction,
-                request.path("ForceAliasCreation").asBoolean(false)
+                request.path("ForceAliasCreation").asBoolean(false),
+                validationData,
+                clientMetadata
         );
         ObjectNode response = objectMapper.createObjectNode();
         response.set("User", userToNode(user));
@@ -379,6 +648,9 @@ public class CognitoJsonHandler {
             attr.put("Name", k);
             attr.put("Value", v);
         });
+        Map<String, Object> mfaSettings = new LinkedHashMap<>();
+        CognitoService.putMfaSettings(mfaSettings, service.describeUserPool(request.path("UserPoolId").asText()), user);
+        response.setAll(objectMapper.<ObjectNode>valueToTree(mfaSettings));
         return Response.ok(response).build();
     }
 
@@ -437,6 +709,139 @@ public class CognitoJsonHandler {
     private Response handleAdminDisableUser(JsonNode request) {
         service.adminDisableUser(request.path("UserPoolId").asText(), request.path("Username").asText());
         return Response.ok(objectMapper.createObjectNode()).build();
+    }
+
+    /**
+     * AWS coerces a JSON string in this member instead of rejecting it, and rejects every
+     * other non-boolean type. Measured against Cognito in ap-southeast-1:
+     *
+     * <pre>
+     * absent          accepted, stored false
+     * true / false    accepted as given
+     * "true", "yes"   accepted, stored true
+     * "false"         accepted, stored false
+     * 1, null, {}, [] SerializationException
+     * </pre>
+     *
+     * <p>Jackson would map all of those last four to false through {@code asBoolean()},
+     * which is how a malformed flag used to be accepted alongside valid settings and
+     * persisted as unintended branding state.
+     */
+    private static Boolean readUseCognitoProvidedValues(JsonNode request) {
+        if (!request.has("UseCognitoProvidedValues")) {
+            return null;
+        }
+        JsonNode node = request.path("UseCognitoProvidedValues");
+        if (node.isBoolean()) {
+            return node.booleanValue();
+        }
+        if (node.isTextual()) {
+            return !"false".equalsIgnoreCase(node.asText());
+        }
+        throw new AwsException("SerializationException", null, 400);
+    }
+
+    private Response handleCreateManagedLoginBranding(JsonNode request) {
+        ManagedLoginBranding branding = service.createManagedLoginBranding(
+                request.path("UserPoolId").asText(),
+                request.path("ClientId").asText(),
+                readUseCognitoProvidedValues(request),
+                readObjectMap(request, "Settings"),
+                readMapList(request, "Assets")
+        );
+        return brandingResponse(branding);
+    }
+
+    private Response handleDescribeManagedLoginBranding(JsonNode request) {
+        return brandingResponse(service.describeManagedLoginBranding(
+                request.path("UserPoolId").asText(),
+                request.path("ManagedLoginBrandingId").asText(null)));
+    }
+
+    private Response handleDescribeManagedLoginBrandingByClient(JsonNode request) {
+        return brandingResponse(service.describeManagedLoginBrandingByClient(
+                request.path("UserPoolId").asText(),
+                request.path("ClientId").asText()));
+    }
+
+    private Response handleUpdateManagedLoginBranding(JsonNode request) {
+        return brandingResponse(service.updateManagedLoginBranding(
+                request.path("UserPoolId").asText(),
+                request.path("ManagedLoginBrandingId").asText(null),
+                readUseCognitoProvidedValues(request),
+                readObjectMap(request, "Settings"),
+                readMapList(request, "Assets")));
+    }
+
+    private Response handleDeleteManagedLoginBranding(JsonNode request) {
+        service.deleteManagedLoginBranding(
+                request.path("UserPoolId").asText(),
+                request.path("ManagedLoginBrandingId").asText(null));
+        return Response.ok(objectMapper.createObjectNode()).build();
+    }
+
+    private Response brandingResponse(ManagedLoginBranding branding) {
+        ObjectNode response = objectMapper.createObjectNode();
+        response.set("ManagedLoginBranding", managedLoginBrandingToNode(branding));
+        return Response.ok(response).build();
+    }
+
+    /** AWS omits Settings entirely when none was supplied, but always returns Assets. */
+    private ObjectNode managedLoginBrandingToNode(ManagedLoginBranding branding) {
+        ObjectNode node = objectMapper.createObjectNode();
+        node.put("ManagedLoginBrandingId", branding.getManagedLoginBrandingId());
+        node.put("UserPoolId", branding.getUserPoolId());
+        node.put("UseCognitoProvidedValues", branding.isUseCognitoProvidedValues());
+        if (branding.getSettings() != null) {
+            node.set("Settings", objectMapper.valueToTree(branding.getSettings()));
+        }
+        ArrayNode assets = node.putArray("Assets");
+        branding.getAssets().forEach(asset -> assets.add(objectMapper.valueToTree(asset)));
+        node.put("CreationDate", branding.getCreationDate());
+        node.put("LastModifiedDate", branding.getLastModifiedDate());
+        return node;
+    }
+
+    /** Absent or null yields null; a value of the wrong JSON type is a deserialization failure. */
+    private Map<String, Object> readObjectMap(JsonNode request, String member) {
+        JsonNode node = request.get(member);
+        if (node == null || node.isNull()) {
+            return null;
+        }
+        if (!node.isObject()) {
+            throw new AwsException("SerializationException", "Unexpected field type", 400);
+        }
+        return objectMapper.convertValue(node, new TypeReference<LinkedHashMap<String, Object>>() {});
+    }
+
+    /**
+     * Elements are checked before conversion so a scalar cannot escape as an IllegalArgumentException.
+     * AWS separates the two failures: a null element is a validation error, a non-object element a
+     * deserialization one. Note this differs from LogConfigurations, where a null element is dropped.
+     */
+    private List<Map<String, Object>> readMapList(JsonNode request, String member) {
+        JsonNode node = request.get(member);
+        if (node == null || node.isNull()) {
+            return null;
+        }
+        if (!node.isArray()) {
+            throw new AwsException("SerializationException", "Unexpected field type", 400);
+        }
+        List<Map<String, Object>> values = new ArrayList<>();
+        for (JsonNode element : node) {
+            if (element.isNull()) {
+                throw new AwsException("InvalidParameterException",
+                        "1 validation error detected: Value '" + node + "' at '"
+                                + Character.toLowerCase(member.charAt(0)) + member.substring(1)
+                                + "' failed to satisfy constraint: Member must satisfy constraint: "
+                                + "[Member must not be null]", 400);
+            }
+            if (!element.isObject()) {
+                throw new AwsException("SerializationException", "Unexpected value type in payload", 400);
+            }
+            values.add(objectMapper.convertValue(element, new TypeReference<Map<String, Object>>() {}));
+        }
+        return values;
     }
 
     private Response handleAdminLinkProviderForUser(JsonNode request) {
@@ -539,6 +944,19 @@ public class CognitoJsonHandler {
         return Response.ok(objectMapper.valueToTree(result)).build();
     }
 
+    private Response handleAssociateSoftwareToken(JsonNode request) {
+        Map<String, Object> result = service.associateSoftwareToken(
+                request.path("AccessToken").asText(null), request.path("Session").asText(null));
+        return Response.ok(objectMapper.valueToTree(result)).build();
+    }
+
+    private Response handleVerifySoftwareToken(JsonNode request) {
+        Map<String, Object> result = service.verifySoftwareToken(
+                request.path("AccessToken").asText(null), request.path("Session").asText(null),
+                request.path("UserCode").asText(null));
+        return Response.ok(objectMapper.valueToTree(result)).build();
+    }
+
     private Response handleSignUp(JsonNode request) {
         Map<String, String> attrs = new HashMap<>();
         request.path("UserAttributes").forEach(a -> attrs.put(a.path("Name").asText(), a.path("Value").asText()));
@@ -631,6 +1049,11 @@ public class CognitoJsonHandler {
         return Response.ok(objectMapper.valueToTree(result)).build();
     }
 
+    private Response handleGetUserAuthFactors(JsonNode request) {
+        Map<String, Object> result = service.getUserAuthFactors(request.path("AccessToken").asText());
+        return Response.ok(objectMapper.valueToTree(result)).build();
+    }
+
     private Response handleGetUserAttributeVerificationCode(JsonNode request) {
         Map<String, Object> deliveryDetails = service.getUserAttributeVerificationCode(
                 request.path("AccessToken").asText(),
@@ -644,12 +1067,22 @@ public class CognitoJsonHandler {
         return Response.ok(response).build();
     }
 
+    private Response handleVerifyUserAttribute(JsonNode request) {
+        service.verifyUserAttribute(
+                request.path("AccessToken").asText(),
+                request.path("AttributeName").asText(),
+                request.path("Code").asText()
+        );
+        return Response.ok(objectMapper.createObjectNode()).build();
+    }
+
     private Response handleUpdateUserAttributes(JsonNode request) {
         Map<String, String> attrs = new HashMap<>();
         request.path("UserAttributes").forEach(a -> attrs.put(a.path("Name").asText(), a.path("Value").asText()));
-        service.updateUserAttributes(request.path("AccessToken").asText(), attrs);
+        List<Map<String, Object>> deliveryDetails = service.updateUserAttributes(
+                request.path("AccessToken").asText(), attrs);
         ObjectNode response = objectMapper.createObjectNode();
-        response.putArray("CodeDeliveryDetailsList");
+        response.set("CodeDeliveryDetailsList", objectMapper.valueToTree(deliveryDetails));
         return Response.ok(response).build();
     }
 
@@ -661,7 +1094,12 @@ public class CognitoJsonHandler {
     }
 
     private Response handleGlobalSignOut(JsonNode request) {
-        service.globalSignOut(request.path("AccessToken").asText());
+        service.globalSignOut(request.path("AccessToken").asText(null));
+        return Response.ok(objectMapper.createObjectNode()).build();
+    }
+
+    private Response handleDeleteUser(JsonNode request) {
+        service.deleteUser(request.path("AccessToken").asText(null));
         return Response.ok(objectMapper.createObjectNode()).build();
     }
 
@@ -727,10 +1165,20 @@ public class CognitoJsonHandler {
         }
         node.set("UsernameConfiguration", objectMapper.valueToTree(p.getUsernameConfiguration() != null ? p.getUsernameConfiguration() : new HashMap<>()));
         node.set("AccountRecoverySetting", objectMapper.valueToTree(p.getAccountRecoverySetting() != null ? p.getAccountRecoverySetting() : new HashMap<>()));
+        // Same reasoning as UserPoolAddOns above: an unconfigured pool omits this optional
+        // member entirely rather than returning an empty object.
+        if (p.getUserAttributeUpdateSettings() != null && !p.getUserAttributeUpdateSettings().isEmpty()) {
+            node.set("UserAttributeUpdateSettings", objectMapper.valueToTree(p.getUserAttributeUpdateSettings()));
+        }
         node.put("UserPoolTier", p.getUserPoolTier() != null ? p.getUserPoolTier() : "ESSENTIALS");
 
         return node;
     }
+
+
+    @SuppressWarnings("unchecked")
+
+
 
     private ObjectNode clientToDescriptionNode(UserPoolClient c) {
         ObjectNode node = objectMapper.createObjectNode();
@@ -745,6 +1193,7 @@ public class CognitoJsonHandler {
         node.put("ClientId", c.getClientId());
         node.put("UserPoolId", c.getUserPoolId());
         node.put("ClientName", c.getClientName());
+        node.put("AuthSessionValidity", c.getAuthSessionValidity());
         if (c.getClientSecret() != null) {
             node.put("ClientSecret", c.getClientSecret());
         }
@@ -795,6 +1244,17 @@ public class CognitoJsonHandler {
         return node;
     }
 
+    private static Integer authSessionValidity(JsonNode request) {
+        JsonNode value = request.get("AuthSessionValidity");
+        if (value == null || value.isNull()) {
+            return null;
+        }
+        if (!value.isIntegralNumber() || !value.canConvertToInt()) {
+            throw new AwsException("SerializationException", "Expected integer or null", 400);
+        }
+        return value.intValue();
+    }
+
     private ObjectNode resourceServerToNode(ResourceServer server) {
         ObjectNode node = objectMapper.createObjectNode();
         node.put("UserPoolId", server.getUserPoolId());
@@ -811,6 +1271,58 @@ public class CognitoJsonHandler {
             }
         }
         return node;
+    }
+
+    /**
+     * {@code IdpIdentifiers} is echoed only when the caller supplied the member: AWS omits it
+     * from CreateIdentityProvider and UpdateIdentityProvider responses otherwise, whatever the
+     * stored value, while DescribeIdentityProvider always returns it.
+     */
+    private ObjectNode identityProviderToNode(IdentityProvider provider, boolean includeIdpIdentifiers) {
+        ObjectNode node = objectMapper.createObjectNode();
+        node.put("UserPoolId", provider.getUserPoolId());
+        node.put("ProviderName", provider.getProviderName());
+        node.put("ProviderType", provider.getProviderType());
+        ObjectNode details = node.putObject("ProviderDetails");
+        provider.getProviderDetails().forEach(details::put);
+        ObjectNode mapping = node.putObject("AttributeMapping");
+        provider.getAttributeMapping().forEach(mapping::put);
+        if (includeIdpIdentifiers) {
+            ArrayNode identifiers = node.putArray("IdpIdentifiers");
+            provider.getIdpIdentifiers().forEach(identifiers::add);
+        }
+        node.put("CreationDate", provider.getCreationDate());
+        node.put("LastModifiedDate", provider.getLastModifiedDate());
+        return node;
+    }
+
+    private ObjectNode providerDescriptionToNode(IdentityProvider provider) {
+        ObjectNode node = objectMapper.createObjectNode();
+        node.put("ProviderName", provider.getProviderName());
+        node.put("ProviderType", provider.getProviderType());
+        node.put("LastModifiedDate", provider.getLastModifiedDate());
+        node.put("CreationDate", provider.getCreationDate());
+        return node;
+    }
+
+    private Map<String, String> readStringMap(JsonNode request, String member) {
+        JsonNode node = request.get(member);
+        if (node == null || !node.isObject()) {
+            return null;
+        }
+        Map<String, String> values = new LinkedHashMap<>();
+        node.fields().forEachRemaining(entry -> values.put(entry.getKey(), entry.getValue().asText()));
+        return values;
+    }
+
+    private List<String> readStringList(JsonNode request, String member) {
+        JsonNode node = request.get(member);
+        if (node == null || !node.isArray()) {
+            return null;
+        }
+        List<String> values = new ArrayList<>();
+        node.forEach(item -> values.add(item.asText()));
+        return values;
     }
 
     private List<ResourceServerScope> parseScopes(JsonNode scopesNode) {
@@ -998,6 +1510,28 @@ public class CognitoJsonHandler {
         }
         node.put("ClientSecretCreateDate", cs.getClientSecretCreateDate());
         return node;
+    }
+    private Response handleAdminSetUserMFAPreference(JsonNode request) {
+        service.adminSetUserMFAPreference(
+                request.path("UserPoolId").asText(),
+                request.path("Username").asText(),
+                mfaSettingsUpdate(request.path("EmailMfaSettings")),
+                mfaSettingsUpdate(request.path("SoftwareTokenMfaSettings")));
+        return Response.ok(objectMapper.createObjectNode()).build();
+    }
+
+    private Response handleSetUserMFAPreference(JsonNode request) {
+        service.setUserMFAPreference(
+                request.path("AccessToken").asText(),
+                mfaSettingsUpdate(request.path("EmailMfaSettings")),
+                mfaSettingsUpdate(request.path("SoftwareTokenMfaSettings")));
+        return Response.ok(objectMapper.createObjectNode()).build();
+    }
+
+    private static CognitoService.MfaSettingsUpdate mfaSettingsUpdate(JsonNode settings) {
+        return new CognitoService.MfaSettingsUpdate(
+                settings.has("Enabled") ? settings.path("Enabled").asBoolean() : null,
+                settings.has("PreferredMfa") ? settings.path("PreferredMfa").asBoolean() : null);
     }
 
 }

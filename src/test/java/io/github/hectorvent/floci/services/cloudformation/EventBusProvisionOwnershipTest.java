@@ -5,14 +5,13 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
-import io.github.hectorvent.floci.services.cloudformation.provisioners.CloudFormationResourceRegistry;
+import io.github.hectorvent.floci.services.cloudformation.provisioners.CfnResourceDispatcher;
 import io.github.hectorvent.floci.services.eventbridge.EventBridgeService;
 import io.github.hectorvent.floci.services.eventbridge.model.EventBus;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.time.Instant;
-import java.util.List;
 import java.util.Map;
 import java.util.function.Function;
 
@@ -46,20 +45,15 @@ class EventBusProvisionOwnershipTest {
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
     private EventBridgeService eventBridgeService;
-    private CloudFormationResourceProvisioner provisioner;
+    private CfnResourceDispatcher provisioner;
 
     @BeforeEach
     void setUp() {
         eventBridgeService = mock(EventBridgeService.class);
-        provisioner = new CloudFormationResourceProvisioner(
-                null, null, null, null, null,
-                null, null, null, null, eventBridgeService,
-                null, null, null, null, null, null,
-                MAPPER,
-                null, null, null, null, null, null, null,
-                null, null, null, null, null, null, null,
-                null, null,
-                new CloudFormationResourceRegistry(List.of()));
+        provisioner = CfnProvisionerFixture.builder()
+                .eventBridge(eventBridgeService)
+                .objectMapper(MAPPER)
+                .build();
     }
 
     /**
@@ -201,7 +195,7 @@ class EventBusProvisionOwnershipTest {
     }
 
     private JsonNode props(boolean withPolicy) {
-        var node = MAPPER.createObjectNode();
+        ObjectNode node = MAPPER.createObjectNode();
         node.put("Name", BUS);
         if (withPolicy) {
             node.set("Policy", MAPPER.createObjectNode().put("Version", "2012-10-17"));

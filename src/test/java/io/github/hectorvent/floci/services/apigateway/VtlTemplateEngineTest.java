@@ -1,11 +1,13 @@
 package io.github.hectorvent.floci.services.apigateway;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.quarkus.test.junit.QuarkusTest;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.Test;
 
 import java.util.Map;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -26,6 +28,7 @@ class VtlTemplateEngineTest {
                 "/users",
                 "req-123",
                 "000000000000",
+                Map.of(),
                 Map.of()
         );
     }
@@ -63,6 +66,19 @@ class VtlTemplateEngineTest {
     }
 
     @Test
+    void parsedMapAndCollectionMethodsInResponseTemplate() {
+        String template = "#set($parsed = $util.parseJson($input.body))"
+                + "#if($parsed.headers)$parsed.headers.isEmpty()|$parsed.headers.size()|"
+                + "#foreach($entry in $parsed.headers.entrySet())$entry.getKey()=$entry.getValue()#end|"
+                + "$parsed.items.isEmpty()|$parsed.items.size()|#foreach($item in $parsed.items)$item#end#end";
+
+        String result = engine.evaluate(template, ctx("{\"headers\":{\"x-test\":\"yes\"},\"items\":[\"a\",\"b\"]}"))
+                .body().trim();
+
+        assertEquals("false|1|x-test=yes|false|2|ab", result);
+    }
+
+    @Test
     void inputPath() {
         String result = engine.evaluate("$input.path('$.name')", ctx("{\"name\":\"Carol\"}")).body();
         assertEquals("Carol", result);
@@ -96,28 +112,28 @@ class VtlTemplateEngineTest {
     @Test
     void utilEscapeJavaScript_controlChars() {
         // Test backspace, form feed
-        var util = new VtlTemplateEngine.UtilVariable(new ObjectMapper());
+        VtlTemplateEngine.UtilVariable util = new VtlTemplateEngine.UtilVariable(new ObjectMapper());
         String result = util.escapeJavaScript("a\bb\fc");
         assertEquals("a\\bb\\fc", result);
     }
 
     @Test
     void utilEscapeJavaScript_unicode() {
-        var util = new VtlTemplateEngine.UtilVariable(new ObjectMapper());
+        VtlTemplateEngine.UtilVariable util = new VtlTemplateEngine.UtilVariable(new ObjectMapper());
         String result = util.escapeJavaScript("café");
         assertEquals("caf\\u00e9", result);
     }
 
     @Test
     void utilEscapeJavaScript_backslash() {
-        var util = new VtlTemplateEngine.UtilVariable(new ObjectMapper());
+        VtlTemplateEngine.UtilVariable util = new VtlTemplateEngine.UtilVariable(new ObjectMapper());
         String result = util.escapeJavaScript("a\\b");
         assertEquals("a\\\\b", result);
     }
 
     @Test
     void utilEscapeJavaScript_newlineTabCr() {
-        var util = new VtlTemplateEngine.UtilVariable(new ObjectMapper());
+        VtlTemplateEngine.UtilVariable util = new VtlTemplateEngine.UtilVariable(new ObjectMapper());
         String result = util.escapeJavaScript("a\nb\tc\rd");
         assertEquals("a\\nb\\tc\\rd", result);
     }
@@ -155,10 +171,51 @@ class VtlTemplateEngineTest {
     }
 
     @Test
+    void contextAuthorizer() {
+        VtlTemplateEngine.VtlContext authorizerCtx = new VtlTemplateEngine.VtlContext(
+                "{}", Map.of(), Map.of(), Map.of(), "prod", "POST", "/users",
+                "req-123", "000000000000", Map.of(),
+                Map.of(
+                        "principalId", "test-user",
+                        "key_id", "KEY-123",
+                        "numberKey", "1",
+                        "booleanKey", "true",
+                        "identity", "{\"tenant\":\"t-9\"}"));
+        String template = "#set($identity = $util.parseJson($context.authorizer.identity))"
+                + "#set($numberIsString = $context.authorizer.numberKey == \"1\")"
+                + "#set($booleanIsString = $context.authorizer.booleanKey == \"true\")"
+                + "$context.authorizer.principalId|$context.authorizer.key_id|$identity.tenant"
+                + "|$numberIsString|$booleanIsString";
+
+        assertEquals("test-user|KEY-123|t-9|true|true", engine.evaluate(template, authorizerCtx).body());
+    }
+
+    @Test
+    void contextErrorForGatewayResponses() {
+        VtlTemplateEngine.VtlContext errorCtx = new VtlTemplateEngine.VtlContext(
+                null, Map.of(), Map.of(), Map.of(), "prod", "GET", "/users",
+                "req-123", "000000000000", Map.of(), null,
+                Map.of("path", "/prod/users",
+                        "error", Map.of("message", "Missing Authentication Token",
+                                "messageString", "\"Missing Authentication Token\"",
+                                "responseType", "MISSING_AUTHENTICATION_TOKEN",
+                                "validationErrorString", "")));
+        String template = "{\"message\":$context.error.messageString,"
+                + "\"raw\":\"$context.error.message\",\"type\":\"$context.error.responseType\","
+                + "\"path\":\"$context.path\",\"stage\":\"$context.stage\"}";
+
+        assertEquals("{\"message\":\"Missing Authentication Token\",\"raw\":\"Missing Authentication Token\","
+                + "\"type\":\"MISSING_AUTHENTICATION_TOKEN\",\"path\":\"/prod/users\",\"stage\":\"prod\"}",
+                engine.evaluate(template, errorCtx).body());
+        // Outside a gateway response $context.error is simply absent.
+        assertEquals("$context.error", engine.evaluate("$context.error", ctx("{}")).body());
+    }
+
+    @Test
     void stageVariables() {
         VtlTemplateEngine.VtlContext svCtx = new VtlTemplateEngine.VtlContext(
                 "{}", Map.of(), Map.of(), Map.of(), "prod", "GET", "/",
-                "req-1", "000000000000", Map.of("tableName", "my-table"));
+                "req-1", "000000000000", Map.of("tableName", "my-table"), Map.of());
         String result = engine.evaluate("$stageVariables.tableName", svCtx).body();
         assertEquals("my-table", result);
     }
@@ -235,7 +292,7 @@ class VtlTemplateEngineTest {
                 + "#end]}";
         String result = engine.evaluate(template, ctx(body)).body().trim();
         assertDoesNotThrow(() -> new ObjectMapper().readTree(result));
-        var node = assertDoesNotThrow(() -> new ObjectMapper().readTree(result));
+        JsonNode node = assertDoesNotThrow(() -> new ObjectMapper().readTree(result));
         assertEquals(2, node.path("results").size());
         assertEquals("1", node.path("results").get(0).path("key").asText());
     }
@@ -280,7 +337,7 @@ class VtlTemplateEngineTest {
                 {"QueueUrl": "http://localhost:4566/000000000000/my-queue", "MessageBody": "$util.escapeJavaScript($input.json('$'))"}""";
         String result = engine.evaluate(template, ctx(body)).body();
         assertDoesNotThrow(() -> new ObjectMapper().readTree(result));
-        var node = assertDoesNotThrow(() -> new ObjectMapper().readTree(result));
+        JsonNode node = assertDoesNotThrow(() -> new ObjectMapper().readTree(result));
         assertEquals("http://localhost:4566/000000000000/my-queue", node.path("QueueUrl").asText());
         // MessageBody should be the escaped JSON string
         assertTrue(node.path("MessageBody").asText().contains("orderId"));
@@ -289,14 +346,14 @@ class VtlTemplateEngineTest {
     @Test
     void realWorld_dynamoDbQueryWithParams() {
         // Pattern: use query string params in a DynamoDB query
-        var queryCtx = new VtlTemplateEngine.VtlContext(
+        VtlTemplateEngine.VtlContext queryCtx = new VtlTemplateEngine.VtlContext(
                 "{}", Map.of(), Map.of("userId", "user-42", "status", "active"),
                 Map.of(), "prod", "GET", "/items",
-                "req-456", "000000000000", Map.of("tableName", "orders"));
+                "req-456", "000000000000", Map.of("tableName", "orders"), Map.of());
         String template = """
                 {"TableName": "$stageVariables.tableName", "KeyConditionExpression": "pk = :pk", "ExpressionAttributeValues": {":pk": {"S": "$input.params().querystring.userId"}}}""";
         String result = engine.evaluate(template, queryCtx).body();
-        var node = assertDoesNotThrow(() -> new ObjectMapper().readTree(result));
+        JsonNode node = assertDoesNotThrow(() -> new ObjectMapper().readTree(result));
         assertEquals("orders", node.path("TableName").asText());
         assertEquals("user-42", node.path("ExpressionAttributeValues").path(":pk").path("S").asText());
     }
@@ -320,7 +377,17 @@ class VtlTemplateEngineTest {
         // Access all three param types in one template
         String template = "$input.params().querystring.limit|$input.params().path.proxy|$input.params().header.get('Content-Type')";
         String result = engine.evaluate(template, ctx("{}")).body();
-        assertTrue(result.startsWith("10|users/123|"), "Should contain all param types: " + result);
+        assertEquals("10|users/123|application/json", result);
+    }
+
+    @Test
+    void inputParams_headerKeySet() {
+        String template = "#foreach($header in $input.params().header.keySet())"
+                + "$header=$input.params().header.get($header)#if($foreach.hasNext),#end#end";
+        String result = engine.evaluate(template, ctx("{}")).body();
+
+        assertEquals(Set.of("Content-Type=application/json", "Authorization=Bearer xyz"),
+                Set.of(result.split(",")));
     }
 
     // ──────────── $util.parseJson in templates ────────────
@@ -352,15 +419,36 @@ class VtlTemplateEngineTest {
     }
 
     @Test
-    void inputParams_shorthand_querystringPrecedence() {
-        // querystring should take precedence over path and header
+    void inputParams_shorthand_pathPrecedence() {
+        // AWS searches path, query string, and headers in that order.
         VtlTemplateEngine.VtlContext overlapCtx = new VtlTemplateEngine.VtlContext(
                 "{}", Map.of("shared", "header-val"),
                 Map.of("shared", "query-val"),
                 Map.of("shared", "path-val"),
-                "prod", "GET", "/", "req-1", "000000000000", Map.of());
+                "prod", "GET", "/", "req-1", "000000000000", Map.of(), Map.of());
         String result = engine.evaluate("$input.params('shared')", overlapCtx).body();
-        assertEquals("query-val", result);
+        assertEquals("path-val", result);
+    }
+
+    @Test
+    void inputParams_shorthand_preservesAnEmptyPathValue() {
+        VtlTemplateEngine.VtlContext context = new VtlTemplateEngine.VtlContext(
+                "{}", Map.of("id", "header-id"), Map.of("id", "query-id"), Map.of("id", ""),
+                "prod", "GET", "/items/{id}", "req-123", "000000000000", Map.of(), Map.of());
+
+        assertEquals("", engine.evaluate("$input.params('id')", context).body());
+    }
+
+    @Test
+    void inputParams_shorthand_fallsBackToQueryThenHeaderThenEmpty() {
+        VtlTemplateEngine.VtlContext context = new VtlTemplateEngine.VtlContext(
+                "{}", Map.of("id", "header-id", "empty", "header-empty", "headerOnly", "header-value"),
+                Map.of("id", "query-id", "empty", ""), null,
+                "prod", "GET", "/items", "req-123", "000000000000", Map.of(), Map.of());
+
+        assertEquals("query-id||header-value|", engine.evaluate(
+                "$input.params('id')|$input.params('empty')|$input.params('headerOnly')|$input.params('missing')",
+                context).body());
     }
 
     @Test
@@ -410,5 +498,78 @@ class VtlTemplateEngineTest {
         VtlTemplateEngine.EvaluateResult result = engine.evaluate("hello", ctx("{}"));
         assertNull(result.statusOverride());
         assertTrue(result.headerOverrides().isEmpty());
+    }
+
+    // ────────── Sandbox: reflection escapes must be blocked ──────────
+
+    @Test
+    void security_getClassLoaderIsNotReachable() {
+        // When SecureUberspector blocks a method call, Velocity (in non-strict mode, the default
+        // here) renders the literal, unresolved reference text instead of throwing or evaluating
+        // it. Getting the raw template text back verbatim (rather than an actual ClassLoader
+        // instance's toString, e.g. "...ClassLoader@<hash>") proves the call was blocked. Note
+        // this literal text still contains the substring "ClassLoader" (it's the method name), so
+        // a plain assertFalse(result.contains("ClassLoader")) would wrongly fail here.
+        String template = "$util.getClass().getClassLoader()";
+        String result = engine.evaluate(template, ctx("{}")).body();
+        assertEquals(template, result,
+                "expected getClassLoader() to be blocked by SecureUberspector and rendered as an "
+                        + "unresolved literal reference, but got: " + result);
+    }
+
+    @Test
+    void security_classForNameIsNotReachable() {
+        String result = engine.evaluate(
+                "$util.getClass().forName('java.lang.System').getName()", ctx("{}")).body();
+        assertNotEquals("java.lang.System", result,
+                "expected Class.forName(...) to be blocked by SecureUberspector, but it resolved: " + result);
+    }
+
+    @Test
+    void security_runtimeClassIsNotLoadableByName() {
+        String result = engine.evaluate(
+                "$util.getClass().forName('java.lang.Runtime').getName()", ctx("{}")).body();
+        assertNotEquals("java.lang.Runtime", result,
+                "expected Class.forName('java.lang.Runtime') to be blocked, but it resolved: " + result);
+    }
+
+    @Test
+    void security_processBuilderClassIsNotLoadableByName() {
+        String result = engine.evaluate(
+                "$util.getClass().forName('java.lang.ProcessBuilder').getName()", ctx("{}")).body();
+        assertNotEquals("java.lang.ProcessBuilder", result,
+                "expected Class.forName('java.lang.ProcessBuilder') to be blocked, but it resolved: " + result);
+    }
+
+    @Test
+    void security_getClassStillPermitsGetName() {
+        // getName() on a Class receiver must remain permitted (SecureUberspector's one exception),
+        // so ordinary reflection-free VTL idioms relying on it (if any) keep working.
+        String result = engine.evaluate("$util.getClass().getName()", ctx("{}")).body();
+        assertTrue(result.contains("UtilVariable"), "expected getName() on Class to still work, got: " + result);
+    }
+
+    // ────────── Sandbox: runaway loop and output limits ──────────
+
+    @Test
+    void security_foreachLoopCountIsBounded() {
+        // 50,000 requested iterations, each writing a single character. With no cap this renders
+        // 50,000 characters; the configured default (ApiGatewayServiceConfig.vtlMaxLoops = 10000)
+        // must cap the loop well before that.
+        String template = "#foreach($i in [1..50000])x#end";
+        String result = engine.evaluate(template, ctx("{}")).body();
+        assertEquals(10000, result.length(),
+                "expected #foreach to be capped at the configured vtlMaxLoops, but rendered " + result.length()
+                        + " characters");
+    }
+
+    @Test
+    void security_outputSizeIsBounded() {
+        // 21 doublings of a 2-character seed produce roughly 4 million characters, comfortably
+        // over the default 1,048,576-character output cap, in only 21 loop iterations (well under
+        // the 10,000-iteration loop cap), so this exercises the output limit specifically.
+        String template = "#set($s = \"xy\")#foreach($i in [1..21])#set($s = \"$s$s\")#end$s";
+        assertThrows(RuntimeException.class, () -> engine.evaluate(template, ctx("{}")),
+                "expected output exceeding the configured vtlMaxOutputChars to throw");
     }
 }

@@ -5,8 +5,10 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.services.rds.container.RdsBackendGate;
 import io.github.hectorvent.floci.services.rds.model.DatabaseEngine;
 import io.github.hectorvent.floci.services.secretsmanager.SecretsManagerService;
+import io.github.hectorvent.floci.services.secretsmanager.model.SecretVersion;
 import org.junit.jupiter.api.Test;
 
 import java.lang.reflect.Proxy;
@@ -17,8 +19,13 @@ import java.sql.SQLException;
 import java.sql.Statement;
 import java.sql.Types;
 import java.time.Duration;
+import java.util.List;
+import java.util.Properties;
 import java.util.UUID;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import org.h2.Driver;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -33,6 +40,10 @@ import static org.mockito.Mockito.when;
 
 class RdsDataServiceTest {
 
+    static {
+        Driver.load();
+    }
+
     private static final String RESOURCE_ARN = "arn:aws:rds:us-east-1:000000000000:cluster:test";
     private static final String FALLBACK_RESOURCE_ARN = "arn:aws:rds:us-west-2:111111111111:cluster:test";
     private static final String OTHER_RESOURCE_ARN = "arn:aws:rds:us-east-1:000000000000:cluster:other";
@@ -41,6 +52,72 @@ class RdsDataServiceTest {
     private static final String REGION = "us-east-1";
 
     private final ObjectMapper objectMapper = new ObjectMapper();
+
+    @Test
+    void executeStatementRejectsAResponseOverOneMebibyte() throws Exception {
+        TestHarness harness = new TestHarness();
+        ObjectNode request = harness.request(
+                "select repeat('x', 20000) as c from system_range(1, 100)");
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> harness.service.executeStatement(request, REGION));
+        assertEquals("UnsupportedResultException", error.getErrorCode());
+        assertEquals("Database response exceeded size limit", error.getMessage());
+    }
+
+    @Test
+    void executeStatementAllowsAResponseUnderOneMebibyte() throws Exception {
+        TestHarness harness = new TestHarness();
+        ObjectNode response = harness.service.executeStatement(harness.request(
+                "select repeat('x', 20000) as c from system_range(1, 10)"), REGION);
+
+        assertEquals(10, response.get("records").size());
+    }
+
+    /** Records serialize as [[{"stringValue":"..."}]]: 22 bytes around a single string. */
+    @Test
+    void executeStatementCountsTheWholeRecordsArrayAtTheBoundary() throws Exception {
+        int overhead = 22;
+        int limit = 1024 * 1024;
+        TestHarness harness = new TestHarness();
+        ObjectNode exact = harness.service.executeStatement(harness.request(
+                "select repeat('x', " + (limit - overhead) + ") as c"), REGION);
+        assertEquals(1, exact.get("records").size());
+
+        ObjectNode over = harness.request("select repeat('x', " + (limit - overhead + 1) + ") as c");
+        AwsException error = assertThrows(AwsException.class,
+                () -> harness.service.executeStatement(over, REGION));
+        assertEquals("UnsupportedResultException", error.getErrorCode());
+        assertEquals("Database response exceeded size limit", error.getMessage());
+    }
+
+    /**
+     * Message and error code checked against Aurora PostgreSQL 17.7 through the real
+     * Data API on 2026-09-13.
+     */
+    @Test
+    void rejectsPostgresResultTypesTheDataApiDoesNotSupport() throws Exception {
+        ResultSetMetaData meta = mock(ResultSetMetaData.class);
+        when(meta.getColumnCount()).thenReturn(2);
+        when(meta.getColumnTypeName(1)).thenReturn("jsonb");
+        when(meta.getColumnTypeName(2)).thenReturn("point");
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> RdsDataService.rejectUnsupportedResultTypes(meta, DatabaseEngine.POSTGRES));
+        assertEquals("UnsupportedResultException", error.getErrorCode());
+        assertEquals("The result contains the unsupported data type POINT.", error.getMessage());
+    }
+
+    @Test
+    void acceptsPostgresResultTypesTheDataApiSupports() throws Exception {
+        ResultSetMetaData meta = mock(ResultSetMetaData.class);
+        when(meta.getColumnCount()).thenReturn(3);
+        when(meta.getColumnTypeName(1)).thenReturn("int4");
+        when(meta.getColumnTypeName(2)).thenReturn("jsonb");
+        when(meta.getColumnTypeName(3)).thenReturn("text");
+
+        RdsDataService.rejectUnsupportedResultTypes(meta, DatabaseEngine.POSTGRES);
+    }
 
     @Test
     void executesSqlAndMapsDataApiResultShape() throws Exception {
@@ -125,6 +202,40 @@ class RdsDataServiceTest {
         ArrayNode generatedFields = (ArrayNode) response.get("generatedFields");
         assertEquals(1, generatedFields.size());
         assertTrue(generatedFields.get(0).get("longValue").asLong() > 0);
+    }
+
+    @Test
+    void omitsRecordsForStatementsThatProduceNoResultSet() throws Exception {
+        TestHarness harness = new TestHarness();
+        harness.createTables();
+
+        for (String sql : new String[] {
+                "create table data_api_omit(id bigint primary key)",
+                "insert into data_api_items(id, title) values ('omit', 'Omit')",
+                "update data_api_items set title = 'Renamed' where id = 'omit'",
+                "delete from data_api_items where id = 'omit'",
+                "update data_api_items set title = 'Nobody' where id = 'no-such-row'"}) {
+            ObjectNode response = harness.service.executeStatement(harness.request(sql), REGION);
+
+            assertFalse(response.has("records"), sql);
+            assertFalse(response.has("columnMetadata"), sql);
+            assertTrue(response.has("generatedFields"), sql);
+            assertTrue(response.has("numberOfRecordsUpdated"), sql);
+        }
+    }
+
+    @Test
+    void reportsEmptyRecordsForQueriesThatMatchNoRows() throws Exception {
+        TestHarness harness = new TestHarness();
+        harness.createTables();
+
+        ObjectNode response = harness.service.executeStatement(
+                harness.request("select title from data_api_items where id = 'no-such-row'"), REGION);
+
+        ArrayNode records = (ArrayNode) response.get("records");
+        assertTrue(records.isEmpty());
+        assertEquals(0L, response.get("numberOfRecordsUpdated").asLong());
+        assertFalse(response.has("generatedFields"));
     }
 
     @Test
@@ -604,6 +715,46 @@ class RdsDataServiceTest {
     }
 
     @Test
+    void doesNotUseMasterCredentialsWhenSecretLookupFails() {
+        TestHarness harness = new TestHarness(missingSecrets());
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> harness.service.executeStatement(harness.request("select 1"), REGION));
+
+        assertEquals("SecretsErrorException", error.getErrorCode());
+    }
+
+    @Test
+    void rejectsMalformedSecretInsteadOfUsingMasterCredentials() {
+        TestHarness harness = new TestHarness(secretWith("not-json"));
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> harness.service.executeStatement(harness.request("select 1"), REGION));
+
+        assertEquals("InvalidSecretException", error.getErrorCode());
+    }
+
+    @Test
+    void rejectsEmptySecretInsteadOfUsingMasterCredentials() {
+        TestHarness harness = new TestHarness(secretWith(" "));
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> harness.service.executeStatement(harness.request("select 1"), REGION));
+
+        assertEquals("InvalidSecretException", error.getErrorCode());
+    }
+
+    @Test
+    void rejectsSecretMissingCredentialsInsteadOfUsingMasterCredentials() {
+        TestHarness harness = new TestHarness(secretWith("{\"username\":\"sa\"}"));
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> harness.service.executeStatement(harness.request("select 1"), REGION));
+
+        assertEquals("InvalidSecretException", error.getErrorCode());
+    }
+
+    @Test
     void rejectsUnsupportedExecuteOptions() throws Exception {
         TestHarness harness = new TestHarness();
         harness.createTables();
@@ -665,9 +816,69 @@ class RdsDataServiceTest {
     }
 
     @Test
+    void statementOutsideATransactionHoldsTheClusterAwakeOnlyWhileItRuns() throws Exception {
+        TestHarness harness = new TestHarness();
+        harness.createTables();
+
+        harness.service.executeStatement(harness.request("select 1"), REGION);
+
+        assertEquals(List.of("127.0.0.1:3306"), harness.gate.entered);
+        assertEquals(0, harness.gate.held.get());
+    }
+
+    @Test
+    void transactionHoldsTheClusterAwakeUntilItEnds() throws Exception {
+        TestHarness harness = new TestHarness();
+        harness.createTables();
+
+        String committed = harness.service.beginTransaction(harness.beginRequest(), REGION)
+                .get("transactionId").asText();
+        ObjectNode insert = harness.request("insert into data_api_items(id, title, score) values ('held', 'Held', 1)");
+        insert.put("transactionId", committed);
+        harness.service.executeStatement(insert, REGION);
+        assertEquals(1, harness.gate.held.get(), "an open transaction keeps the cluster from pausing");
+        harness.service.commitTransaction(harness.transactionRequest(committed), REGION);
+        assertEquals(0, harness.gate.held.get());
+
+        String rolledBack = harness.service.beginTransaction(harness.beginRequest(), REGION)
+                .get("transactionId").asText();
+        assertEquals(1, harness.gate.held.get());
+        harness.service.rollbackTransaction(harness.transactionRequest(rolledBack), REGION);
+        assertEquals(0, harness.gate.held.get());
+        assertEquals(2, harness.gate.entered.size(), "statements in a transaction reuse its hold");
+    }
+
+    @Test
+    void expiredTransactionLetsTheClusterPause() throws Exception {
+        TestHarness harness = new TestHarness(Duration.ofMillis(50));
+        String tx = harness.service.beginTransaction(harness.beginRequest(), REGION)
+                .get("transactionId").asText();
+        Thread.sleep(200);
+
+        ObjectNode next = harness.request("select 1");
+        next.put("transactionId", tx);
+        assertThrows(AwsException.class, () -> harness.service.executeStatement(next, REGION));
+
+        assertEquals(0, harness.gate.held.get());
+    }
+
+    @Test
+    void clusterThatCannotResumeFailsTheRequestAsAnInternalError() {
+        TestHarness harness = new TestHarness();
+        harness.gate.failure = new IllegalStateException("Could not resume auto-paused RDS container");
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> harness.service.executeStatement(harness.request("select 1"), REGION));
+
+        assertEquals("InternalServerErrorException", error.getErrorCode());
+        assertEquals(500, error.getHttpStatus());
+        assertEquals(0, harness.gate.held.get());
+    }
+
+    @Test
     void closesConnectionWhenTransactionSetupFails() {
         RdsDataResourceResolver resolver = mock(RdsDataResourceResolver.class);
-        SecretsManagerService secrets = fallbackSecrets();
+        SecretsManagerService secrets = defaultSecrets();
         RdsDataResourceResolver.DatabaseTarget target = target();
         when(resolver.resolve(RESOURCE_ARN, REGION)).thenReturn(target);
         AtomicBoolean closed = new AtomicBoolean(false);
@@ -738,11 +949,27 @@ class RdsDataServiceTest {
         return param;
     }
 
-    private static SecretsManagerService fallbackSecrets() {
+    private static SecretsManagerService defaultSecrets() {
+        SecretsManagerService secrets = mock(SecretsManagerService.class);
+        SecretVersion version = new SecretVersion();
+        version.setSecretString("{\"username\":\"sa\",\"password\":\"\"}");
+        when(secrets.getSecretValue(any(), any(), any(), any())).thenReturn(version);
+        return secrets;
+    }
+
+    private static SecretsManagerService missingSecrets() {
         SecretsManagerService secrets = mock(SecretsManagerService.class);
         when(secrets.getSecretValue(any(), any(), any(), any()))
                 .thenThrow(new AwsException("ResourceNotFoundException",
                         "Secrets Manager can't find the specified secret.", 400));
+        return secrets;
+    }
+
+    private static SecretsManagerService secretWith(String value) {
+        SecretsManagerService secrets = mock(SecretsManagerService.class);
+        SecretVersion version = new SecretVersion();
+        version.setSecretString(value);
+        when(secrets.getSecretValue(any(), any(), any(), any())).thenReturn(version);
         return secrets;
     }
 
@@ -764,6 +991,7 @@ class RdsDataServiceTest {
         return switch (engine) {
             case MYSQL, MARIADB -> "MySQL";
             case POSTGRES -> "PostgreSQL";
+            case SQLSERVER -> "MSSQLServer";
         };
     }
 
@@ -795,14 +1023,41 @@ class RdsDataServiceTest {
                 });
     }
 
+    /** Counts the backends the Data API enters and the holds still open on them. */
+    private static final class CountingGate implements RdsBackendGate {
+        private final List<String> entered = new CopyOnWriteArrayList<>();
+        private final AtomicInteger held = new AtomicInteger();
+        private volatile IllegalStateException failure;
+
+        @Override
+        public Lease enter(String host, int port) {
+            if (failure != null) {
+                throw failure;
+            }
+            entered.add(host + ":" + port);
+            held.incrementAndGet();
+            AtomicBoolean closed = new AtomicBoolean();
+            return () -> {
+                if (closed.compareAndSet(false, true)) {
+                    held.decrementAndGet();
+                }
+            };
+        }
+    }
+
     private final class TestHarness {
         private final String jdbcUrl;
         private final RdsDataResourceResolver resolver;
         private final RdsDataResourceResolver.DatabaseTarget target;
+        private final CountingGate gate = new CountingGate();
         private final RdsDataService service;
 
         private TestHarness() {
             this(DatabaseEngine.MYSQL, Duration.ofSeconds(60));
+        }
+
+        private TestHarness(SecretsManagerService secrets) {
+            this(secrets, DatabaseEngine.MYSQL, Duration.ofSeconds(60));
         }
 
         private TestHarness(DatabaseEngine engine) {
@@ -814,10 +1069,13 @@ class RdsDataServiceTest {
         }
 
         private TestHarness(DatabaseEngine engine, Duration transactionTtl) {
+            this(defaultSecrets(), engine, transactionTtl);
+        }
+
+        private TestHarness(SecretsManagerService secrets, DatabaseEngine engine, Duration transactionTtl) {
             jdbcUrl = "jdbc:h2:mem:rdsdata_" + UUID.randomUUID() + ";MODE=" + h2Mode(engine)
                     + ";DATABASE_TO_LOWER=TRUE;DB_CLOSE_DELAY=-1";
             resolver = mock(RdsDataResourceResolver.class);
-            SecretsManagerService secrets = fallbackSecrets();
             target = target(RESOURCE_ARN, engine);
             when(resolver.resolve(RESOURCE_ARN, REGION)).thenReturn(target);
             when(resolver.resolve(FALLBACK_RESOURCE_ARN, REGION)).thenReturn(target);
@@ -830,14 +1088,29 @@ class RdsDataServiceTest {
                                 String username,
                                 String password,
                                 String database) throws SQLException {
-                    return DriverManager.getConnection(jdbcUrl, "sa", "");
+                    return getConnection();
                 }
             };
-            service = new RdsDataService(resolver, secrets, objectMapper, connectionFactory, transactionTtl);
+            service = new RdsDataService(resolver, secrets, objectMapper, connectionFactory, transactionTtl, gate);
+        }
+
+        private Connection getConnection() throws SQLException {
+            try {
+                return DriverManager.getConnection(jdbcUrl, "sa", "");
+            } catch (SQLException e) {
+                Properties props = new Properties();
+                props.setProperty("user", "sa");
+                props.setProperty("password", "");
+                Connection conn = new Driver().connect(jdbcUrl, props);
+                if (conn != null) {
+                    return conn;
+                }
+                throw e;
+            }
         }
 
         private void createTables() throws SQLException {
-            try (Connection connection = DriverManager.getConnection(jdbcUrl, "sa", "");
+            try (Connection connection = getConnection();
                  Statement statement = connection.createStatement()) {
                 statement.execute("""
                         create table data_api_items(
@@ -863,7 +1136,7 @@ class RdsDataServiceTest {
          * harnesses standing in for PostgreSQL.
          */
         private void createEventsTable() throws SQLException {
-            try (Connection connection = DriverManager.getConnection(jdbcUrl, "sa", "");
+            try (Connection connection = getConnection();
                  Statement statement = connection.createStatement()) {
                 statement.execute("""
                         create table data_api_events(

@@ -9,13 +9,16 @@ import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager.ContainerInfo;
 import io.github.hectorvent.floci.core.common.docker.ContainerLogStreamer;
 import io.github.hectorvent.floci.core.common.docker.LaunchedContainerAwsEnv;
+import io.github.hectorvent.floci.services.ecr.registry.EcrRegistryManager;
 import io.github.hectorvent.floci.services.ecs.model.ContainerDefinition;
 import io.github.hectorvent.floci.services.ecs.model.ContainerOverride;
 import io.github.hectorvent.floci.services.ecs.model.EcsTask;
 import io.github.hectorvent.floci.services.ecs.model.KeyValuePair;
 import io.github.hectorvent.floci.services.ecs.model.Secret;
 import io.github.hectorvent.floci.services.ecs.model.TaskDefinition;
+import io.github.hectorvent.floci.services.lambda.launcher.ImageCacheService.LaunchImage;
 import io.github.hectorvent.floci.services.secretsmanager.SecretsManagerService;
+import io.github.hectorvent.floci.services.s3.S3Service;
 import io.github.hectorvent.floci.services.secretsmanager.model.SecretVersion;
 import io.github.hectorvent.floci.services.ssm.SsmService;
 import io.github.hectorvent.floci.services.ssm.model.Parameter;
@@ -51,8 +54,11 @@ class EcsContainerManagerSecretsTest {
         builder = mock(ContainerBuilder.Builder.class, RETURNS_SELF);
         containerBuilder = mock(ContainerBuilder.class);
         when(containerBuilder.newContainer(anyString())).thenReturn(builder);
+        when(containerBuilder.resolveImage(anyString())).thenAnswer(invocation -> invocation.getArgument(0));
 
         lifecycleManager = mock(ContainerLifecycleManager.class);
+        when(lifecycleManager.resolveImageForLaunch(any(), any()))
+                .thenAnswer(invocation -> new LaunchImage(invocation.getArgument(0), null));
         when(lifecycleManager.createAndStart(any()))
                 .thenReturn(new ContainerInfo("docker-id", Map.of()));
 
@@ -64,9 +70,12 @@ class EcsContainerManagerSecretsTest {
         when(awsEnv.sdkBaselineEnv(any(), any())).thenReturn(List.of());
         ssmService = mock(SsmService.class);
         secretsManagerService = mock(SecretsManagerService.class);
+        EcrRegistryManager ecrRegistryManager = mock(EcrRegistryManager.class);
+        when(ecrRegistryManager.rewriteImageUri(anyString())).thenAnswer(inv -> inv.getArgument(0));
 
         manager = new EcsContainerManager(containerBuilder, lifecycleManager, logStreamer,
-                containerDetector, config, regionResolver, awsEnv, ssmService, secretsManagerService);
+                containerDetector, config, regionResolver, awsEnv, ssmService, secretsManagerService, mock(S3Service.class),
+                ecrRegistryManager, mock(HostVolumePolicy.class));
     }
 
     @Test
@@ -107,6 +116,40 @@ class EcsContainerManagerSecretsTest {
                 List.of(), "us-east-1");
 
         verify(ssmService).getParameter("/foo/bar", "us-east-1");
+    }
+
+    /**
+     * Both {@code valueFrom} guards required a literal {@code arn:aws:}. Outside the commercial
+     * partition a Secrets Manager ARN fell through to the SSM branch and a parameter ARN was
+     * passed along whole as a parameter name, so the task died at launch with ParameterNotFound
+     * rather than reading its own configuration.
+     */
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.CsvSource({
+            "us-gov-west-1, aws-us-gov",
+            "cn-north-1,    aws-cn",
+            "us-isob-east-1, aws-iso-b"})
+    void resolvesSecretsAndParametersInAnyPartition(String region, String partition) {
+        String ssmArn = "arn:" + partition + ":ssm:" + region + ":000000000000:parameter/app/token";
+        String secretArn = "arn:" + partition + ":secretsmanager:" + region + ":000000000000:secret:db-AbCdEf";
+        when(ssmService.getParameter("/app/token", region))
+                .thenReturn(new Parameter("/app/token", "ssm-value", "String"));
+        when(secretsManagerService.getSecretValue(secretArn, null, null, region))
+                .thenReturn(secretVersion("sm-value"));
+
+        manager.startTask(task(), taskDef(containerDef("app", List.of(
+                new Secret("TOKEN", ssmArn),
+                new Secret("PASSWORD", secretArn)))),
+                List.of(), region);
+
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<List<String>> envCaptor = ArgumentCaptor.forClass(List.class);
+        verify(builder).withEnv(envCaptor.capture());
+
+        List<String> env = envCaptor.getValue();
+        assertTrue(env.contains("TOKEN=ssm-value"), "SSM ARN in " + partition + " did not resolve: " + env);
+        assertTrue(env.contains("PASSWORD=sm-value"),
+                "Secrets Manager ARN in " + partition + " did not resolve: " + env);
     }
 
     @Test

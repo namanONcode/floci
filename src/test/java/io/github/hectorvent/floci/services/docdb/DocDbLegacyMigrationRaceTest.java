@@ -10,6 +10,9 @@ import io.github.hectorvent.floci.services.docdb.container.DocDbContainerManager
 import io.github.hectorvent.floci.services.docdb.model.DocDbCluster;
 import io.github.hectorvent.floci.services.docdb.model.DocDbInstance;
 import org.junit.jupiter.api.Test;
+import io.github.hectorvent.floci.services.ec2.Ec2Service;
+import io.github.hectorvent.floci.services.kms.KmsService;
+import io.github.hectorvent.floci.services.rds.RdsService;
 import org.mockito.Mockito;
 
 import java.util.concurrent.CountDownLatch;
@@ -45,13 +48,14 @@ class DocDbLegacyMigrationRaceTest {
                 "docdb-clusters.json".equals(inv.getArgument(1)) ? clusterStore : instanceStore);
 
         EmulatorConfig config = Mockito.mock(EmulatorConfig.class);
-        var servicesConfig = Mockito.mock(EmulatorConfig.ServicesConfig.class);
-        var docdbConfig = Mockito.mock(EmulatorConfig.DocDbServiceConfig.class);
+        EmulatorConfig.ServicesConfig servicesConfig = Mockito.mock(EmulatorConfig.ServicesConfig.class);
+        EmulatorConfig.DocDbServiceConfig docdbConfig = Mockito.mock(EmulatorConfig.DocDbServiceConfig.class);
         when(config.services()).thenReturn(servicesConfig);
         when(servicesConfig.docdb()).thenReturn(docdbConfig);
         when(docdbConfig.mock()).thenReturn(true);
         service = new DocDbService(config, new RegionResolver("us-east-1", "000000000000"),
-                Mockito.mock(DocDbContainerManager.class), storageFactory);
+                Mockito.mock(DocDbContainerManager.class), storageFactory,
+                Mockito.mock(RdsService.class), Mockito.mock(Ec2Service.class), Mockito.mock(KmsService.class));
     }
 
     private void freshService() {
@@ -63,14 +67,15 @@ class DocDbLegacyMigrationRaceTest {
                 "docdb-clusters.json".equals(inv.getArgument(1)) ? clusterStore : instanceStore);
 
         EmulatorConfig config = Mockito.mock(EmulatorConfig.class);
-        var servicesConfig = Mockito.mock(EmulatorConfig.ServicesConfig.class);
-        var docdbConfig = Mockito.mock(EmulatorConfig.DocDbServiceConfig.class);
+        EmulatorConfig.ServicesConfig servicesConfig = Mockito.mock(EmulatorConfig.ServicesConfig.class);
+        EmulatorConfig.DocDbServiceConfig docdbConfig = Mockito.mock(EmulatorConfig.DocDbServiceConfig.class);
         when(config.services()).thenReturn(servicesConfig);
         when(servicesConfig.docdb()).thenReturn(docdbConfig);
         when(docdbConfig.mock()).thenReturn(true);
 
         service = new DocDbService(config, new RegionResolver("us-east-1", "000000000000"),
-                Mockito.mock(DocDbContainerManager.class), storageFactory);
+                Mockito.mock(DocDbContainerManager.class), storageFactory,
+                Mockito.mock(RdsService.class), Mockito.mock(Ec2Service.class), Mockito.mock(KmsService.class));
     }
 
     @Test

@@ -4,6 +4,7 @@ import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsService;
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.async.ResultCallback;
+import com.github.dockerjava.api.command.LogContainerCmd;
 import com.github.dockerjava.api.model.Frame;
 import com.github.dockerjava.api.model.StreamType;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -14,6 +15,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.Closeable;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.time.Instant;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayDeque;
@@ -33,7 +35,7 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.Consumer;
 
 /**
- * Streams Docker container logs to both the Floci console logger and CloudWatch Logs.
+ * Streams Docker container logs to CloudWatch Logs and, by default, the Floci console logger.
  * Consolidates the log streaming pattern used across container managers.
  */
 @ApplicationScoped
@@ -45,8 +47,12 @@ public class ContainerLogStreamer {
     private final DockerClient dockerClient;
     private final CloudWatchLogsService cloudWatchLogsService;
 
+    // Log-follow attaches hold their connection open for the whole container lifetime, so
+    // this class is the primary consumer of the streaming pool: sharing the control-plane
+    // pool is what starved short create/start/stop calls during an LZA Logging fan-out
+    // (see DockerClientProducer / StreamingDocker).
     @Inject
-    public ContainerLogStreamer(DockerClient dockerClient, CloudWatchLogsService cloudWatchLogsService) {
+    public ContainerLogStreamer(@StreamingDocker DockerClient dockerClient, CloudWatchLogsService cloudWatchLogsService) {
         this.dockerClient = dockerClient;
         this.cloudWatchLogsService = cloudWatchLogsService;
     }
@@ -69,9 +75,36 @@ public class ContainerLogStreamer {
                 null, containerId, logGroup, logStream, region, logPrefix);
     }
 
+    /**
+     * Like {@link #attach}, but only forwards lines the container emits from now on. Use it for a
+     * container that already existed before this process started: following from the beginning
+     * replays its whole history (hours of registry access logs after a busy day) into the console
+     * and CloudWatch Logs, where it evicts the current Lambda logs.
+     */
+    public Closeable attachFromNow(String containerId, String logGroup, String logStream,
+                                   String region, String logPrefix) {
+        return attachFromNowForAccount(null, containerId, logGroup, logStream, region, logPrefix);
+    }
+
     public Closeable attachForAccount(
             String accountId, String containerId, String logGroup, String logStream,
             String region, String logPrefix) {
+        return attachForAccount(accountId, containerId, logGroup, logStream, region, logPrefix, null);
+    }
+
+    /**
+     * Like {@link #attachForAccount}, but only forwards lines the container emits from now on.
+     */
+    public Closeable attachFromNowForAccount(
+            String accountId, String containerId, String logGroup, String logStream,
+            String region, String logPrefix) {
+        return attachForAccount(accountId, containerId, logGroup, logStream, region, logPrefix, Instant.now());
+    }
+
+    /** {@code since} of null follows the container's complete log history. */
+    Closeable attachForAccount(
+            String accountId, String containerId, String logGroup, String logStream,
+            String region, String logPrefix, Instant since) {
         ensureLogGroupAndStreamForAccount(accountId, logGroup, logStream, region);
 
         // Trim trailing whitespace and drop blank lines, then fan each reassembled line out to the
@@ -83,15 +116,36 @@ public class ContainerLogStreamer {
                 forwardToCloudWatchLogs(accountId, logGroup, logStream, region, trimmed);
             }
         };
+        return follow(containerId, since, emitter);
+    }
 
+    /**
+     * Like {@link #attach}, but sends the output only to the console logger, not to CloudWatch Logs.
+     * Use it for a container whose output must stay visible locally but has no CloudWatch
+     * destination, such as an ECS container without an {@code awslogs} log configuration.
+     */
+    public Closeable attachConsoleOnly(String containerId, String logPrefix) {
+        Consumer<String> emitter = line -> {
+            String trimmed = line.stripTrailing();
+            if (!trimmed.isEmpty()) {
+                LOG.infov("[{0}] {1}", logPrefix, trimmed);
+            }
+        };
+        return follow(containerId, null, emitter);
+    }
+
+    private Closeable follow(String containerId, Instant since, Consumer<String> emitter) {
         try {
             LogReassemblyCallback callback = new LogReassemblyCallback(emitter);
-            dockerClient.logContainerCmd(containerId)
+            LogContainerCmd command = dockerClient.logContainerCmd(containerId)
                     .withStdOut(true)
                     .withStdErr(true)
                     .withFollowStream(true)
-                    .withTimestamps(false)
-                    .exec(callback);
+                    .withTimestamps(false);
+            if (since != null) {
+                command = command.withSince((int) since.getEpochSecond());
+            }
+            command.exec(callback);
             return new ContainerLogHandle(callback);
         } catch (Exception e) {
             LOG.warnv("Could not attach log stream for container {0}: {1}", containerId, e.getMessage());
@@ -118,17 +172,33 @@ public class ContainerLogStreamer {
      */
     public ResultCallback.Adapter<Frame> execLogCallback(String logGroup, String logStream,
                                                         String region, String logPrefix) {
-        return frameCallback(null, logGroup, logStream, region, logPrefix);
+        return execLogCallbackForAccount(null, logGroup, logStream, region, logPrefix);
+    }
+
+    public ResultCallback.Adapter<Frame> execLogCallbackForAccount(
+            String accountId, String logGroup, String logStream, String region, String logPrefix) {
+        return execLogCallbackForAccount(accountId, logGroup, logStream, region, logPrefix, true);
     }
 
     /**
-     * Shared frame handling for both the container log stream and exec streams.
+     * Returns an exec callback that always forwards to CloudWatch Logs.
+     *
+     * @param logToConsole whether to also write each frame to the Floci console at INFO level
+     */
+    public ResultCallback.Adapter<Frame> execLogCallbackForAccount(
+            String accountId, String logGroup, String logStream, String region, String logPrefix,
+            boolean logToConsole) {
+        return frameCallback(accountId, logGroup, logStream, region, logPrefix, logToConsole);
+    }
+
+    /**
+     * Handles frames from Docker exec streams.
      *
      * @param accountId account that owns the destination log stream, or {@code null} for the
      *                  default account
      */
     private ResultCallback.Adapter<Frame> frameCallback(String accountId, String logGroup, String logStream,
-                                                        String region, String logPrefix) {
+                                                        String region, String logPrefix, boolean logToConsole) {
         return new ResultCallback.Adapter<>() {
             @Override
             public void onNext(Frame frame) {
@@ -137,7 +207,9 @@ public class ContainerLogStreamer {
                 }
                 String line = new String(frame.getPayload(), StandardCharsets.UTF_8).stripTrailing();
                 if (!line.isEmpty()) {
-                    LOG.infov("[{0}] {1}", logPrefix, line);
+                    if (logToConsole) {
+                        LOG.infov("[{0}] {1}", logPrefix, line);
+                    }
                     forwardToCloudWatchLogs(accountId, logGroup, logStream, region, line);
                 }
             }
@@ -186,6 +258,11 @@ public class ContainerLogStreamer {
         forwardToCloudWatchLogs(null, logGroup, logStream, region, line);
     }
 
+    public void streamToCloudWatchLogsForAccount(
+            String accountId, String logGroup, String logStream, String region, String line) {
+        forwardToCloudWatchLogs(accountId, logGroup, logStream, region, line);
+    }
+
     private void forwardToCloudWatchLogs(
             String accountId, String logGroup, String logStream, String region, String line) {
         try {
@@ -213,7 +290,7 @@ public class ContainerLogStreamer {
         private static final ScheduledExecutorService CLOSE_DRAIN_SCHEDULER = closeDrainScheduler();
 
         private static ScheduledExecutorService closeDrainScheduler() {
-            var scheduler = new ScheduledThreadPoolExecutor(1, runnable -> {
+            ScheduledThreadPoolExecutor scheduler = new ScheduledThreadPoolExecutor(1, runnable -> {
                 Thread thread = new Thread(runnable, "floci-container-log-close");
                 thread.setDaemon(true);
                 return thread;

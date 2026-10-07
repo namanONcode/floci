@@ -6,9 +6,15 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsException;
 
 import java.math.BigDecimal;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Base64;
+import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
+import java.util.TreeSet;
 
 /**
  * Proper tokenizer/parser/evaluator for DynamoDB filter expressions and key condition expressions.
@@ -49,7 +55,7 @@ final class ExpressionEvaluator {
     // ── Tokenizer ──
 
     static List<Token> tokenize(String expression) {
-        var tokens = new ArrayList<Token>();
+        ArrayList<Token> tokens = new ArrayList<>();
         int i = 0;
         int len = expression.length();
 
@@ -216,7 +222,7 @@ final class ExpressionEvaluator {
         }
 
         private Expr parseOrExpr() {
-            var operands = new ArrayList<Expr>();
+            ArrayList<Expr> operands = new ArrayList<>();
             operands.add(parseAndExpr());
             while (peek().type() == TokenType.OR) {
                 advance(); // consume OR
@@ -226,7 +232,7 @@ final class ExpressionEvaluator {
         }
 
         private Expr parseAndExpr() {
-            var operands = new ArrayList<Expr>();
+            ArrayList<Expr> operands = new ArrayList<>();
             operands.add(parseNotExpr());
             while (peek().type() == TokenType.AND) {
                 advance(); // consume AND
@@ -258,7 +264,7 @@ final class ExpressionEvaluator {
             if (current.type() == TokenType.FUNCTION) {
                 String funcName = advance().value();
                 expect(TokenType.LPAREN);
-                var args = parseOperandList();
+                List<Operand> args = parseOperandList();
                 expect(TokenType.RPAREN);
 
                 // If followed by a comparator, this is "size(path) = :val" — treat as comparison
@@ -278,7 +284,7 @@ final class ExpressionEvaluator {
             if (next.type() == TokenType.IN) {
                 advance(); // consume IN
                 expect(TokenType.LPAREN);
-                var candidates = parseOperandList();
+                List<Operand> candidates = parseOperandList();
                 expect(TokenType.RPAREN);
                 return new InExpr(left, candidates);
             }
@@ -307,7 +313,7 @@ final class ExpressionEvaluator {
             if (current.type() == TokenType.FUNCTION) {
                 String funcName = advance().value();
                 expect(TokenType.LPAREN);
-                var args = parseOperandList();
+                List<Operand> args = parseOperandList();
                 expect(TokenType.RPAREN);
                 return new FunctionOperand(funcName, args);
             }
@@ -319,7 +325,7 @@ final class ExpressionEvaluator {
 
             // Path: identifier or #name, possibly dotted with nested [n] list indices
             if (current.type() == TokenType.IDENTIFIER || current.type() == TokenType.NAME_REF) {
-                var segments = new ArrayList<String>();
+                ArrayList<String> segments = new ArrayList<>();
                 segments.add(advance().value());
                 // Consume any immediately-following list indices (no dot needed before [n])
                 while (peek().type() == TokenType.LIST_INDEX) {
@@ -348,7 +354,7 @@ final class ExpressionEvaluator {
         }
 
         private List<Operand> parseOperandList() {
-            var list = new ArrayList<Operand>();
+            ArrayList<Operand> list = new ArrayList<>();
             list.add(parseOperand());
             while (peek().type() == TokenType.COMMA) {
                 advance(); // consume comma
@@ -368,8 +374,8 @@ final class ExpressionEvaluator {
 
     static Expr parse(String expression) {
         if (expression == null || expression.isBlank()) return null;
-        var tokens = tokenize(expression.trim());
-        var parser = new Parser(tokens);
+        List<Token> tokens = tokenize(expression.trim());
+        Parser parser = new Parser(tokens);
         Expr expr = parser.parseExpression();
         if (parser.peek().type() != TokenType.EOF) {
             throw new IllegalArgumentException(
@@ -393,25 +399,41 @@ final class ExpressionEvaluator {
      */
     static void validateExpression(String expression, String exprType,
                                    JsonNode exprAttrNames, JsonNode exprAttrValues) {
-        if (expression == null || expression.isBlank()) return;
-        List<Token> tokens;
-        Expr expr;
+        validateSyntax(expression, exprType);
+        validateSemantics(expression, exprType, exprAttrNames, exprAttrValues);
+    }
+
+    /**
+     * The tokenize/parse/redundant-parentheses half of {@link #validateExpression}, split out so
+     * callers can run an undefined-#name/:value check between this and {@link #validateSemantics}:
+     * DynamoDB reports a syntax or redundant-parentheses error before an undefined placeholder,
+     * but an undefined placeholder before a semantic error like {@code contains(x, x)}.
+     */
+    static void validateSyntax(String expression, String exprType) {
+        if (expression == null || expression.isBlank()) {
+            return;
+        }
         try {
-            tokens = tokenize(expression.trim());
+            List<Token> tokens = tokenize(expression.trim());
             checkRedundantParentheses(tokens, exprType);
-            expr = parse(expression);
+            parse(expression);
         } catch (IllegalArgumentException e) {
             String detail = e.getMessage();
-            
+
             if (detail.startsWith("token:")) {
-                throw new AwsException("ValidationException", 
+                throw new AwsException("ValidationException",
                     "Invalid " + exprType + ": Syntax error; " + detail, 400);
             } else {
-                throw new AwsException("ValidationException", 
+                throw new AwsException("ValidationException",
                     "Invalid " + exprType + ": Syntax error", 400);
             }
         }
-        validateSemantics(expr, exprType, exprAttrNames, exprAttrValues);
+    }
+
+    /** The semantic half of {@link #validateExpression}; see {@link #validateSyntax}. */
+    static void validateSemantics(String expression, String exprType,
+                                   JsonNode exprAttrNames, JsonNode exprAttrValues) {
+        validateSemantics(parse(expression), exprType, exprAttrNames, exprAttrValues);
     }
 
     // A pair of parentheses is redundant when its entire content is itself a single
@@ -451,8 +473,70 @@ final class ExpressionEvaluator {
             case OrExpr o -> o.operands().forEach(x -> validateSemantics(x, exprType, names, values));
             case NotExpr n -> validateSemantics(n.operand(), exprType, names, values);
             case FunctionCallExpr f -> validateFunction(f, exprType, names, values);
+            case BetweenExpr b -> validateBetween(b, exprType, values);
             default -> {}
         }
+    }
+
+    // AWS rejects a BETWEEN whose bounds are the wrong way round when it parses the
+    // expression, rather than letting the condition fail at evaluation time.
+    private static void validateBetween(BetweenExpr between, String exprType, JsonNode values) {
+        JsonNode low = placeholderValue(between.low(), values);
+        JsonNode high = placeholderValue(between.high(), values);
+        if (low == null || high == null) {
+            return;
+        }
+        String lowType = low.fieldNames().next();
+        if (!lowType.equals(high.fieldNames().next()) || compareBoundValues(low, high) <= 0) {
+            return;
+        }
+        // AWS wraps the ConditionExpression form in its validation-error envelope, but reports
+        // the FilterExpression and KeyConditionExpression forms on their own.
+        String envelope = "ConditionExpression".equals(exprType) ? "1 validation error detected: " : "";
+        throw new AwsException("ValidationException", envelope
+                + "Invalid " + exprType + ": The BETWEEN operator requires upper bound to be greater than "
+                + "or equal to lower bound; lower bound operand: " + displayAttributeValue(low)
+                + ", upper bound operand: " + displayAttributeValue(high), 400);
+    }
+
+    // DynamoDB orders strings by their UTF-8 bytes, which differs from Java's UTF-16
+    // ordering above the basic plane: U+E000 sorts before U+10000 on AWS but after it here.
+    private static int compareBoundValues(JsonNode low, JsonNode high) {
+        if (low.has("S") && high.has("S")) {
+            return Arrays.compareUnsigned(
+                    low.get("S").asText().getBytes(StandardCharsets.UTF_8),
+                    high.get("S").asText().getBytes(StandardCharsets.UTF_8));
+        }
+        if (low.has("B") && high.has("B")) {
+            return Arrays.compareUnsigned(decodeBinary(low), decodeBinary(high));
+        }
+        return compareAttributeValues(low, high);
+    }
+
+    // A binary value that is not valid base64 never reaches a comparison, begins_with or size()
+    // on AWS: the request fails to deserialize first, with a 400 SerializationException.
+    private static byte[] decodeBinary(JsonNode value) {
+        try {
+            return Base64.getDecoder().decode(value.get("B").asText());
+        } catch (IllegalArgumentException e) {
+            throw new AwsException("SerializationException",
+                    "Unexpected value type in payload", 400);
+        }
+    }
+
+    private static JsonNode placeholderValue(Operand operand, JsonNode values) {
+        if (operand instanceof PlaceholderOperand(String name) && values != null) {
+            JsonNode value = values.get(name);
+            if (value != null && value.isObject() && value.fieldNames().hasNext()) {
+                return value;
+            }
+        }
+        return null;
+    }
+
+    private static String displayAttributeValue(JsonNode value) {
+        String type = value.fieldNames().next();
+        return "AttributeValue: {" + type + ":" + value.get(type).asText() + "}";
     }
 
     private static void validateFunction(FunctionCallExpr f, String exprType,
@@ -500,7 +584,7 @@ final class ExpressionEvaluator {
     // Renders a path operand the way DynamoDB does in operand errors, e.g. "[data]" or "[a, b]".
     private static String displayOperand(Operand operand, JsonNode names) {
         if (operand instanceof PathOperand path) {
-            var parts = new ArrayList<String>();
+            ArrayList<String> parts = new ArrayList<>();
             for (String seg : path.segments()) {
                 if (seg.startsWith("[")) {
                     if (!parts.isEmpty()) parts.set(parts.size() - 1, parts.getLast() + seg);
@@ -543,7 +627,7 @@ final class ExpressionEvaluator {
             }
         }
 
-        var tokens = tokenize(expression.trim());
+        List<Token> tokens = tokenize(expression.trim());
         // Find the top-level AND that separates PK from SK.
         // We need to skip AND tokens that are part of BETWEEN...AND.
         // Strategy: walk through tokens tracking parenthesis depth and BETWEEN state.
@@ -647,7 +731,7 @@ final class ExpressionEvaluator {
 
         JsonNode leftNode = resolveAttributeValue(cmp.left(), item, exprAttrNames, exprAttrValues);
         JsonNode rightNode = resolveAttributeValue(cmp.right(), item, exprAttrNames, exprAttrValues);
-        if (leftNode == null || rightNode == null) return false;
+        if (leftNode == null || rightNode == null || !sameType(leftNode, rightNode)) return false;
         int cmpResult = compareAttributeValues(leftNode, rightNode);
         return switch (cmp.op()) {
             case LT -> cmpResult < 0;
@@ -663,8 +747,12 @@ final class ExpressionEvaluator {
         JsonNode val = resolveAttributeValue(bet.value(), item, exprAttrNames, exprAttrValues);
         JsonNode low = resolveAttributeValue(bet.low(), item, exprAttrNames, exprAttrValues);
         JsonNode high = resolveAttributeValue(bet.high(), item, exprAttrNames, exprAttrValues);
-        if (val == null || low == null || high == null) return false;
+        if (val == null || low == null || high == null || !sameType(val, low) || !sameType(val, high)) return false;
         return compareAttributeValues(val, low) >= 0 && compareAttributeValues(val, high) <= 0;
+    }
+
+    private static boolean sameType(JsonNode left, JsonNode right) {
+        return left.fieldNames().next().equals(right.fieldNames().next());
     }
 
     private static boolean evaluateIn(InExpr in, JsonNode item,
@@ -703,8 +791,8 @@ final class ExpressionEvaluator {
                 JsonNode prefixNode = resolveAttributeValue(func.args().get(1), item, exprAttrNames, exprAttrValues);
                 if (attrNode == null || prefixNode == null) yield false;
                 if (attrNode.has("B") && prefixNode.has("B")) {
-                    byte[] attrBytes = java.util.Base64.getDecoder().decode(attrNode.get("B").asText());
-                    byte[] prefixBytes = java.util.Base64.getDecoder().decode(prefixNode.get("B").asText());
+                    byte[] attrBytes = decodeBinary(attrNode);
+                    byte[] prefixBytes = decodeBinary(prefixNode);
                     if (prefixBytes.length > attrBytes.length) yield false;
                     for (int bi = 0; bi < prefixBytes.length; bi++) {
                         if (attrBytes[bi] != prefixBytes[bi]) yield false;
@@ -853,7 +941,7 @@ final class ExpressionEvaluator {
     }
 
     private static String resolvePathString(PathOperand path, JsonNode exprAttrNames) {
-        var sb = new StringBuilder();
+        StringBuilder sb = new StringBuilder();
         for (int i = 0; i < path.segments().size(); i++) {
             String segment = path.segments().get(i);
             if (segment.startsWith("[")) {
@@ -895,7 +983,7 @@ final class ExpressionEvaluator {
     // Tokenizes a resolved path string (e.g. "a.b[0].c") into segments.
     // Each segment is either a plain attribute name or a "[n]" list index string.
     private static List<String> parsePathSegments(String path) {
-        var segs = new ArrayList<String>();
+        ArrayList<String> segs = new ArrayList<>();
         for (String dotPart : path.split("\\.")) {
             dotPart = dotPart.replace(DOT_ESCAPE, ".");
             int brk = dotPart.indexOf('[');
@@ -962,9 +1050,9 @@ final class ExpressionEvaluator {
             JsonNode aMap = a.get("M");
             JsonNode bMap = b.get("M");
             if (aMap.size() != bMap.size()) return false;
-            var fields = aMap.fields();
+            Iterator<Map.Entry<String, JsonNode>> fields = aMap.fields();
             while (fields.hasNext()) {
-                var entry = fields.next();
+                Map.Entry<String, JsonNode> entry = fields.next();
                 if (!bMap.has(entry.getKey())) return false;
                 if (!attributeValuesEqual(entry.getValue(), bMap.get(entry.getKey()))) return false;
             }
@@ -983,7 +1071,7 @@ final class ExpressionEvaluator {
         if (a.has("SS") && b.has("SS")) {
             JsonNode aArr = a.get("SS"), bArr = b.get("SS");
             if (aArr.size() != bArr.size()) return false;
-            var aSet = new java.util.HashSet<String>();
+            HashSet<String> aSet = new HashSet<>();
             aArr.forEach(e -> aSet.add(e.asText()));
             for (JsonNode e : bArr) { if (!aSet.contains(e.asText())) return false; }
             return true;
@@ -992,7 +1080,7 @@ final class ExpressionEvaluator {
         if (a.has("BS") && b.has("BS")) {
             JsonNode aArr = a.get("BS"), bArr = b.get("BS");
             if (aArr.size() != bArr.size()) return false;
-            var aSet = new java.util.HashSet<String>();
+            HashSet<String> aSet = new HashSet<>();
             aArr.forEach(e -> aSet.add(e.asText()));
             for (JsonNode e : bArr) { if (!aSet.contains(e.asText())) return false; }
             return true;
@@ -1003,7 +1091,7 @@ final class ExpressionEvaluator {
             if (aArr.size() != bArr.size()) return false;
             // TreeSet membership goes through compareTo, so 1 and 1.0 are the same member.
             // BigDecimal.equals() is scale-sensitive and would treat them as different.
-            var aSet = new java.util.TreeSet<BigDecimal>();
+            TreeSet<BigDecimal> aSet = new TreeSet<>();
             try {
                 aArr.forEach(e -> aSet.add(new BigDecimal(e.asText())));
                 for (JsonNode e : bArr) { if (!aSet.contains(new BigDecimal(e.asText()))) return false; }
@@ -1032,8 +1120,8 @@ final class ExpressionEvaluator {
             }
         }
         if (a.has("B") && b.has("B")) {
-            byte[] aBytes = Base64.getDecoder().decode(a.get("B").asText());
-            byte[] bBytes = Base64.getDecoder().decode(b.get("B").asText());
+            byte[] aBytes = decodeBinary(a);
+            byte[] bBytes = decodeBinary(b);
             int minLen = Math.min(aBytes.length, bBytes.length);
             for (int i = 0; i < minLen; i++) {
                 int diff = (aBytes[i] & 0xFF) - (bBytes[i] & 0xFF);
@@ -1050,7 +1138,7 @@ final class ExpressionEvaluator {
 
     private static int computeSize(JsonNode attrNode) {
         if (attrNode.has("S")) return attrNode.get("S").asText().length();
-        if (attrNode.has("B")) return attrNode.get("B").asText().length(); // base64 length
+        if (attrNode.has("B")) return decodeBinary(attrNode).length;
         if (attrNode.has("L")) return attrNode.get("L").size();
         if (attrNode.has("M")) return attrNode.get("M").size();
         if (attrNode.has("SS")) return attrNode.get("SS").size();

@@ -6,16 +6,19 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.Resettable;
+import io.github.hectorvent.floci.core.common.SqlParameterParser.ParsedSql;
+import io.github.hectorvent.floci.services.rds.container.RdsBackendGate;
 import io.github.hectorvent.floci.services.rds.model.DatabaseEngine;
 import io.github.hectorvent.floci.services.secretsmanager.SecretsManagerService;
 import io.github.hectorvent.floci.services.secretsmanager.model.SecretVersion;
-import io.github.hectorvent.floci.core.common.Resettable;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import java.nio.charset.StandardCharsets;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
@@ -40,6 +43,12 @@ import java.util.concurrent.TimeUnit;
 @ApplicationScoped
 public class RdsDataService implements Resettable {
 
+    /**
+     * The Data API fails an ExecuteStatement whose response is larger than 1 MiB. Only the
+     * serialized records are counted; the small remainder of the body is not.
+     */
+    private static final long MAX_RESPONSE_BYTES = 1024L * 1024L;
+
     private static final Logger LOG = Logger.getLogger(RdsDataService.class);
 
     /** Statement keywords whose result is a write, even when a {@code RETURNING} clause also reports rows. */
@@ -52,15 +61,17 @@ public class RdsDataService implements Resettable {
     private final Duration transactionTtl;
     private final ConcurrentMap<String, TransactionContext> transactions = new ConcurrentHashMap<>();
     private final ScheduledExecutorService transactionCleanupExecutor;
+    private final RdsBackendGate backendGate;
 
     @Inject
     public RdsDataService(RdsDataResourceResolver resourceResolver,
                           SecretsManagerService secretsManagerService,
                           ObjectMapper objectMapper,
                           RdsDataConnectionFactory connectionFactory,
-                          EmulatorConfig config) {
+                          EmulatorConfig config,
+                          RdsBackendGate backendGate) {
         this(resourceResolver, secretsManagerService, objectMapper, connectionFactory,
-                Duration.ofSeconds(config.services().rdsData().transactionTtlSeconds()));
+                Duration.ofSeconds(config.services().rdsData().transactionTtlSeconds()), backendGate);
     }
 
     RdsDataService(RdsDataResourceResolver resourceResolver,
@@ -68,11 +79,22 @@ public class RdsDataService implements Resettable {
                    ObjectMapper objectMapper,
                    RdsDataConnectionFactory connectionFactory,
                    Duration transactionTtl) {
+        this(resourceResolver, secretsManagerService, objectMapper, connectionFactory, transactionTtl,
+                RdsBackendGate.OPEN);
+    }
+
+    RdsDataService(RdsDataResourceResolver resourceResolver,
+                   SecretsManagerService secretsManagerService,
+                   ObjectMapper objectMapper,
+                   RdsDataConnectionFactory connectionFactory,
+                   Duration transactionTtl,
+                   RdsBackendGate backendGate) {
         this.resourceResolver = resourceResolver;
         this.secretsManagerService = secretsManagerService;
         this.objectMapper = objectMapper;
         this.connectionFactory = connectionFactory;
         this.transactionTtl = transactionTtl;
+        this.backendGate = backendGate;
         this.transactionCleanupExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread thread = new Thread(r, "rds-data-transaction-cleanup");
             thread.setDaemon(true);
@@ -94,7 +116,7 @@ public class RdsDataService implements Resettable {
             synchronized (tx) {
                 if (transactions.remove(id, tx)) {
                     rollbackQuietly(tx.connection);
-                    closeQuietly(tx.connection);
+                    tx.close();
                 }
             }
         });
@@ -105,7 +127,7 @@ public class RdsDataService implements Resettable {
             synchronized (tx) {
                 if (transactions.remove(id, tx)) {
                     rollbackQuietly(tx.connection);
-                    closeQuietly(tx.connection);
+                    tx.close();
                 }
             }
         });
@@ -148,13 +170,18 @@ public class RdsDataService implements Resettable {
         Credentials credentials = credentials(request, target, region);
         String database = databaseName(request, target);
 
+        // The transaction's connection keeps the cluster awake until it commits, rolls back or expires.
+        RdsBackendGate.Lease lease = enterBackend(target);
+        boolean leaseHandedOver = false;
         Connection connection = null;
         try {
             connection = connectionFactory.open(target, credentials.username(), credentials.password(), database);
             connection.setAutoCommit(false);
             String transactionId = UUID.randomUUID().toString();
             transactions.put(transactionId, new TransactionContext(
-                    transactionId, connection, target.engine(), target.arn(), database, region, transactionTtl));
+                    transactionId, connection, target.engine(), target.arn(), database, region, transactionTtl,
+                    lease));
+            leaseHandedOver = true;
 
             ObjectNode response = objectMapper.createObjectNode();
             response.put("transactionId", transactionId);
@@ -164,6 +191,10 @@ public class RdsDataService implements Resettable {
                 closeQuietly(connection);
             }
             throw databaseError(e);
+        } finally {
+            if (!leaseHandedOver) {
+                lease.close();
+            }
         }
     }
 
@@ -183,7 +214,7 @@ public class RdsDataService implements Resettable {
             } catch (SQLException e) {
                 throw databaseError(e);
             } finally {
-                closeQuietly(tx.connection);
+                tx.close();
             }
         }
         ObjectNode response = objectMapper.createObjectNode();
@@ -207,7 +238,7 @@ public class RdsDataService implements Resettable {
             } catch (SQLException e) {
                 throw databaseError(e);
             } finally {
-                closeQuietly(tx.connection);
+                tx.close();
             }
         }
         ObjectNode response = objectMapper.createObjectNode();
@@ -235,15 +266,32 @@ public class RdsDataService implements Resettable {
                 resourceResolver.resolve(resourceArn, region);
         Credentials credentials = credentials(request, target, region);
         String database = databaseName(request, target);
-        try (Connection connection = connectionFactory.open(target, credentials.username(), credentials.password(), database)) {
+        try (RdsBackendGate.Lease _ = enterBackend(target);
+             Connection connection = connectionFactory.open(target, credentials.username(), credentials.password(), database)) {
             return work.execute(connection, target.engine());
+        }
+    }
+
+    /**
+     * Resumes an auto-paused Aurora cluster before the Data API uses its database, as Aurora
+     * does, and keeps it from pausing again until the returned lease is closed.
+     */
+    private RdsBackendGate.Lease enterBackend(RdsDataResourceResolver.DatabaseTarget target) {
+        try {
+            return backendGate.enter(target.host(), target.port());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new AwsException("InternalServerErrorException",
+                    "Interrupted while the DB cluster was resuming.", 500);
+        } catch (IllegalStateException e) {
+            throw new AwsException("InternalServerErrorException", e.getMessage(), 500);
         }
     }
 
     private ObjectNode executeOnConnection(Connection connection, DatabaseEngine engine, String sql,
                                            Map<String, JsonNode> parameters, boolean includeMetadata)
             throws SQLException {
-        RdsDataSqlParameters.ParsedSql parsed = RdsDataSqlParameters.parse(sql, usesBackslashEscapes(engine));
+        ParsedSql parsed = RdsDataSqlParameters.parse(sql, usesBackslashEscapes(engine));
         try (PreparedStatement statement = prepare(connection, engine, parsed.sql())) {
             RdsDataSqlParameters.bind(statement, parsed.parameterOrder(), parameters);
             return buildResponse(statement, statement.execute(), includeMetadata, engine);
@@ -274,7 +322,7 @@ public class RdsDataService implements Resettable {
         if (parameterSets.isEmpty()) {
             return batchResponse(updateResults);
         }
-        RdsDataSqlParameters.ParsedSql parsed = RdsDataSqlParameters.parse(sql, usesBackslashEscapes(engine));
+        ParsedSql parsed = RdsDataSqlParameters.parse(sql, usesBackslashEscapes(engine));
         try (PreparedStatement statement = prepare(connection, engine, parsed.sql())) {
             rejectStatementReturningRows(statement, parsed.sql());
             if (returnsGeneratedKeys(engine)) {
@@ -394,7 +442,7 @@ public class RdsDataService implements Resettable {
     private static boolean returnsGeneratedKeys(DatabaseEngine engine) {
         return switch (engine) {
             case MYSQL, MARIADB -> true;
-            case POSTGRES -> false;
+            case POSTGRES, SQLSERVER -> false;
         };
     }
 
@@ -406,16 +454,30 @@ public class RdsDataService implements Resettable {
     private static boolean usesBackslashEscapes(DatabaseEngine engine) {
         return switch (engine) {
             case MYSQL, MARIADB -> true;
-            case POSTGRES -> false;
+            case POSTGRES, SQLSERVER -> false;
         };
     }
 
+    /**
+     * The {@code ExecuteStatement} response for {@code statement}.
+     *
+     * <p>{@code records} and {@code generatedFields} are mutually exclusive on
+     * the wire, and each is omitted rather than sent empty when it does not
+     * apply. AWS answers a statement that produced a result set with
+     * {@code records} — an empty array when the query matched no rows — and no
+     * {@code generatedFields}; a statement that produced an update count gets
+     * {@code generatedFields} and no {@code records} at all. Sending
+     * {@code "records": []} for an update would make {@code hasRecords()} on
+     * the AWS SDK models report true, and read as an empty result set to any
+     * caller that tests the field for presence.
+     */
     private ObjectNode buildResponse(Statement statement, boolean hasResultSet, boolean includeMetadata,
                                      DatabaseEngine engine) throws SQLException {
         ObjectNode response = objectMapper.createObjectNode();
         if (hasResultSet) {
             try (ResultSet rs = statement.getResultSet()) {
                 ResultSetMetaData meta = rs.getMetaData();
+                rejectUnsupportedResultTypes(meta, engine);
                 if (includeMetadata) {
                     response.set("columnMetadata", RdsDataColumnMetadata.toColumnMetadata(objectMapper, meta));
                 }
@@ -424,7 +486,6 @@ public class RdsDataService implements Resettable {
             response.put("numberOfRecordsUpdated", 0L);
         } else {
             int updateCount = statement.getUpdateCount();
-            response.set("records", objectMapper.createArrayNode());
             response.put("numberOfRecordsUpdated", Math.max(updateCount, 0));
             response.set("generatedFields", generatedFields(statement, engine));
         }
@@ -454,13 +515,42 @@ public class RdsDataService implements Resettable {
         }
     }
 
+    /**
+     * Aurora PostgreSQL answers a result set holding one of these column types with
+     * UnsupportedResultException (checked 2026-09-13). Casting the column to text is the
+     * documented way to read it.
+     */
+    private static final Set<String> UNSUPPORTED_POSTGRES_RESULT_TYPES = Set.of(
+            "point", "interval", "money", "box", "circle", "line", "lseg", "path", "polygon");
+
+    static void rejectUnsupportedResultTypes(ResultSetMetaData meta, DatabaseEngine engine) throws SQLException {
+        if (engine != DatabaseEngine.POSTGRES) {
+            return;
+        }
+        for (int i = 1; i <= meta.getColumnCount(); i++) {
+            String typeName = meta.getColumnTypeName(i);
+            if (typeName != null && UNSUPPORTED_POSTGRES_RESULT_TYPES.contains(typeName.toLowerCase(Locale.ROOT))) {
+                throw new AwsException("UnsupportedResultException",
+                        "The result contains the unsupported data type " + typeName.toUpperCase(Locale.ROOT) + ".",
+                        400);
+            }
+        }
+    }
+
     private ArrayNode records(ResultSet rs, ResultSetMetaData meta) throws SQLException {
         ArrayNode records = objectMapper.createArrayNode();
         int columnCount = meta.getColumnCount();
+        // Serialized size of the records array: its two brackets plus one comma between rows.
+        long responseBytes = 2;
         while (rs.next()) {
             ArrayNode row = objectMapper.createArrayNode();
             for (int i = 1; i <= columnCount; i++) {
                 row.add(RdsDataFieldMapper.toField(objectMapper, rs.getObject(i), meta.getColumnType(i)));
+            }
+            responseBytes += row.toString().getBytes(StandardCharsets.UTF_8).length
+                    + (records.isEmpty() ? 0 : 1);
+            if (responseBytes > MAX_RESPONSE_BYTES) {
+                throw new AwsException("UnsupportedResultException", "Database response exceeded size limit", 400);
             }
             records.add(row);
         }
@@ -470,16 +560,18 @@ public class RdsDataService implements Resettable {
     private Credentials credentials(JsonNode request, RdsDataResourceResolver.DatabaseTarget target, String region) {
         String secretArn = textOrNull(request, "secretArn");
         if (secretArn != null && !secretArn.isBlank()) {
+            SecretVersion secret;
             try {
-                SecretVersion secret = secretsManagerService.getSecretValue(secretArn, null, null, region);
-                Credentials fromSecret = parseSecretCredentials(secret.getSecretString());
-                if (fromSecret != null) {
-                    return fromSecret;
-                }
+                secret = secretsManagerService.getSecretValue(secretArn, null, null, region);
             } catch (AwsException e) {
-                LOG.debugv("Falling back to RDS master credentials for Data API secret {0}: {1}",
-                        secretArn, e.getMessage());
+                throw new AwsException("SecretsErrorException", e.getMessage(), 400);
             }
+            Credentials fromSecret = parseSecretCredentials(secret.getSecretString());
+            if (fromSecret != null) {
+                return fromSecret;
+            }
+            throw new AwsException("InvalidSecretException",
+                    "The secret must contain username and password fields.", 400);
         }
         String username = target.username() != null && !target.username().isBlank() ? target.username() : "root";
         return new Credentials(username, target.password());
@@ -500,9 +592,11 @@ public class RdsDataService implements Resettable {
                 return new Credentials(username, password);
             }
         } catch (Exception e) {
-            LOG.debugv("Could not parse RDS Data API secret credentials: {0}", e.getMessage());
+            throw new AwsException("InvalidSecretException",
+                    "The secret must contain valid JSON credentials.", 400);
         }
-        return null;
+        throw new AwsException("InvalidSecretException",
+                "The secret must contain username and password fields.", 400);
     }
 
     private String databaseName(JsonNode request, RdsDataResourceResolver.DatabaseTarget target) {
@@ -543,7 +637,7 @@ public class RdsDataService implements Resettable {
                 synchronized (tx) {
                     if (tx.expiresAt.isBefore(now) && transactions.remove(id, tx)) {
                         rollbackQuietly(tx.connection);
-                        closeQuietly(tx.connection);
+                        tx.close();
                     }
                 }
             }
@@ -697,22 +791,32 @@ public class RdsDataService implements Resettable {
         private final String resourceArn;
         private final String database;
         private final String region;
+        private final RdsBackendGate.Lease lease;
         private volatile Instant expiresAt;
 
         private TransactionContext(
                 String id, Connection connection, DatabaseEngine engine, String resourceArn,
-                String database, String region, Duration ttl) {
+                String database, String region, Duration ttl, RdsBackendGate.Lease lease) {
             this.id = id;
             this.connection = connection;
             this.engine = engine;
             this.resourceArn = resourceArn;
             this.database = database;
             this.region = region;
+            this.lease = lease;
             refresh(ttl);
         }
 
         private void refresh(Duration ttl) {
             this.expiresAt = Instant.now().plus(ttl);
+        }
+
+        private void close() {
+            try {
+                closeQuietly(connection);
+            } finally {
+                lease.close();
+            }
         }
     }
 

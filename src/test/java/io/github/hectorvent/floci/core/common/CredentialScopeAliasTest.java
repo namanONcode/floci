@@ -8,6 +8,7 @@ import jakarta.ws.rs.core.MultivaluedHashMap;
 import jakarta.ws.rs.core.UriInfo;
 import org.junit.jupiter.api.Test;
 
+import java.net.URI;
 import java.util.Map;
 import java.util.stream.Collectors;
 
@@ -43,6 +44,12 @@ class CredentialScopeAliasTest {
         assertEquals("iot", catalog.canonicalCredentialScope("iot-jobs-data"));
     }
 
+
+    @Test
+    void ssoPortalAliasNormalisesToSso() {
+        assertEquals("sso", catalog.canonicalCredentialScope("awsssoportal"));
+    }
+
     @Test
     void canonicalScopeIsUnchanged() {
         assertEquals("s3", catalog.canonicalCredentialScope("s3"));
@@ -61,7 +68,6 @@ class CredentialScopeAliasTest {
         // canonical scope from the external key would rewrite valid scopes onto prefixes AWS
         // never issues, so every action would resolve to null and enforcement would be skipped.
         assertEquals("ses", catalog.canonicalCredentialScope("ses"));
-        assertEquals("sesv2", catalog.canonicalCredentialScope("sesv2"));
         assertEquals("bedrock", catalog.canonicalCredentialScope("bedrock"));
         assertEquals("logs", catalog.canonicalCredentialScope("logs"));
     }
@@ -76,7 +82,7 @@ class CredentialScopeAliasTest {
                 .filter(scope -> !scope.equals(catalog.canonicalCredentialScope(scope)))
                 .collect(Collectors.toMap(scope -> scope, catalog::canonicalCredentialScope));
 
-        assertEquals(Map.of("s3express", "s3", "iot-jobs-data", "iot"), rewritten);
+        assertEquals(Map.of("s3express", "s3", "iot-jobs-data", "iot", "awsssoportal", "sso"), rewritten);
     }
 
     @Test
@@ -97,6 +103,8 @@ class CredentialScopeAliasTest {
     private static ContainerRequestContext getObjectRequest() {
         UriInfo uriInfo = mock(UriInfo.class);
         when(uriInfo.getPath()).thenReturn("/my-bucket/my-key");
+        when(uriInfo.getRequestUri()).thenReturn(URI.create("http://localhost:4566/my-bucket/my-key"));
+        when(uriInfo.getBaseUri()).thenReturn(URI.create("http://localhost:4566/"));
         when(uriInfo.getQueryParameters()).thenReturn(new MultivaluedHashMap<>());
 
         ContainerRequestContext ctx = mock(ContainerRequestContext.class);

@@ -54,33 +54,33 @@ public class SfnMockLoader {
      * mock configuration is configured or the test case cannot be resolved from it.
      */
     public MockedTestCase requireTestCase(String stateMachineName, String testCaseName) {
-        var path = configuredPath.orElseThrow(() -> new AwsException("ValidationException",
+        String path = configuredPath.orElseThrow(() -> new AwsException("ValidationException",
                 "Cannot run test case '" + testCaseName + "': no mock configuration file is configured. "
                         + "Set SFN_MOCK_CONFIG to the path of a mock configuration file.", 400));
-        var root = load(path);
-        var testCases = root.path("StateMachines").path(stateMachineName).path("TestCases");
+        JsonNode root = load(path);
+        JsonNode testCases = root.path("StateMachines").path(stateMachineName).path("TestCases");
         if (!testCases.isObject()) {
             throw new AwsException("ValidationException",
                     "State machine '" + stateMachineName + "' has no test cases in mock configuration file "
                             + path, 400);
         }
-        var testCase = testCases.path(testCaseName);
+        JsonNode testCase = testCases.path(testCaseName);
         if (!testCase.isObject()) {
             throw new AwsException("ValidationException",
                     "Test case '" + testCaseName + "' is not defined for state machine '" + stateMachineName
                             + "' in mock configuration file " + path, 400);
         }
-        var mockedResponses = root.path("MockedResponses");
-        var stateResponses = new LinkedHashMap<String, List<MockedResponseStep>>();
+        JsonNode mockedResponses = root.path("MockedResponses");
+        LinkedHashMap<String, List<MockedResponseStep>> stateResponses = new LinkedHashMap<>();
         testCase.fields().forEachRemaining(entry -> {
-            var stateName = entry.getKey();
-            var responseKey = entry.getValue();
+            String stateName = entry.getKey();
+            JsonNode responseKey = entry.getValue();
             if (!responseKey.isTextual()) {
                 throw new AwsException("ValidationException",
                         "Test case '" + testCaseName + "' state '" + stateName
                                 + "' must reference a MockedResponses entry by name", 400);
             }
-            var responseNode = mockedResponses.path(responseKey.asText());
+            JsonNode responseNode = mockedResponses.path(responseKey.asText());
             if (!responseNode.isObject()) {
                 throw new AwsException("ValidationException",
                         "Mocked response '" + responseKey.asText() + "' referenced by test case '"
@@ -94,7 +94,7 @@ public class SfnMockLoader {
     }
 
     private JsonNode load(String path) {
-        var file = Path.of(path);
+        Path file = Path.of(path);
         long lastModified;
         try {
             lastModified = Files.getLastModifiedTime(file).toMillis();
@@ -102,7 +102,7 @@ public class SfnMockLoader {
             throw new AwsException("ValidationException",
                     "Mock configuration file not found: " + path, 400);
         }
-        var cached = cache;
+        CachedMockFile cached = cache;
         if (cached != null && cached.path().equals(path) && cached.lastModified() == lastModified) {
             return cached.root();
         }
@@ -121,22 +121,23 @@ public class SfnMockLoader {
         return root;
     }
 
+    /**
+     * An entry with no attempts stays empty instead of being rejected. Step Functions Local
+     * treats it as a lookup that finds nothing, so the execution starts and fails with
+     * {@code States.Runtime} only if the state that names it is entered.
+     */
     private List<MockedResponseStep> parseSteps(String responseKey, JsonNode responseNode) {
-        var steps = new ArrayList<MockedResponseStep>();
+        ArrayList<MockedResponseStep> steps = new ArrayList<>();
         responseNode.fields().forEachRemaining(
                 entry -> steps.add(parseStep(responseKey, entry.getKey(), entry.getValue())));
-        if (steps.isEmpty()) {
-            throw new AwsException("ValidationException",
-                    "Mocked response '" + responseKey + "' must define at least one attempt entry", 400);
-        }
         steps.sort(Comparator.comparingInt(MockedResponseStep::fromAttempt));
         return List.copyOf(steps);
     }
 
     private MockedResponseStep parseStep(String responseKey, String attemptRange, JsonNode step) {
-        var range = parseAttemptRange(responseKey, attemptRange);
-        var returnNode = step.get("Return");
-        var throwNode = step.get("Throw");
+        int[] range = parseAttemptRange(responseKey, attemptRange);
+        JsonNode returnNode = step.get("Return");
+        JsonNode throwNode = step.get("Throw");
         if ((returnNode == null) == (throwNode == null)) {
             throw new AwsException("ValidationException",
                     "Mocked response '" + responseKey + "' attempt '" + attemptRange
@@ -145,7 +146,7 @@ public class SfnMockLoader {
         if (returnNode != null) {
             return new MockedResponseStep(range[0], range[1], returnNode, null, null);
         }
-        var error = throwNode.path("Error").asText(null);
+        String error = throwNode.path("Error").asText(null);
         if (error == null || error.isBlank()) {
             throw new AwsException("ValidationException",
                     "Mocked response '" + responseKey + "' attempt '" + attemptRange
@@ -156,7 +157,7 @@ public class SfnMockLoader {
 
     private int[] parseAttemptRange(String responseKey, String attemptRange) {
         try {
-            var separator = attemptRange.indexOf('-');
+            int separator = attemptRange.indexOf('-');
             int from;
             int to;
             if (separator < 0) {

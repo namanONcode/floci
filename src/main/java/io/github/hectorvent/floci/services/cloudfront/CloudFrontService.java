@@ -2,8 +2,9 @@ package io.github.hectorvent.floci.services.cloudfront;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.config.EmulatorConfig;
-import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.cloudfront.model.CacheBehavior;
@@ -26,12 +27,15 @@ import io.github.hectorvent.floci.services.cloudfront.model.PublicKey;
 import io.github.hectorvent.floci.services.cloudfront.model.RealtimeLogConfig;
 import io.github.hectorvent.floci.services.cloudfront.model.ResponseHeadersPolicy;
 import io.github.hectorvent.floci.services.cloudfront.model.StreamingDistribution;
+import io.github.hectorvent.floci.services.iam.IamService;
+import io.github.hectorvent.floci.services.iam.ServerCertificateReferenceProvider;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
 import java.security.SecureRandom;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -39,13 +43,15 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
+import java.util.SequencedSet;
 import java.util.Set;
 import java.util.UUID;
 import java.util.function.Function;
 import java.util.regex.Pattern;
 
 @ApplicationScoped
-public class CloudFrontService {
+public class CloudFrontService implements ServerCertificateReferenceProvider {
 
     private static final String CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     private static final int MAX_CUSTOM_RESPONSE_HEADERS_POLICIES = 20;
@@ -79,6 +85,24 @@ public class CloudFrontService {
             "60669652-455b-4ae9-85a4-c4c02393f86c";
     private static final Map<String, ResponseHeadersPolicy> MANAGED_RESPONSE_HEADERS_POLICIES =
             managedResponseHeadersPolicies();
+    static final String MANAGED_ALL_VIEWER_ORIGIN_REQUEST_POLICY_ID =
+            "216adef6-5c7f-47e4-b989-5492eafa07d3";
+    static final String MANAGED_ALL_VIEWER_AND_CLOUDFRONT_HEADERS_ORIGIN_REQUEST_POLICY_ID =
+            "33f36d7e-f396-46d9-90e0-52428a34d9dc";
+    static final String MANAGED_ALL_VIEWER_EXCEPT_HOST_HEADER_ORIGIN_REQUEST_POLICY_ID =
+            "b689b0a8-53d0-40ab-baf2-68738e2966ac";
+    static final String MANAGED_CORS_CUSTOM_ORIGIN_ORIGIN_REQUEST_POLICY_ID =
+            "59781a5b-3903-41f3-afcb-af62929ccde1";
+    static final String MANAGED_CORS_S3_ORIGIN_ORIGIN_REQUEST_POLICY_ID =
+            "88a5eaf4-2fd4-4709-b370-b4c650ea3fcf";
+    static final String MANAGED_MEDIATAILOR_ORIGIN_REQUEST_POLICY_ID =
+            "775133bc-15f2-49f9-abea-afb2e0bf67d2";
+    static final String MANAGED_HOST_HEADER_ONLY_ORIGIN_REQUEST_POLICY_ID =
+            "bf0718e1-ba1e-49d1-88b1-f726733018ae";
+    static final String MANAGED_USER_AGENT_REFERER_ORIGIN_REQUEST_POLICY_ID =
+            "acba4595-bd28-49b8-b9fe-13317c0390fa";
+    private static final Map<String, OriginRequestPolicy> MANAGED_ORIGIN_REQUEST_POLICIES =
+            managedOriginRequestPolicies();
 
     private final StorageBackend<String, Distribution> distStore;
     private final StorageBackend<String, List<Invalidation>> invalidationStore;
@@ -98,10 +122,28 @@ public class CloudFrontService {
     private final StorageBackend<String, FieldLevelEncryptionProfile> fleProfileStore;
     private final StorageBackend<String, MonitoringSubscription> monitoringStore;
     private final String accountId;
+    private final RegionResolver regionResolver;
+    private final IamService iamService;
     private final String domainSuffix;
+    /**
+     * Host suffixes under which every distribution is served as {@code <id><suffix>}, whatever
+     * {@code floci.services.cloudfront.domain-suffix} makes the assigned domain name. They carry the
+     * {@code cloudfront} service label on the endpoint hosts the embedded DNS resolves, the same
+     * derivation API Gateway uses for {@code <id>.execute-api.<host>}, so a name that resolves to
+     * Floci is also routed by it. {@code <id>.cloudfront.localhost.floci.io} and
+     * {@code <id>.cloudfront.localhost} are additionally covered by the generated HTTPS
+     * certificate, so a signed URL for either can be downloaded over HTTPS.
+     */
+    private final List<String> localDeliverySuffixes;
+
+    public CloudFrontService(StorageFactory factory, EmulatorConfig config, RegionResolver regionResolver) {
+        this(factory, config, regionResolver, null);
+    }
 
     @Inject
-    public CloudFrontService(StorageFactory factory, EmulatorConfig config) {
+    public CloudFrontService(StorageFactory factory, EmulatorConfig config, RegionResolver regionResolver,
+                             IamService iamService) {
+        this.iamService = iamService;
         this.distStore = factory.create("cloudfront", "cloudfront-distributions.json",
                 new TypeReference<Map<String, Distribution>>() {});
         this.invalidationStore = factory.create("cloudfront", "cloudfront-invalidations.json",
@@ -137,7 +179,9 @@ public class CloudFrontService {
         this.monitoringStore = factory.create("cloudfront", "cloudfront-monitoring-subscriptions.json",
                 new TypeReference<Map<String, MonitoringSubscription>>() {});
         this.accountId = config.defaultAccountId();
+        this.regionResolver = regionResolver;
         this.domainSuffix = config.services().cloudfront().domainSuffix();
+        this.localDeliverySuffixes = localDeliverySuffixes(config);
     }
 
     // ── Distributions ─────────────────────────────────────────────────────────
@@ -147,10 +191,11 @@ public class CloudFrontService {
         validateOriginCustomHeaders(dist.getConfig());
         validateResponseHeadersPolicyReferences(dist.getConfig(), null);
         validateTrustedKeyGroups(dist.getConfig());
+        validateViewerCertificate(dist.getConfig());
         String id = generateDistributionId();
         dist.setId(id);
-        dist.setArn(AwsArnUtils.Arn.of("cloudfront", "", accountId, "distribution/" + id).toString());
-        dist.setDomainName(id + "." + domainSuffix);
+        dist.setArn(arn("distribution/" + id));
+        dist.setDomainName(domainNameFor(id));
         dist.setStatus("Deployed");
         dist.setLastModifiedTime(Instant.now());
         dist.setEtag(UUID.randomUUID().toString());
@@ -177,6 +222,7 @@ public class CloudFrontService {
         validateOriginCustomHeaders(updated.getConfig());
         validateResponseHeadersPolicyReferences(updated.getConfig(), id);
         validateTrustedKeyGroups(updated.getConfig());
+        validateViewerCertificate(updated.getConfig());
         updated.setId(id);
         updated.setArn(existing.getArn());
         updated.setDomainName(existing.getDomainName());
@@ -186,6 +232,36 @@ public class CloudFrontService {
         updated.setTags(existing.getTags());
         distStore.put(id, updated);
         return updated;
+    }
+
+    @Override
+    public List<Reference> serverCertificateReferences() {
+        List<Reference> references = new ArrayList<>();
+        for (Distribution distribution : distStore.scan(k -> true)) {
+            String certificateId = iamCertificateId(distribution.getConfig());
+            if (certificateId != null) {
+                references.add(new Reference(certificateId, "distribution " + distribution.getId()));
+            }
+        }
+        return references;
+    }
+
+    private static String iamCertificateId(DistributionConfig config) {
+        if (config == null || config.getViewerCertificate() == null) {
+            return null;
+        }
+        String certificateId = config.getViewerCertificate().get("IAMCertificateId");
+        return certificateId == null || certificateId.isBlank() ? null : certificateId;
+    }
+
+    private void validateViewerCertificate(DistributionConfig config) {
+        String certificateId = iamCertificateId(config);
+        if (certificateId != null && iamService != null
+                && iamService.findServerCertificateById(certificateId).isEmpty()) {
+            throw new AwsException("InvalidViewerCertificate",
+                    "The specified SSL certificate doesn't exist, isn't valid, "
+                            + "or doesn't include a valid certificate chain.", 400);
+        }
     }
 
     private static void validateOriginCustomHeaders(DistributionConfig config) {
@@ -264,20 +340,7 @@ public class CloudFrontService {
     public List<Distribution> listDistributions(String marker, int maxItems) {
         List<Distribution> all = new ArrayList<>(distStore.scan(k -> true));
         all.sort((a, b) -> a.getId().compareTo(b.getId()));
-        if (marker != null && !marker.isEmpty()) {
-            int idx = 0;
-            for (int i = 0; i < all.size(); i++) {
-                if (all.get(i).getId().equals(marker)) {
-                    idx = i + 1;
-                    break;
-                }
-            }
-            all = all.subList(idx, all.size());
-        }
-        if (maxItems > 0 && all.size() > maxItems) {
-            return all.subList(0, maxItems);
-        }
-        return all;
+        return paginate(all, marker, maxItems, Distribution::getId);
     }
 
     public synchronized void associateAlias(String targetDistributionId, String alias) {
@@ -321,15 +384,17 @@ public class CloudFrontService {
     /**
      * Finds the distribution whose data-plane requests should be served for the given {@code Host}
      * header. A distribution matches when the host equals its assigned CloudFront domain name
-     * ({@code <id>.cloudfront.net}) or one of its alternate domain names (CNAME aliases). Any port
-     * suffix is ignored and matching is case-insensitive. Returns {@code null} when nothing matches.
+     * ({@code <id>.cloudfront.net}), one of its alternate domain names (CNAME aliases), or one of
+     * the local delivery hostnames {@code <id>.cloudfront.localhost.floci.io} and
+     * {@code <id>.cloudfront.localhost}. Any port suffix is ignored and matching is
+     * case-insensitive. Returns {@code null} when nothing matches.
      */
     public Distribution findByHost(String host) {
         if (host == null || host.isBlank()) {
             return null;
         }
         String hostname = stripPort(host);
-        List<Distribution> distributions = new ArrayList<>(distStore.scan(k -> true));
+        List<Distribution> distributions = distStore.scan(k -> true);
         for (Distribution dist : distributions) {
             if (hostname.equalsIgnoreCase(dist.getDomainName())) {
                 return dist;
@@ -343,6 +408,11 @@ public class CloudFrontService {
                         return dist;
                     }
                 }
+            }
+        }
+        for (Distribution dist : distributions) {
+            if (matchesLocalDeliveryHost(hostname, dist.getId())) {
+                return dist;
             }
         }
         Distribution best = null;
@@ -360,6 +430,36 @@ public class CloudFrontService {
             }
         }
         return best;
+    }
+
+    /**
+     * The domain name a new distribution is served under. AWS assigns a lower-case host, and a
+     * browser lower-cases the authority it sends, so an upper-case id in the host would never match
+     * the resource a signed URL was signed for.
+     */
+    private String domainNameFor(String id) {
+        return id.toLowerCase(Locale.ROOT) + "." + domainSuffix;
+    }
+
+    private static List<String> localDeliverySuffixes(EmulatorConfig config) {
+        SequencedSet<String> endpointHosts = new LinkedHashSet<>();
+        endpointHosts.add("localhost");
+        EmbeddedDnsServer.BUILTIN_SUFFIXES.forEach(endpointHosts::add);
+        config.hostname().ifPresent(endpointHosts::add);
+        config.dns().extraSuffixes().ifPresent(endpointHosts::addAll);
+        return endpointHosts.stream()
+                .map(host -> ".cloudfront." + host.toLowerCase(Locale.ROOT))
+                .toList();
+    }
+
+    /** True when {@code hostname} is the local delivery host of the distribution with this id. */
+    private boolean matchesLocalDeliveryHost(String hostname, String id) {
+        for (String suffix : localDeliverySuffixes) {
+            if (hostname.equalsIgnoreCase(id + suffix)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private void ensureAliasesAvailable(DistributionConfig config, String currentDistributionId) {
@@ -441,20 +541,7 @@ public class CloudFrontService {
         getDistribution(distributionId);
         List<Invalidation> all = new ArrayList<>(
                 invalidationStore.get(distributionId).orElse(List.of()));
-        if (marker != null && !marker.isEmpty()) {
-            int idx = 0;
-            for (int i = 0; i < all.size(); i++) {
-                if (all.get(i).getId().equals(marker)) {
-                    idx = i + 1;
-                    break;
-                }
-            }
-            all = all.subList(idx, all.size());
-        }
-        if (maxItems > 0 && all.size() > maxItems) {
-            return all.subList(0, maxItems);
-        }
-        return all;
+        return paginate(all, marker, maxItems, Invalidation::getId);
     }
 
     // ── Cache Policies ────────────────────────────────────────────────────────
@@ -491,6 +578,11 @@ public class CloudFrontService {
             throw new AwsException("InvalidIfMatchVersion",
                     "The If-Match version is missing or not valid for the resource.", 400);
         }
+        if (isCachePolicyInUse(id)) {
+            throw new AwsException("CachePolicyInUse",
+                    "Cannot delete the cache policy because it is attached to one or more cache behaviors.",
+                    409);
+        }
         cachePolicyStore.delete(id);
     }
 
@@ -498,20 +590,7 @@ public class CloudFrontService {
         List<CachePolicy> all = new ArrayList<>(cachePolicyStore.scan(k -> true));
         all.sort((a, b) -> a.getName() != null && b.getName() != null
                 ? a.getName().compareTo(b.getName()) : a.getId().compareTo(b.getId()));
-        if (marker != null && !marker.isEmpty()) {
-            int idx = 0;
-            for (int i = 0; i < all.size(); i++) {
-                if (all.get(i).getId().equals(marker)) {
-                    idx = i + 1;
-                    break;
-                }
-            }
-            all = all.subList(idx, all.size());
-        }
-        if (maxItems > 0 && all.size() > maxItems) {
-            return all.subList(0, maxItems);
-        }
-        return all;
+        return paginate(all, marker, maxItems, CachePolicy::getId);
     }
 
     // ── Origin Request Policies ───────────────────────────────────────────────
@@ -525,14 +604,19 @@ public class CloudFrontService {
     }
 
     public OriginRequestPolicy getOriginRequestPolicy(String id) {
-        return orpStore.get(id).orElseThrow(() ->
-                new AwsException("NoSuchOriginRequestPolicy",
+        return orpStore.get(id)
+                .or(() -> Optional.ofNullable(MANAGED_ORIGIN_REQUEST_POLICIES.get(id)))
+                .orElseThrow(() -> new AwsException("NoSuchOriginRequestPolicy",
                         "The specified origin request policy does not exist.", 404));
     }
 
     public synchronized OriginRequestPolicy updateOriginRequestPolicy(String id, String ifMatch,
                                                                        OriginRequestPolicy updated) {
         OriginRequestPolicy existing = getOriginRequestPolicy(id);
+        if (isManagedOriginRequestPolicy(id)) {
+            throw new AwsException("IllegalUpdate",
+                    "AWS managed origin request policies cannot be updated.", 400);
+        }
         if (!existing.getEtag().equals(ifMatch)) {
             throw new AwsException("InvalidIfMatchVersion",
                     "The If-Match version is missing or not valid for the resource.", 400);
@@ -546,31 +630,49 @@ public class CloudFrontService {
 
     public synchronized void deleteOriginRequestPolicy(String id, String ifMatch) {
         OriginRequestPolicy existing = getOriginRequestPolicy(id);
+        if (isManagedOriginRequestPolicy(id)) {
+            throw new AwsException("IllegalDelete",
+                    "AWS managed origin request policies cannot be deleted.", 400);
+        }
         if (!existing.getEtag().equals(ifMatch)) {
             throw new AwsException("InvalidIfMatchVersion",
                     "The If-Match version is missing or not valid for the resource.", 400);
+        }
+        if (isOriginRequestPolicyInUse(id)) {
+            throw new AwsException("OriginRequestPolicyInUse",
+                    "Cannot delete the origin request policy because it is attached to one or more cache behaviors.",
+                    409);
         }
         orpStore.delete(id);
     }
 
     public List<OriginRequestPolicy> listOriginRequestPolicies(String marker, int maxItems) {
-        List<OriginRequestPolicy> all = new ArrayList<>(orpStore.scan(k -> true));
+        return listOriginRequestPolicies(marker, maxItems, null);
+    }
+
+    /**
+     * Lists custom and AWS managed origin request policies; {@code type} narrows the list to the
+     * AWS lowercase {@code managed} or {@code custom} value.
+     */
+    public List<OriginRequestPolicy> listOriginRequestPolicies(String marker, int maxItems, String type) {
+        if (type != null && !"custom".equals(type) && !"managed".equals(type)) {
+            throw new AwsException("InvalidArgument",
+                    "Origin request policy Type must be managed or custom.", 400);
+        }
+        List<OriginRequestPolicy> all = new ArrayList<>();
+        if (!"managed".equals(type)) {
+            all.addAll(orpStore.scan(k -> true));
+        }
+        if (!"custom".equals(type)) {
+            all.addAll(MANAGED_ORIGIN_REQUEST_POLICIES.values());
+        }
         all.sort((a, b) -> a.getName() != null && b.getName() != null
                 ? a.getName().compareTo(b.getName()) : a.getId().compareTo(b.getId()));
-        if (marker != null && !marker.isEmpty()) {
-            int idx = 0;
-            for (int i = 0; i < all.size(); i++) {
-                if (all.get(i).getId().equals(marker)) {
-                    idx = i + 1;
-                    break;
-                }
-            }
-            all = all.subList(idx, all.size());
-        }
-        if (maxItems > 0 && all.size() > maxItems) {
-            return all.subList(0, maxItems);
-        }
-        return all;
+        return paginate(all, marker, maxItems, OriginRequestPolicy::getId);
+    }
+
+    static boolean isManagedOriginRequestPolicy(String id) {
+        return MANAGED_ORIGIN_REQUEST_POLICIES.containsKey(id);
     }
 
     // ── Response Headers Policies ─────────────────────────────────────────────
@@ -748,21 +850,51 @@ public class CloudFrontService {
     }
 
     private boolean isResponseHeadersPolicyInUse(String id) {
-        return distStore.scan(k -> true).stream()
-                .map(Distribution::getConfig)
-                .anyMatch(config -> usesResponseHeadersPolicy(config, id));
+        return isAttachedToACacheBehavior(id,
+                DefaultCacheBehavior::getResponseHeadersPolicyId, CacheBehavior::getResponseHeadersPolicyId);
     }
 
-    private static boolean usesResponseHeadersPolicy(
-            DistributionConfig config, String id) {
-        if (config == null) {
-            return false;
-        }
+    /**
+     * Kept as its own entry point for the per-distribution association count, which asks the
+     * question of one config at a time and can be handed a distribution with none.
+     */
+    private static boolean usesResponseHeadersPolicy(DistributionConfig config, String id) {
+        return config != null && usesPolicy(config, id,
+                DefaultCacheBehavior::getResponseHeadersPolicyId, CacheBehavior::getResponseHeadersPolicyId);
+    }
+
+    private boolean isCachePolicyInUse(String id) {
+        return isAttachedToACacheBehavior(id,
+                DefaultCacheBehavior::getCachePolicyId, CacheBehavior::getCachePolicyId);
+    }
+
+    private boolean isOriginRequestPolicyInUse(String id) {
+        return isAttachedToACacheBehavior(id,
+                DefaultCacheBehavior::getOriginRequestPolicyId, CacheBehavior::getOriginRequestPolicyId);
+    }
+
+    /**
+     * Whether any distribution attaches {@code id} to its default or one of its ordered cache
+     * behaviors. Cache, origin request and response headers policies each hang off the same two
+     * places, so the three in-use checks differ only in which id they read.
+     */
+    private boolean isAttachedToACacheBehavior(String id,
+                                               Function<DefaultCacheBehavior, String> onDefault,
+                                               Function<CacheBehavior, String> onOrdered) {
+        return distStore.scan(k -> true).stream()
+                .map(Distribution::getConfig)
+                .filter(Objects::nonNull)
+                .anyMatch(config -> usesPolicy(config, id, onDefault, onOrdered));
+    }
+
+    private static boolean usesPolicy(DistributionConfig config, String id,
+                                      Function<DefaultCacheBehavior, String> onDefault,
+                                      Function<CacheBehavior, String> onOrdered) {
         boolean defaultUsesPolicy = config.getDefaultCacheBehavior() != null
-                && id.equals(config.getDefaultCacheBehavior().getResponseHeadersPolicyId());
+                && id.equals(onDefault.apply(config.getDefaultCacheBehavior()));
         boolean orderedUsesPolicy = config.getCacheBehaviors() != null
-                && config.getCacheBehaviors().stream().anyMatch(behavior ->
-                        id.equals(behavior.getResponseHeadersPolicyId()));
+                && config.getCacheBehaviors().stream()
+                        .anyMatch(behavior -> behavior != null && id.equals(onOrdered.apply(behavior)));
         return defaultUsesPolicy || orderedUsesPolicy;
     }
 
@@ -798,6 +930,112 @@ public class CloudFrontService {
                 "Allows all origins for simple CORS requests",
                 Map.of("CorsConfig", simpleCors)));
         return Map.copyOf(policies);
+    }
+
+    /**
+     * The AWS managed origin request policies, with the IDs and settings the CloudFront Developer
+     * Guide lists under "Use managed origin request policies".
+     */
+    private static Map<String, OriginRequestPolicy> managedOriginRequestPolicies() {
+        Map<String, OriginRequestPolicy> policies = new LinkedHashMap<>();
+        policies.put(MANAGED_ALL_VIEWER_ORIGIN_REQUEST_POLICY_ID, managedOriginRequestPolicy(
+                MANAGED_ALL_VIEWER_ORIGIN_REQUEST_POLICY_ID, "Managed-AllViewer",
+                "Includes all values (headers, cookies, and query strings) from the viewer request",
+                selection("HeaderBehavior", "allViewer", "Headers", List.of()),
+                selection("CookieBehavior", "all", "Cookies", List.of()),
+                selection("QueryStringBehavior", "all", "QueryStrings", List.of())));
+        policies.put(MANAGED_ALL_VIEWER_AND_CLOUDFRONT_HEADERS_ORIGIN_REQUEST_POLICY_ID,
+                managedOriginRequestPolicy(
+                        MANAGED_ALL_VIEWER_AND_CLOUDFRONT_HEADERS_ORIGIN_REQUEST_POLICY_ID,
+                        "Managed-AllViewerAndCloudFrontHeaders-2022-06",
+                        "Includes all values from the viewer request and all CloudFront headers "
+                                + "released through June 2022",
+                        selection("HeaderBehavior", "allViewerAndWhitelistCloudFront", "Headers",
+                                List.of("CloudFront-Forwarded-Proto", "CloudFront-Is-Android-Viewer",
+                                        "CloudFront-Is-Desktop-Viewer", "CloudFront-Is-IOS-Viewer",
+                                        "CloudFront-Is-Mobile-Viewer", "CloudFront-Is-SmartTV-Viewer",
+                                        "CloudFront-Is-Tablet-Viewer", "CloudFront-Viewer-Address",
+                                        "CloudFront-Viewer-ASN", "CloudFront-Viewer-City",
+                                        "CloudFront-Viewer-Country", "CloudFront-Viewer-Country-Name",
+                                        "CloudFront-Viewer-Country-Region",
+                                        "CloudFront-Viewer-Country-Region-Name",
+                                        "CloudFront-Viewer-Http-Version", "CloudFront-Viewer-Latitude",
+                                        "CloudFront-Viewer-Longitude", "CloudFront-Viewer-Metro-Code",
+                                        "CloudFront-Viewer-Postal-Code", "CloudFront-Viewer-Time-Zone",
+                                        "CloudFront-Viewer-TLS")),
+                        selection("CookieBehavior", "all", "Cookies", List.of()),
+                        selection("QueryStringBehavior", "all", "QueryStrings", List.of())));
+        policies.put(MANAGED_ALL_VIEWER_EXCEPT_HOST_HEADER_ORIGIN_REQUEST_POLICY_ID,
+                managedOriginRequestPolicy(
+                        MANAGED_ALL_VIEWER_EXCEPT_HOST_HEADER_ORIGIN_REQUEST_POLICY_ID,
+                        "Managed-AllViewerExceptHostHeader",
+                        "Includes all values from the viewer request except the Host header",
+                        selection("HeaderBehavior", "allExcept", "Headers", List.of("Host")),
+                        selection("CookieBehavior", "all", "Cookies", List.of()),
+                        selection("QueryStringBehavior", "all", "QueryStrings", List.of())));
+        policies.put(MANAGED_CORS_CUSTOM_ORIGIN_ORIGIN_REQUEST_POLICY_ID, managedOriginRequestPolicy(
+                MANAGED_CORS_CUSTOM_ORIGIN_ORIGIN_REQUEST_POLICY_ID, "Managed-CORS-CustomOrigin",
+                "Includes the header that enables CORS requests when the origin is a custom origin",
+                selection("HeaderBehavior", "whitelist", "Headers", List.of("Origin")),
+                selection("CookieBehavior", "none", "Cookies", List.of()),
+                selection("QueryStringBehavior", "none", "QueryStrings", List.of())));
+        policies.put(MANAGED_CORS_S3_ORIGIN_ORIGIN_REQUEST_POLICY_ID, managedOriginRequestPolicy(
+                MANAGED_CORS_S3_ORIGIN_ORIGIN_REQUEST_POLICY_ID, "Managed-CORS-S3Origin",
+                "Includes the headers that enable CORS requests when the origin is an Amazon S3 bucket",
+                selection("HeaderBehavior", "whitelist", "Headers", List.of(
+                        "Origin", "Access-Control-Request-Headers", "Access-Control-Request-Method")),
+                selection("CookieBehavior", "none", "Cookies", List.of()),
+                selection("QueryStringBehavior", "none", "QueryStrings", List.of())));
+        policies.put(MANAGED_MEDIATAILOR_ORIGIN_REQUEST_POLICY_ID, managedOriginRequestPolicy(
+                MANAGED_MEDIATAILOR_ORIGIN_REQUEST_POLICY_ID,
+                "Managed-Elemental-MediaTailor-PersonalizedManifests",
+                "For use with an origin that is an AWS Elemental MediaTailor endpoint",
+                selection("HeaderBehavior", "whitelist", "Headers", List.of(
+                        "Origin", "Access-Control-Request-Headers", "Access-Control-Request-Method",
+                        "User-Agent", "X-Forwarded-For")),
+                selection("CookieBehavior", "none", "Cookies", List.of()),
+                selection("QueryStringBehavior", "all", "QueryStrings", List.of())));
+        policies.put(MANAGED_HOST_HEADER_ONLY_ORIGIN_REQUEST_POLICY_ID, managedOriginRequestPolicy(
+                MANAGED_HOST_HEADER_ONLY_ORIGIN_REQUEST_POLICY_ID, "Managed-HostHeaderOnly",
+                "Includes only the Host header from the viewer request",
+                selection("HeaderBehavior", "whitelist", "Headers", List.of("Host")),
+                selection("CookieBehavior", "none", "Cookies", List.of()),
+                selection("QueryStringBehavior", "none", "QueryStrings", List.of())));
+        policies.put(MANAGED_USER_AGENT_REFERER_ORIGIN_REQUEST_POLICY_ID, managedOriginRequestPolicy(
+                MANAGED_USER_AGENT_REFERER_ORIGIN_REQUEST_POLICY_ID, "Managed-UserAgentRefererHeaders",
+                "Includes only the User-Agent and Referer headers",
+                selection("HeaderBehavior", "whitelist", "Headers", List.of("User-Agent", "Referer")),
+                selection("CookieBehavior", "none", "Cookies", List.of()),
+                selection("QueryStringBehavior", "none", "QueryStrings", List.of())));
+        return Map.copyOf(policies);
+    }
+
+    private static OriginRequestPolicy managedOriginRequestPolicy(
+            String id, String name, String comment, Map<String, Object> headers,
+            Map<String, Object> cookies, Map<String, Object> queryStrings) {
+        Map<String, Object> config = new LinkedHashMap<>();
+        config.put("HeadersConfig", headers);
+        config.put("CookiesConfig", cookies);
+        config.put("QueryStringsConfig", queryStrings);
+        OriginRequestPolicy policy = new OriginRequestPolicy();
+        policy.setId(id);
+        policy.setName(name);
+        policy.setComment(comment);
+        policy.setEtag("E23ZP02F085DFQ");
+        policy.setLastModifiedTime(Instant.EPOCH);
+        policy.setConfig(Map.copyOf(config));
+        return policy;
+    }
+
+    /** One policy selection block, in the shape {@link CloudFrontPolicyConfigCodec} stores. */
+    private static Map<String, Object> selection(String behaviorKey, String behavior,
+                                                 String listKey, List<String> names) {
+        Map<String, Object> block = new LinkedHashMap<>();
+        block.put(behaviorKey, behavior);
+        if (!names.isEmpty()) {
+            block.put(listKey, List.copyOf(names));
+        }
+        return Map.copyOf(block);
     }
 
     private static ResponseHeadersPolicy managedResponseHeadersPolicy(
@@ -891,20 +1129,7 @@ public class CloudFrontService {
         List<OriginAccessControl> all = new ArrayList<>(oacStore.scan(k -> true));
         all.sort((a, b) -> a.getName() != null && b.getName() != null
                 ? a.getName().compareTo(b.getName()) : a.getId().compareTo(b.getId()));
-        if (marker != null && !marker.isEmpty()) {
-            int idx = 0;
-            for (int i = 0; i < all.size(); i++) {
-                if (all.get(i).getId().equals(marker)) {
-                    idx = i + 1;
-                    break;
-                }
-            }
-            all = all.subList(idx, all.size());
-        }
-        if (maxItems > 0 && all.size() > maxItems) {
-            return all.subList(0, maxItems);
-        }
-        return all;
+        return paginate(all, marker, maxItems, OriginAccessControl::getId);
     }
 
     // ── Origin Access Identity (OAI) ──────────────────────────────────────────
@@ -961,20 +1186,7 @@ public class CloudFrontService {
     public List<CloudFrontOriginAccessIdentity> listCloudFrontOriginAccessIdentities(
             String marker, int maxItems) {
         List<CloudFrontOriginAccessIdentity> all = new ArrayList<>(oaiStore.scan(k -> true));
-        if (marker != null && !marker.isEmpty()) {
-            int idx = 0;
-            for (int i = 0; i < all.size(); i++) {
-                if (all.get(i).getId().equals(marker)) {
-                    idx = i + 1;
-                    break;
-                }
-            }
-            all = all.subList(idx, all.size());
-        }
-        if (maxItems > 0 && all.size() > maxItems) {
-            return all.subList(0, maxItems);
-        }
-        return all;
+        return paginate(all, marker, maxItems, CloudFrontOriginAccessIdentity::getId);
     }
 
     private static void validateOriginAccessControl(OriginAccessControl oac) {
@@ -1068,14 +1280,16 @@ public class CloudFrontService {
     }
 
     public CloudFrontFunction describeFunction(String name, String stage) {
-        CloudFrontFunction fn = functionStore.get(name).orElseThrow(() ->
+        String effectiveStage = normalizeFunctionStage(stage);
+        Optional<CloudFrontFunction> function = functionStore.get(functionKey(name, effectiveStage));
+        if (function.isEmpty() && "LIVE".equals(effectiveStage)) {
+            // Releases before stage-aware keys stored a published LIVE function under
+            // the bare name. Keep that state readable without exposing it as DEVELOPMENT.
+            function = functionStore.get(name).filter(fn -> "LIVE".equals(fn.getStage()));
+        }
+        return function.filter(fn -> effectiveStage.equals(fn.getStage())).orElseThrow(() ->
                 new AwsException("NoSuchFunctionExists",
                         "The specified function does not exist.", 404));
-        if (stage != null && !stage.isEmpty() && !fn.getStage().equals(stage)) {
-            throw new AwsException("NoSuchFunctionExists",
-                    "The specified function does not exist.", 404);
-        }
-        return fn;
     }
 
     public synchronized CloudFrontFunction updateFunction(String name, String ifMatch,
@@ -1096,36 +1310,79 @@ public class CloudFrontService {
     }
 
     public synchronized CloudFrontFunction publishFunction(String name, String ifMatch) {
-        CloudFrontFunction fn = describeFunction(name, null);
-        if (!fn.getEtag().equals(ifMatch)) {
+        CloudFrontFunction development = describeFunction(name, "DEVELOPMENT");
+        if (!development.getEtag().equals(ifMatch)) {
             throw new AwsException("InvalidIfMatchVersion",
                     "The If-Match version is missing or not valid for the resource.", 400);
         }
-        fn.setStage("LIVE");
-        fn.setStatus("DEPLOYED");
-        fn.setEtag(UUID.randomUUID().toString());
-        fn.setLastModifiedTime(Instant.now());
-        functionStore.put(name, fn);
-        return fn;
+        CloudFrontFunction live = copyFunction(development);
+        live.setStage("LIVE");
+        live.setStatus("DEPLOYED");
+        live.setEtag(UUID.randomUUID().toString());
+        live.setLastModifiedTime(Instant.now());
+        functionStore.put(functionKey(name, "LIVE"), live);
+        return live;
     }
 
     public synchronized void deleteFunction(String name, String ifMatch) {
-        CloudFrontFunction existing = describeFunction(name, null);
+        CloudFrontFunction existing = functionStore.get(name)
+                .or(() -> functionStore.get(functionKey(name, "LIVE")))
+                .orElseThrow(() -> new AwsException("NoSuchFunctionExists",
+                        "The specified function does not exist.", 404));
         if (!existing.getEtag().equals(ifMatch)) {
             throw new AwsException("InvalidIfMatchVersion",
                     "The If-Match version is missing or not valid for the resource.", 400);
         }
         functionStore.delete(name);
+        functionStore.delete(functionKey(name, "LIVE"));
     }
 
     public List<CloudFrontFunction> listFunctions(String stage, String marker, int maxItems) {
         List<CloudFrontFunction> all = new ArrayList<>(functionStore.scan(k -> true));
         if (stage != null && !stage.isEmpty()) {
-            all = all.stream().filter(f -> stage.equals(f.getStage())).toList();
-            all = new ArrayList<>(all);
+            String effectiveStage = normalizeFunctionStage(stage);
+            all = new ArrayList<>(all.stream()
+                    .filter(f -> effectiveStage.equals(f.getStage()))
+                    .toList());
         }
-        all.sort((a, b) -> a.getName().compareTo(b.getName()));
+        all.sort(Comparator.comparing(CloudFrontFunction::getName)
+                .thenComparing(CloudFrontFunction::getStage));
         return paginate(all, marker, maxItems, CloudFrontFunction::getName);
+    }
+
+    private static String functionKey(String name, String stage) {
+        return switch (stage) {
+            case "DEVELOPMENT" -> name;
+            case "LIVE" -> name + "::LIVE";
+            default -> throw invalidFunctionStage(stage);
+        };
+    }
+
+    private static String normalizeFunctionStage(String stage) {
+        String effectiveStage = stage == null || stage.isEmpty() ? "DEVELOPMENT" : stage;
+        if (!"DEVELOPMENT".equals(effectiveStage) && !"LIVE".equals(effectiveStage)) {
+            throw invalidFunctionStage(effectiveStage);
+        }
+        return effectiveStage;
+    }
+
+    private static AwsException invalidFunctionStage(String stage) {
+        return new AwsException("InvalidArgument",
+                "The parameter Stage must be DEVELOPMENT or LIVE: " + stage, 400);
+    }
+
+    private static CloudFrontFunction copyFunction(CloudFrontFunction source) {
+        CloudFrontFunction copy = new CloudFrontFunction();
+        copy.setName(source.getName());
+        copy.setStage(source.getStage());
+        copy.setStatus(source.getStatus());
+        copy.setFunctionCode(source.getFunctionCode());
+        copy.setRuntime(source.getRuntime());
+        copy.setComment(source.getComment());
+        copy.setEtag(source.getEtag());
+        copy.setCreatedTime(source.getCreatedTime());
+        copy.setLastModifiedTime(source.getLastModifiedTime());
+        return copy;
     }
 
     // ── Tags ──────────────────────────────────────────────────────────────────
@@ -1221,7 +1478,7 @@ public class CloudFrontService {
                     "A public key with this caller reference already exists.",
                     409);
         }
-        key.setId(UUID.randomUUID().toString());
+        key.setId(generatePublicKeyId());
         key.setCreatedTime(Instant.now());
         key.setEtag(UUID.randomUUID().toString());
         publicKeyStore.put(key.getId(), key);
@@ -1543,7 +1800,7 @@ public class CloudFrontService {
     // ── Realtime Log Configs ──────────────────────────────────────────────────
 
     public synchronized RealtimeLogConfig createRealtimeLogConfig(RealtimeLogConfig cfg) {
-        String arn = AwsArnUtils.Arn.of("cloudfront", "", accountId, "realtime-log-config/" + cfg.getName()).toString();
+        String arn = arn("realtime-log-config/" + cfg.getName());
         cfg.setArn(arn);
         realtimeLogConfigStore.put(cfg.getName(), cfg);
         return cfg;
@@ -1563,7 +1820,7 @@ public class CloudFrontService {
 
     public synchronized RealtimeLogConfig updateRealtimeLogConfig(RealtimeLogConfig updated) {
         getRealtimeLogConfig(updated.getName());
-        String arn = AwsArnUtils.Arn.of("cloudfront", "", accountId, "realtime-log-config/" + updated.getName()).toString();
+        String arn = arn("realtime-log-config/" + updated.getName());
         updated.setArn(arn);
         realtimeLogConfigStore.put(updated.getName(), updated);
         return updated;
@@ -1586,8 +1843,8 @@ public class CloudFrontService {
     public synchronized StreamingDistribution createStreamingDistribution(StreamingDistribution sd) {
         String id = generateDistributionId();
         sd.setId(id);
-        sd.setArn(AwsArnUtils.Arn.of("cloudfront", "", accountId, "streaming-distribution/" + id).toString());
-        sd.setDomainName(id + "." + domainSuffix);
+        sd.setArn(arn("streaming-distribution/" + id));
+        sd.setDomainName(domainNameFor(id));
         sd.setStatus("Deployed");
         sd.setLastModifiedTime(Instant.now());
         sd.setEtag(UUID.randomUUID().toString());
@@ -1746,12 +2003,22 @@ public class CloudFrontService {
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    public String getAccountId() {
-        return accountId;
+    /** A CloudFront ARN: global, so it carries no region and takes the request's partition. */
+    public String arn(String resource) {
+        return regionResolver.buildGlobalArn("cloudfront", accountId, resource);
     }
 
     private static String generateDistributionId() {
         StringBuilder sb = new StringBuilder("E");
+        for (int i = 0; i < 13; i++) {
+            sb.append(CHARS.charAt(RANDOM.nextInt(CHARS.length())));
+        }
+        return sb.toString();
+    }
+
+    /** AWS issues public key ids as K + 13 characters; the value travels in Key-Pair-Id. */
+    private static String generatePublicKeyId() {
+        StringBuilder sb = new StringBuilder("K");
         for (int i = 0; i < 13; i++) {
             sb.append(CHARS.charAt(RANDOM.nextInt(CHARS.length())));
         }

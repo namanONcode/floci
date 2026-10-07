@@ -5,24 +5,35 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
+import io.github.hectorvent.floci.services.cognito.model.EmailMfaSettings;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.config.TlsCertificateManager;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.ReservedTags;
+import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
+import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.core.resource.ExplorerResource;
 import io.github.hectorvent.floci.core.resource.ResourceProvider;
 import io.github.hectorvent.floci.core.resource.SupportedResourceType;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
+import io.github.hectorvent.floci.services.acm.AcmService;
+import io.github.hectorvent.floci.services.acm.model.Certificate;
+import io.github.hectorvent.floci.services.acm.model.CertificateStatus;
 import io.github.hectorvent.floci.services.cognito.model.CognitoGroup;
 import io.github.hectorvent.floci.services.cognito.model.CognitoUser;
+import io.github.hectorvent.floci.services.cognito.model.IdentityProvider;
 import io.github.hectorvent.floci.services.cognito.model.ResourceServer;
 import io.github.hectorvent.floci.services.cognito.model.ResourceServerScope;
 import io.github.hectorvent.floci.services.cognito.model.RevokedTokenInfo;
+import io.github.hectorvent.floci.services.cognito.model.SoftwareTokenMfaSettings;
 import io.github.hectorvent.floci.services.cognito.model.UserPool;
 import io.github.hectorvent.floci.services.cognito.model.UserPoolClient;
 import io.github.hectorvent.floci.services.cognito.model.UserPoolClientSecret;
+import io.github.hectorvent.floci.services.cognito.model.UserPoolDomain;
+import io.github.hectorvent.floci.services.cognito.model.ManagedLoginBranding;
 import io.github.hectorvent.floci.services.cognito.verification.CognitoMessageDispatcher;
 import io.github.hectorvent.floci.services.cognito.verification.VerificationCode;
 import io.github.hectorvent.floci.services.cognito.verification.VerificationCodeException;
@@ -37,6 +48,8 @@ import org.jspecify.annotations.Nullable;
 
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
+import java.math.BigDecimal;
+import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.security.KeyFactory;
 import java.security.KeyPair;
@@ -62,19 +75,37 @@ import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Objects;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.regex.Pattern;
 
 import static io.github.hectorvent.floci.core.common.ReservedTags.rejectUnknownReservedTags;
 
 @ApplicationScoped
 public class CognitoService implements ResourceProvider {
     private static final int DEFAULT_REFRESH_TOKEN_VALIDITY_DAYS = 30;
+    static final List<String> DEFAULT_EXPLICIT_AUTH_FLOWS =
+            List.of("ALLOW_REFRESH_TOKEN_AUTH", "ALLOW_USER_SRP_AUTH", "ALLOW_CUSTOM_AUTH");
+    private static final String COGNITO_PASSWORD_SYMBOLS =
+            "^$*.[]{}()?\"!@#%&/\\,><':;|_~`=+-";
+    // JVM-local stripes bound lock memory without retaining one lock for every user key.
+    private static final int USER_LOCK_STRIPES = 512;
+    /**
+     * The commercial CloudFront suffix for the test constructors; CDI wires
+     * {@code floci.services.cloudfront.domain-suffix}.
+     */
+    private static final String DEFAULT_CLOUDFRONT_DOMAIN_SUFFIX = "cloudfront.net"; // partition-literal: test-shaped constructor default
 
     private static final Logger LOG = Logger.getLogger(CognitoService.class);
     private static final ObjectMapper MAPPER = new ObjectMapper();
+    private static final String INVALID_ACCESS_TOKEN_MESSAGE = "Invalid access token";
+    /** The scope of every access token from an API sign-in such as InitiateAuth, and what the user's own operations need. */
+    private static final String USER_ADMIN_SCOPE = "aws.cognito.signin.user.admin";
+    private static final List<String> API_SIGN_IN_SCOPES = List.of(USER_ADMIN_SCOPE);
 
     private static final String IDENTITIES_ATTRIBUTE = "identities";
 
@@ -105,22 +136,46 @@ public class CognitoService implements ResourceProvider {
     private final StorageBackend<String, UserPool> poolStore;
     private final StorageBackend<String, UserPoolClient> clientStore;
     private final StorageBackend<String, ResourceServer> resourceServerStore;
+    private final StorageBackend<String, UserPoolDomain> domainStore;
+    private final StorageBackend<String, IdentityProvider> identityProviderStore;
     private final StorageBackend<String, CognitoUser> userStore;
     private final StorageBackend<String, CognitoGroup> groupStore;
     private final StorageBackend<String, RevokedTokenInfo> revokedTokenStore;
     private final String baseUrl;
+    private final String cloudFrontDomainSuffix;
     private final RegionResolver regionResolver;
     private final LambdaService lambdaService;
+    private final AcmService acmService;
     private final VerificationCodeService verificationCodeService;
     private final CognitoMessageDispatcher messageDispatcher;
+    private final TlsCertificateManager certificateManager;
+    private final Object[] userLocks = newUserLockStripes();
+    // The userKey of each username an AdminCreateUser is creating, from before its existence check
+    // until it stores the user or fails, so an overlapping request for the same username is refused
+    // instead of invoking the PreSignUp trigger again. Only the request that adds a key removes it.
+    private final Set<String> adminCreatesInFlight = ConcurrentHashMap.newKeySet();
 
     // Keyed by session token; contains SRP ephemeral state (bPrivate, B, A, secretBlock)
     private final CognitoAuthFlowHandler authFlowHandler;
 
+    private static Object[] newUserLockStripes() {
+        Object[] stripes = new Object[USER_LOCK_STRIPES];
+        for (int i = 0; i < stripes.length; i++) {
+            stripes[i] = new Object();
+        }
+        return stripes;
+    }
+
+    private Object userLock(String poolId, String username) {
+        String key = userKey(poolId, username);
+        return userLocks[Math.floorMod(key.hashCode(), USER_LOCK_STRIPES)];
+    }
+
     @Inject
     public CognitoService(StorageFactory storageFactory, EmulatorConfig emulatorConfig,
-            RegionResolver regionResolver, LambdaService lambdaService, SesService sesService,
-            SnsService snsService, Clock clock) {
+            RegionResolver regionResolver, LambdaService lambdaService, AcmService acmService,
+            SesService sesService, SnsService snsService, Clock clock,
+            TlsCertificateManager certificateManager) {
         this(
                 storageFactory.create("cognito", "cognito-pools.json",
                         new TypeReference<Map<String, UserPool>>() {}),
@@ -128,6 +183,10 @@ public class CognitoService implements ResourceProvider {
                         new TypeReference<Map<String, UserPoolClient>>() {}),
                 storageFactory.create("cognito", "cognito-resource-servers.json",
                         new TypeReference<Map<String, ResourceServer>>() {}),
+                storageFactory.create("cognito", "cognito-domains.json",
+                        new TypeReference<Map<String, UserPoolDomain>>() {}),
+                storageFactory.create("cognito", "cognito-identity-providers.json",
+                        new TypeReference<Map<String, IdentityProvider>>() {}),
                 storageFactory.create("cognito", "cognito-users.json",
                         new TypeReference<Map<String, CognitoUser>>() {}),
                 storageFactory.create("cognito", "cognito-groups.json",
@@ -135,10 +194,14 @@ public class CognitoService implements ResourceProvider {
                 storageFactory.create("cognito", "cognito-revoked-tokens.json",
                         new TypeReference<Map<String, RevokedTokenInfo>>() {}),
                 trimTrailingSlash(emulatorConfig.effectiveBaseUrl()),
+                emulatorConfig.services().cloudfront().domainSuffix(),
                 regionResolver,
                 lambdaService,
+                acmService,
                 new VerificationCodeService(storageFactory, clock),
-                new CognitoMessageDispatcher(sesService, snsService)
+                new CognitoMessageDispatcher(sesService, snsService, regionResolver.getDefaultRegion()),
+                certificateManager,
+                clock
         );
     }
 
@@ -150,33 +213,103 @@ public class CognitoService implements ResourceProvider {
                    StorageBackend<String, RevokedTokenInfo> revokedTokenStore,
                    String baseUrl,
                    RegionResolver regionResolver,
-                   LambdaService lambdaService) {
+                   LambdaService lambdaService,
+                   AcmService acmService) {
         this(poolStore, clientStore, resourceServerStore, userStore, groupStore, revokedTokenStore, baseUrl,
-                regionResolver, lambdaService, null, null);
+                DEFAULT_CLOUDFRONT_DOMAIN_SUFFIX, regionResolver, lambdaService, acmService);
     }
 
     CognitoService(StorageBackend<String, UserPool> poolStore,
             StorageBackend<String, UserPoolClient> clientStore,
             StorageBackend<String, ResourceServer> resourceServerStore,
+            StorageBackend<String, UserPoolDomain> domainStore,
+            StorageBackend<String, IdentityProvider> identityProviderStore,
             StorageBackend<String, CognitoUser> userStore,
             StorageBackend<String, CognitoGroup> groupStore,
             StorageBackend<String, RevokedTokenInfo> revokedTokenStore,
             String baseUrl,
-            RegionResolver regionResolver, LambdaService lambdaService,
+            RegionResolver regionResolver, LambdaService lambdaService, AcmService acmService,
             VerificationCodeService verificationCodeService,
-            CognitoMessageDispatcher messageDispatcher) {
+            CognitoMessageDispatcher messageDispatcher,
+            TlsCertificateManager certificateManager) {
+        this(poolStore, clientStore, resourceServerStore, domainStore, identityProviderStore, userStore,
+                groupStore, revokedTokenStore, baseUrl, DEFAULT_CLOUDFRONT_DOMAIN_SUFFIX, regionResolver,
+                lambdaService, acmService, verificationCodeService, messageDispatcher, certificateManager);
+    }
+
+    CognitoService(StorageBackend<String, UserPool> poolStore,
+                   StorageBackend<String, UserPoolClient> clientStore,
+                   StorageBackend<String, ResourceServer> resourceServerStore,
+                   StorageBackend<String, CognitoUser> userStore,
+                   StorageBackend<String, CognitoGroup> groupStore,
+                   StorageBackend<String, RevokedTokenInfo> revokedTokenStore,
+                   String baseUrl,
+                   String cloudFrontDomainSuffix,
+                   RegionResolver regionResolver,
+                   LambdaService lambdaService,
+                   AcmService acmService) {
+        this(poolStore, clientStore, resourceServerStore, new InMemoryStorage<>(),
+                new InMemoryStorage<>(), userStore, groupStore, revokedTokenStore, baseUrl,
+                cloudFrontDomainSuffix, regionResolver, lambdaService, acmService, null, null, null);
+    }
+
+    CognitoService(StorageBackend<String, UserPool> poolStore,
+            StorageBackend<String, UserPoolClient> clientStore,
+            StorageBackend<String, ResourceServer> resourceServerStore,
+            StorageBackend<String, UserPoolDomain> domainStore,
+            StorageBackend<String, IdentityProvider> identityProviderStore,
+            StorageBackend<String, CognitoUser> userStore,
+            StorageBackend<String, CognitoGroup> groupStore,
+            StorageBackend<String, RevokedTokenInfo> revokedTokenStore,
+            String baseUrl,
+            String cloudFrontDomainSuffix,
+            RegionResolver regionResolver, LambdaService lambdaService, AcmService acmService,
+            VerificationCodeService verificationCodeService,
+            CognitoMessageDispatcher messageDispatcher,
+            TlsCertificateManager certificateManager) {
+        this(poolStore, clientStore, resourceServerStore, domainStore, identityProviderStore, userStore,
+                groupStore, revokedTokenStore, baseUrl, cloudFrontDomainSuffix, regionResolver, lambdaService,
+                acmService, verificationCodeService, messageDispatcher, certificateManager, Clock.systemUTC());
+    }
+
+    /**
+     * Full constructor accepting the {@link Clock} used to time-bound Cognito auth challenge
+     * sessions (see {@link CognitoAuthFlowHandler}). Production code reaches this through the
+     * {@code @Inject} constructor above with the CDI-managed clock; every other constructor here
+     * defaults to {@link Clock#systemUTC()} so existing call sites are unaffected.
+     */
+    CognitoService(StorageBackend<String, UserPool> poolStore,
+            StorageBackend<String, UserPoolClient> clientStore,
+            StorageBackend<String, ResourceServer> resourceServerStore,
+            StorageBackend<String, UserPoolDomain> domainStore,
+            StorageBackend<String, IdentityProvider> identityProviderStore,
+            StorageBackend<String, CognitoUser> userStore,
+            StorageBackend<String, CognitoGroup> groupStore,
+            StorageBackend<String, RevokedTokenInfo> revokedTokenStore,
+            String baseUrl,
+            String cloudFrontDomainSuffix,
+            RegionResolver regionResolver, LambdaService lambdaService, AcmService acmService,
+            VerificationCodeService verificationCodeService,
+            CognitoMessageDispatcher messageDispatcher,
+            TlsCertificateManager certificateManager,
+            Clock clock) {
         this.poolStore = poolStore;
         this.clientStore = clientStore;
         this.resourceServerStore = resourceServerStore;
+        this.domainStore = domainStore;
+        this.identityProviderStore = identityProviderStore;
         this.userStore = userStore;
         this.groupStore = groupStore;
         this.revokedTokenStore = revokedTokenStore;
         this.baseUrl = baseUrl;
+        this.cloudFrontDomainSuffix = cloudFrontDomainSuffix;
         this.regionResolver = regionResolver;
         this.lambdaService = lambdaService;
+        this.acmService = acmService;
         this.verificationCodeService = verificationCodeService;
         this.messageDispatcher = messageDispatcher;
-        this.authFlowHandler = new CognitoAuthFlowHandler(this, lambdaService, regionResolver);
+        this.certificateManager = certificateManager;
+        this.authFlowHandler = new CognitoAuthFlowHandler(this, lambdaService, regionResolver, clock);
     }
 
     // ──────────────────────────── User Pools ────────────────────────────
@@ -220,11 +353,69 @@ public class CognitoService implements ResourceProvider {
         UserPool updatedPool = MAPPER.convertValue(pool, UserPool.class);
 
         populateUserPool(updatedPool, request);
+        if (request.get("PoolName") instanceof String poolName && !poolName.isBlank()) {
+            updatedPool.setName(poolName);
+        }
 
         updatedPool.setLastModifiedDate(System.currentTimeMillis() / 1000L);
         poolStore.put(id, updatedPool);
         LOG.infov("Updated User Pool: {0}", id);
         return updatedPool;
+    }
+
+    /**
+     * A copy of the settings {@link #updateUserPool} can change, and nothing else (no signing
+     * material), for a caller that puts them back with {@link #restoreUserPoolSettings}: the rollback
+     * of a CloudFormation update that changed the pool in place.
+     */
+    public UserPool userPoolSettings(String userPoolId) {
+        UserPool settings = new UserPool();
+        settings.setId(userPoolId);
+        copyUserPoolSettings(describeUserPool(userPoolId), settings);
+        return MAPPER.convertValue(settings, UserPool.class);
+    }
+
+    /**
+     * Puts back the settings {@link #userPoolSettings} copied, including clearing one the update
+     * added, which {@link #updateUserPool} cannot do since it only applies what a request names.
+     * Everything else on the pool, its users and signing keys among them, stays as it is now.
+     */
+    public UserPool restoreUserPoolSettings(UserPool settings) {
+        UserPool pool = describeUserPool(settings.getId());
+        UserPool restored = MAPPER.convertValue(pool, UserPool.class);
+        copyUserPoolSettings(MAPPER.convertValue(settings, UserPool.class), restored);
+        restored.setLastModifiedDate(System.currentTimeMillis() / 1000L);
+        poolStore.put(restored.getId(), restored);
+        LOG.infov("Restored User Pool settings: {0}", restored.getId());
+        return restored;
+    }
+
+    /** The name and every field {@code populateUserPool} sets, which is what an update can change. */
+    private static void copyUserPoolSettings(UserPool from, UserPool to) {
+        to.setName(from.getName());
+        to.setPolicies(from.getPolicies());
+        to.setDeletionProtection(from.getDeletionProtection());
+        to.setLambdaConfig(from.getLambdaConfig());
+        to.setSchemaAttributes(from.getSchemaAttributes());
+        to.setAutoVerifiedAttributes(from.getAutoVerifiedAttributes());
+        to.setAliasAttributes(from.getAliasAttributes());
+        to.setUsernameAttributes(from.getUsernameAttributes());
+        to.setSmsVerificationMessage(from.getSmsVerificationMessage());
+        to.setEmailVerificationMessage(from.getEmailVerificationMessage());
+        to.setEmailVerificationSubject(from.getEmailVerificationSubject());
+        to.setVerificationMessageTemplate(from.getVerificationMessageTemplate());
+        to.setSmsAuthenticationMessage(from.getSmsAuthenticationMessage());
+        to.setMfaConfiguration(from.getMfaConfiguration());
+        to.setDeviceConfiguration(from.getDeviceConfiguration());
+        to.setEmailConfiguration(from.getEmailConfiguration());
+        to.setSmsConfiguration(from.getSmsConfiguration());
+        to.setUserPoolTags(from.getUserPoolTags());
+        to.setAdminCreateUserConfig(from.getAdminCreateUserConfig());
+        to.setUserPoolAddOns(from.getUserPoolAddOns());
+        to.setUsernameConfiguration(from.getUsernameConfiguration());
+        to.setAccountRecoverySetting(from.getAccountRecoverySetting());
+        to.setUserAttributeUpdateSettings(from.getUserAttributeUpdateSettings());
+        to.setUserPoolTier(from.getUserPoolTier());
     }
 
     public void addCustomAttributes(String userPoolId, List<Map<String, Object>> customAttributes) {
@@ -256,11 +447,7 @@ public class CognitoService implements ResourceProvider {
                 throw new AwsException("InvalidParameterException", "Attribute name contains invalid characters.", 400);
             }
 
-            boolean developerOnly = Boolean.TRUE.equals(attr.get("DeveloperOnlyAttribute"));
-            String prefix = developerOnly ? "dev:" : "custom:";
-            if (!name.startsWith("custom:") && !name.startsWith("dev:")) {
-                attr.put("Name", prefix + name);
-            }
+            attr.put("Name", prefixedAttributeName(name, Boolean.TRUE.equals(attr.get("DeveloperOnlyAttribute"))));
 
             String finalName = (String) attr.get("Name");
             boolean exists = schema.stream().anyMatch(existing -> finalName.equals(existing.get("Name")));
@@ -276,12 +463,160 @@ public class CognitoService implements ResourceProvider {
         LOG.infov("Added custom attributes to User Pool: {0}", userPoolId);
     }
 
+    /**
+     * Normalizes and validates a supplied {@code PasswordPolicy}.
+     *
+     * <p>On live Cognito, when {@code PasswordPolicy} is provided, {@code MinimumLength} must be
+     * between 6 and 99. If omitted, live Cognito evaluates it as 0 and rejects the request with
+     * {@code InvalidParameterException} ("Value '0' at 'policies.passwordPolicy.minimumLength'
+     * failed to satisfy constraint: Member must have value greater than or equal to 6").
+     *
+     * <p>{@code TemporaryPasswordValidityDays} defaults to 7 (the one default the API reference
+     * documents explicitly).
+     *
+     * <p>RequireUppercase, RequireLowercase, RequireNumbers and RequireSymbols are deliberately
+     * left alone: absence means "not required", matching live Cognito and avoiding Terraform
+     * plan drift.
+     *
+     * <p>Deliberately does not fabricate a {@code PasswordPolicy} for a pool that supplies none
+     * at all — every other test and fixture in this codebase creates pools that way, relying on
+     * "no policy configured" meaning no password validation, and defaulting one into existence
+     * here would enforce it retroactively on all of them. Whether an unconfigured pool should
+     * get AWS's default policy is tracked separately (hectorvent's follow-up on #2066).
+     */
+    @SuppressWarnings("unchecked")
+    private void normalizePasswordPolicy(UserPool pool) {
+        Map<String, Object> policies = pool.getPolicies();
+        if (policies == null || !(policies.get("PasswordPolicy") instanceof Map<?, ?> raw)) {
+            return;
+        }
+        Map<String, Object> passwordPolicy = new HashMap<>((Map<String, Object>) raw);
+        validatePasswordPolicy(passwordPolicy);
+        passwordPolicy.putIfAbsent("TemporaryPasswordValidityDays", 7);
+        Map<String, Object> normalized = new HashMap<>(policies);
+        normalized.put("PasswordPolicy", passwordPolicy);
+        pool.setPolicies(normalized);
+    }
+
+    /**
+     * Gives a pool without a {@code SignInPolicy} AWS's default, {@code PASSWORD} alone. DescribeUserPool on
+     * AWS reports {@code {"AllowedFirstAuthFactors": ["PASSWORD"]}} for a pool created without one, on any
+     * tier. Unlike {@link #normalizePasswordPolicy}, defaulting this one enforces nothing new: a pool with no
+     * sign-in policy already offers only password challenges.
+     */
+    private static void defaultSignInPolicy(UserPool pool) {
+        Map<String, Object> policies = pool.getPolicies() == null ? new HashMap<>() : new HashMap<>(pool.getPolicies());
+        if (policies.get("SignInPolicy") instanceof Map<?, ?>) {
+            return;
+        }
+        policies.put("SignInPolicy", Map.of("AllowedFirstAuthFactors", List.of("PASSWORD")));
+        pool.setPolicies(policies);
+    }
+
+    private void validatePasswordPolicy(Map<String, Object> passwordPolicy) {
+        Object minLengthVal = passwordPolicy.get("MinimumLength");
+        if (minLengthVal == null) {
+            throw new AwsException(
+                    "InvalidParameterException",
+                    "1 validation error detected: Value '0' at 'policies.passwordPolicy.minimumLength' failed to satisfy constraint: Member must have value greater than or equal to 6",
+                    400
+            );
+        }
+        BigInteger minLength = policyInteger(passwordPolicy, "MinimumLength", "minimumLength");
+        if (minLength.compareTo(BigInteger.valueOf(6)) < 0) {
+            throw new AwsException(
+                    "InvalidParameterException",
+                    "1 validation error detected: Value '" + minLengthVal + "' at 'policies.passwordPolicy.minimumLength' failed to satisfy constraint: Member must have value greater than or equal to 6",
+                    400
+            );
+        }
+        if (minLength.compareTo(BigInteger.valueOf(99)) > 0) {
+            throw new AwsException(
+                    "InvalidParameterException",
+                    "1 validation error detected: Value '" + minLengthVal + "' at 'policies.passwordPolicy.minimumLength' failed to satisfy constraint: Member must have value less than or equal to 99",
+                    400
+            );
+        }
+
+        if (passwordPolicy.containsKey("TemporaryPasswordValidityDays")) {
+            Object tempDaysVal = passwordPolicy.get("TemporaryPasswordValidityDays");
+            if (tempDaysVal != null) {
+                BigInteger tempDays = policyInteger(passwordPolicy, "TemporaryPasswordValidityDays",
+                        "temporaryPasswordValidityDays");
+                if (tempDays.compareTo(BigInteger.ZERO) < 0) {
+                    throw new AwsException(
+                            "InvalidParameterException",
+                            "1 validation error detected: Value '" + tempDaysVal + "' at 'policies.passwordPolicy.temporaryPasswordValidityDays' failed to satisfy constraint: Member must have value greater than or equal to 0",
+                            400
+                    );
+                }
+                if (tempDays.compareTo(BigInteger.valueOf(365)) > 0) {
+                    throw new AwsException(
+                            "InvalidParameterException",
+                            "1 validation error detected: Value '" + tempDaysVal + "' at 'policies.passwordPolicy.temporaryPasswordValidityDays' failed to satisfy constraint: Member must have value less than or equal to 365",
+                            400
+                    );
+                }
+            }
+        }
+
+        if (passwordPolicy.containsKey("PasswordHistorySize")) {
+            Object historySizeVal = passwordPolicy.get("PasswordHistorySize");
+            if (historySizeVal != null) {
+                BigInteger historySize = policyInteger(passwordPolicy, "PasswordHistorySize", "passwordHistorySize");
+                if (historySize.compareTo(BigInteger.ZERO) < 0) {
+                    throw new AwsException(
+                            "InvalidParameterException",
+                            "1 validation error detected: Value '" + historySizeVal + "' at 'policies.passwordPolicy.passwordHistorySize' failed to satisfy constraint: Member must have value greater than or equal to 0",
+                            400
+                    );
+                }
+                if (historySize.compareTo(BigInteger.valueOf(24)) > 0) {
+                    throw new AwsException(
+                            "InvalidParameterException",
+                            "1 validation error detected: Value '" + historySizeVal + "' at 'policies.passwordPolicy.passwordHistorySize' failed to satisfy constraint: Member must have value less than or equal to 24",
+                            400
+                    );
+                }
+            }
+        }
+    }
+
+    private static String prefixedAttributeName(String name, boolean developerOnly) {
+        if (name.startsWith("custom:") || name.startsWith("dev:")) {
+            return name;
+        }
+        return (developerOnly ? "dev:" : "custom:") + name;
+    }
+
+    private static List<Map<String, Object>> prefixCustomSchemaAttributes(List<Map<String, Object>> schema) {
+        if (schema == null) {
+            return null;
+        }
+        List<Map<String, Object>> prefixed = new ArrayList<>(schema.size());
+        for (Map<String, Object> attr : schema) {
+            String name = attr == null ? null : (String) attr.get("Name");
+            if (name == null || name.isBlank() || CognitoStandardAttributes.isStandard(name)) {
+                prefixed.add(attr);
+                continue;
+            }
+            Map<String, Object> copy = new HashMap<>(attr);
+            copy.put("Name", prefixedAttributeName(name, Boolean.TRUE.equals(attr.get("DeveloperOnlyAttribute"))));
+            prefixed.add(copy);
+        }
+        return prefixed;
+    }
+
     @SuppressWarnings("unchecked")
     private void populateUserPool(UserPool pool, Map<String, Object> request) {
-        if (request.containsKey("Policies")) pool.setPolicies((Map<String, Object>) request.get("Policies"));
+        if (request.containsKey("Policies")) {
+            pool.setPolicies((Map<String, Object>) request.get("Policies"));
+            normalizePasswordPolicy(pool);
+        }
+        defaultSignInPolicy(pool);
         if (request.containsKey("DeletionProtection")) pool.setDeletionProtection((String) request.get("DeletionProtection"));
         if (request.containsKey("LambdaConfig")) pool.setLambdaConfig((Map<String, Object>) request.get("LambdaConfig"));
-        if (request.containsKey("Schema")) pool.setSchemaAttributes((List<Map<String, Object>>) request.get("Schema"));
+        if (request.containsKey("Schema")) pool.setSchemaAttributes(prefixCustomSchemaAttributes((List<Map<String, Object>>) request.get("Schema")));
         if (request.containsKey("AutoVerifiedAttributes")) pool.setAutoVerifiedAttributes((List<String>) request.get("AutoVerifiedAttributes"));
         if (request.containsKey("AliasAttributes")) pool.setAliasAttributes((List<String>) request.get("AliasAttributes"));
         if (request.containsKey("UsernameAttributes")) pool.setUsernameAttributes((List<String>) request.get("UsernameAttributes"));
@@ -298,13 +633,56 @@ public class CognitoService implements ResourceProvider {
         if (request.containsKey("AdminCreateUserConfig")) pool.setAdminCreateUserConfig((Map<String, Object>) request.get("AdminCreateUserConfig"));
         if (request.containsKey("UserPoolAddOns")) pool.setUserPoolAddOns((Map<String, Object>) request.get("UserPoolAddOns"));
         if (request.containsKey("UsernameConfiguration")) pool.setUsernameConfiguration((Map<String, Object>) request.get("UsernameConfiguration"));
-        if (request.containsKey("AccountRecoverySetting")) pool.setAccountRecoverySetting((Map<String, Object>) request.get("AccountRecoverySetting"));
+        if (request.containsKey("AccountRecoverySetting")) {
+            pool.setAccountRecoverySetting((Map<String, Object>) request.get("AccountRecoverySetting"));
+            validateAccountRecoverySetting(pool);
+        }
+        if (request.containsKey("UserAttributeUpdateSettings")) {
+            pool.setUserAttributeUpdateSettings(validateUserAttributeUpdateSettings(
+                    (Map<String, Object>) request.get("UserAttributeUpdateSettings")));
+        }
         if (request.containsKey("UserPoolTier")) pool.setUserPoolTier((String) request.get("UserPoolTier"));
+    }
+
+    private void validateAccountRecoverySetting(UserPool pool) {
+        List<String> mechanisms = accountRecoveryMechanisms(pool);
+        if (mechanisms.contains("admin_only") && mechanisms.stream().anyMatch(name -> !"admin_only".equals(name))) {
+            throw new AwsException("InvalidParameterException",
+                    "Invalid account recovery setting parameter. "
+                            + "Account Recovery Setting cannot use admin_only setting with any other recovery mechanisms.",
+                    400);
+        }
+    }
+
+    private Map<String, Object> validateUserAttributeUpdateSettings(Map<String, Object> settings) {
+        if (settings == null || settings.isEmpty()) {
+            return new HashMap<>();
+        }
+
+        Object rawAttributes = settings.get("AttributesRequireVerificationBeforeUpdate");
+        if (!(rawAttributes instanceof List<?> attributes)) {
+            throw new AwsException("InvalidParameterException",
+                    "AttributesRequireVerificationBeforeUpdate must be a list", 400);
+        }
+
+        LinkedHashSet<String> normalized = new LinkedHashSet<>();
+        for (Object attribute : attributes) {
+            String name = String.valueOf(attribute);
+            if (!"email".equals(name) && !"phone_number".equals(name)) {
+                throw new AwsException("InvalidParameterException",
+                        "AttributesRequireVerificationBeforeUpdate only supports email and phone_number", 400);
+            }
+            normalized.add(name);
+        }
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("AttributesRequireVerificationBeforeUpdate", new ArrayList<>(normalized));
+        return result;
     }
 
     public UserPool describeUserPool(String id) {
         UserPool pool = poolStore.get(id)
-                .orElseThrow(() -> new AwsException("ResourceNotFoundException", "User pool not found", 400));
+                .orElseThrow(() -> userPoolNotFound(id));
         boolean generatedKeys = ensureJwtSigningKeys(pool);
         boolean generatedSecret = ensureRefreshTokenSecret(pool);
         if (generatedKeys || generatedSecret) {
@@ -313,8 +691,115 @@ public class CognitoService implements ResourceProvider {
         return pool;
     }
 
+    /**
+     * SetUserPoolMfaConfig. Stores the MFA mode and the software-token setting, which is
+     * what GetUserPoolMfaConfig reports back and what the Terraform provider reads to
+     * detect drift on mfa_configuration / software_token_mfa_configuration.
+     *
+     * <p>SMS, email and WebAuthn MFA are accepted and not stored: Floci has no path to
+     * deliver an SMS or email factor, so retaining the config would claim a capability
+     * that does not exist.
+     */
+    /**
+     * @param otherFactorConfigured whether EmailMfaConfiguration or SmsMfaConfiguration was
+     *     present in the request. Both count towards the factor rules below even though
+     *     Floci does not deliver either challenge; WebAuthnConfiguration does not, measured
+     *     against the live service, which accepts it alongside OFF and does not accept it
+     *     as the sole factor for ON or OPTIONAL.
+     */
+    public UserPool setUserPoolMfaConfig(String id, String mfaConfiguration,
+                                         Boolean softwareTokenMfaEnabled,
+                                         boolean otherFactorConfigured) {
+        UserPool pool = describeUserPool(id);
+        // An absent MfaConfiguration means OFF, not "leave the current mode alone":
+        // measured against the live service, which resets a pool that was OPTIONAL back
+        // to OFF when the member is omitted.
+        String mode = mfaConfiguration != null ? mfaConfiguration : "OFF";
+        if (!List.of("OPTIONAL", "OFF", "ON").contains(mode)) {
+            throw new AwsException("InvalidParameterException",
+                    "1 validation error detected: Value '" + mode
+                            + "' at 'mfaConfiguration' failed to satisfy constraint: "
+                            + "Member must satisfy enum value set: [OPTIONAL, OFF, ON]", 400);
+        }
+        // Presence, not value: the live service rejects OFF alongside
+        // SoftwareTokenMfaConfiguration{Enabled:false} just as it does Enabled:true, and
+        // conversely accepts ON alongside Enabled:false, so the member being there is what
+        // counts, despite the "must be enabled" wording of the second message.
+        boolean anyFactorConfigured = softwareTokenMfaEnabled != null || otherFactorConfigured;
+        if ("OFF".equals(mode) && anyFactorConfigured) {
+            throw new AwsException("InvalidParameterException",
+                    "Invalid MFA configuration given, can't turn off MFA and configure an "
+                            + "MFA together.", 400);
+        }
+        if (!"OFF".equals(mode) && !anyFactorConfigured) {
+            throw new AwsException("InvalidParameterException",
+                    "Invalid MFA Configuration given. SMS MFA, Email MFA, or Software Token "
+                            + "MFA must be enabled.", 400);
+        }
+        pool.setMfaConfiguration(mode);
+        if ("OFF".equals(mode)) {
+            // Turning MFA off drops the factor configuration with it: the live service
+            // answers OFF alone afterwards, with no SoftwareTokenMfaConfiguration member.
+            pool.setSoftwareTokenMfaEnabled(null);
+        } else if (softwareTokenMfaEnabled != null) {
+            pool.setSoftwareTokenMfaEnabled(softwareTokenMfaEnabled);
+        }
+        poolStore.put(id, pool);
+        return pool;
+    }
+
     public List<UserPool> listUserPools() {
-        return poolStore.scan(k -> true);
+        String region = regionResolver.getRegion();
+        return poolStore.scan(k -> true).stream()
+                .filter(pool -> {
+                    String poolRegion = poolRegion(pool);
+                    return poolRegion == null || poolRegion.equals(region);
+                })
+                .toList();
+    }
+
+    /**
+     * Refuses a pool from another region as not found, as AWS does: a pool lives in the region its
+     * id names. A pool whose region cannot be told stays reachable, as {@link #listUserPools} lists it.
+     */
+    public void requireUserPoolInRegion(String userPoolId, String region) {
+        poolStore.get(userPoolId).ifPresent(pool -> {
+            String poolRegion = poolRegion(pool);
+            if (poolRegion != null && !poolRegion.equals(region)) {
+                throw userPoolNotFound(userPoolId);
+            }
+        });
+    }
+
+    /** {@link #requireUserPoolInRegion} for an operation that names the pool by its ARN, as tagging does. */
+    public void requireUserPoolArnInRegion(String resourceArn, String region) {
+        requireUserPoolInRegion(extractUserPoolIdFromArn(resourceArn), region);
+    }
+
+    /**
+     * Refuses a domain whose user pool lives in another region, as the same not found an unknown
+     * domain gets: domains are stored by name alone, but a domain belongs to its pool's region.
+     */
+    public void requireUserPoolDomainInRegion(String domain, String region) {
+        if (domain == null || domain.isBlank()) {
+            return;
+        }
+        domainStore.get(domain).map(UserPoolDomain::getUserPoolId).flatMap(poolStore::get).ifPresent(pool -> {
+            String poolRegion = poolRegion(pool);
+            if (poolRegion != null && !poolRegion.equals(region)) {
+                throw new AwsException("ResourceNotFoundException", "Domain does not exist", 400);
+            }
+        });
+    }
+
+    /** Pools are stored by id for every region; the region comes from the pool ARN, else the id prefix. */
+    private static String poolRegion(UserPool pool) {
+        if (pool.getArn() != null && AwsArnUtils.isArn(pool.getArn())) {
+            return AwsArnUtils.parse(pool.getArn()).region();
+        }
+        String id = pool.getId();
+        int underscore = id == null ? -1 : id.indexOf('_');
+        return underscore > 0 ? id.substring(0, underscore) : null;
     }
 
     @Override
@@ -340,9 +825,14 @@ public class CognitoService implements ResourceProvider {
         return Set.of(new SupportedResourceType("cognito-idp:userpool", "cognito-idp", true));
     }
 
+    /** The ARN must name the pool itself: the same id under another region or account is another pool. */
     private UserPool describeUserPoolByArn(String resourceArn) {
         String poolId = extractUserPoolIdFromArn(resourceArn);
-        return describeUserPool(poolId);
+        UserPool pool = describeUserPool(poolId);
+        if (pool.getArn() != null && !pool.getArn().equals(resourceArn)) {
+            throw userPoolNotFound(poolId);
+        }
+        return pool;
     }
 
     public void tagResource(String resourceArn, Map<String, String> tags) {
@@ -401,10 +891,65 @@ public class CognitoService implements ResourceProvider {
     }
 
     public void deleteUserPool(String id) {
+        // Deletion protection is the pool's own guard against this call: with it ACTIVE, AWS
+        // refuses until an UpdateUserPool switches it to INACTIVE (developer guide, "User pool
+        // deletion protection"), and a CloudFormation delete of the pool reports DELETE_FAILED.
+        String deletionProtection = poolStore.get(id).map(UserPool::getDeletionProtection).orElse(null);
+        if ("ACTIVE".equalsIgnoreCase(deletionProtection)) {
+            throw new AwsException("InvalidParameterException",
+                    "The user pool cannot be deleted because deletion protection is activated. "
+                            + "Deletion protection must be inactivated first.", 400);
+        }
+        // AWS refuses to delete a pool that still has a hosted UI / custom domain; the
+        // DeleteUserPool API reference documents this exact InvalidParameterException.
+        boolean hasDomain = domainStore.scan(k -> true).stream()
+                .anyMatch(d -> id.equals(d.getUserPoolId()));
+        if (hasDomain) {
+            throw new AwsException("InvalidParameterException",
+                    "User pool cannot be deleted. It has a domain configured that should be deleted first.", 400);
+        }
+        // github.com/floci-io/floci/issues/2864: every record the pool owns goes with it. On AWS
+        // a pool id is never reused, so the question does not arise; here floci:override-id makes
+        // ids caller-chosen and therefore reusable, and anything left behind is inherited by the
+        // next pool pinned to the same id. Orphaned users keep their password hashes and orphaned
+        // clients keep their secrets.
         String prefix = id + "::";
         groupStore.scan(k -> k.startsWith(prefix))
                 .forEach(g -> groupStore.delete(groupKey(id, g.getGroupName())));
-        poolStore.delete(id);
+        userStore.scan(k -> k.startsWith(prefix))
+                .forEach(u -> {
+                    synchronized (userLock(id, u.getUsername())) {
+                        userStore.delete(userKey(id, u.getUsername()));
+                    }
+                });
+        resourceServerStore.scan(k -> k.startsWith(prefix))
+                .forEach(r -> resourceServerStore.delete(resourceServerKey(id, r.getIdentifier())));
+        // Clients are keyed by client id alone, so they are found by their userPoolId field.
+        listUserPoolClients(id).forEach(c -> clientStore.delete(c.getClientId()));
+        // Revoked tokens are keyed revoked:{poolId}:{jti}, and a jti may itself contain a colon
+        // (global revocations use global:{username}), so the prefix cannot be bounded by the
+        // separator alone. Pool ids are caller-chosen and may also contain a colon, which would
+        // let this prefix match a live pool whose id extends this one and reinstate its revoked
+        // tokens. The record's own userPoolId settles ownership. Keys are collected before
+        // deleting so the backing key set is not modified while it is being iterated.
+        String revokedPrefix = "revoked:" + id + ":";
+        revokedTokenStore.keys().stream()
+                .filter(k -> k.startsWith(revokedPrefix))
+                .filter(k -> revokedTokenStore.get(k)
+                        .map(t -> id.equals(t.getUserPoolId()))
+                        .orElse(false))
+                .toList()
+                .forEach(revokedTokenStore::delete);
+        if (verificationCodeService != null) {
+            verificationCodeService.invalidateForPool(id);
+        }
+        // Same lock as the provider mutations: a create or update that interleaves with
+        // this cascade would otherwise reinstate a provider for a pool that is going away.
+        synchronized (identityProviderLock) {
+            identityProviderStore.scan(k -> k.startsWith(prefix))
+                    .forEach(p -> identityProviderStore.delete(identityProviderKey(id, p.getProviderName())));
+            poolStore.delete(id);
+        }
     }
 
     // ──────────────────────────── User Pool Clients ────────────────────────────
@@ -429,9 +974,28 @@ public class CognitoService implements ResourceProvider {
                                                List<String> supportedIdentityProviders, Map<String, String> tokenValidityUnits,
                                                List<String> writeAttributes, Map<String, Object> refreshTokenRotation,
                                                Boolean enableTokenRevocation) {
+        return createUserPoolClient(userPoolId, clientName, generateSecret, allowedOAuthFlowsUserPoolClient,
+                allowedOAuthFlows, allowedOAuthScopes, analyticsConfiguration, callbackURLs,
+                defaultRedirectURI, explicitAuthFlows, accessTokenValidity, idTokenValidity,
+                logoutURLs, preventUserExistenceErrors, readAttributes, refreshTokenValidity,
+                supportedIdentityProviders, tokenValidityUnits, writeAttributes, refreshTokenRotation,
+                enableTokenRevocation, null);
+    }
 
+    public UserPoolClient createUserPoolClient(String userPoolId, String clientName,
+                                               boolean generateSecret, boolean allowedOAuthFlowsUserPoolClient,
+                                               List<String> allowedOAuthFlows, List<String> allowedOAuthScopes,
+                                               Map<String, Object> analyticsConfiguration, List<String> callbackURLs,
+                                               String defaultRedirectURI, List<String> explicitAuthFlows, Integer accessTokenValidity,
+                                               Integer idTokenValidity, List<String> logoutURLs, String preventUserExistenceErrors,
+                                               List<String> readAttributes, Integer refreshTokenValidity,
+                                               List<String> supportedIdentityProviders, Map<String, String> tokenValidityUnits,
+                                               List<String> writeAttributes, Map<String, Object> refreshTokenRotation,
+                                               Boolean enableTokenRevocation, Integer authSessionValidity) {
+
+        validateAuthSessionValidity(authSessionValidity);
         UserPool userPool = describeUserPool(userPoolId);
-        String clientId = UUID.randomUUID().toString().replace("-", "").substring(0, 26);
+        String clientId = clientIdFor(userPool, clientName);
         List<String> normalizedAllowedOAuthFlows = normalizeStringList(allowedOAuthFlows);
         List<String> normalizedAllowedOAuthScopes = normalizeStringList(allowedOAuthScopes);
         List<String> normalizedCallbackUrls = normalizeStringList(callbackURLs);
@@ -458,15 +1022,6 @@ public class CognitoService implements ResourceProvider {
         );
 
         UserPoolClient client = new UserPoolClient();
-        if (userPool.getClientIdOverride() != null) {
-            if (userPool.getClientIdOverride().equalsIgnoreCase("use-name")) {
-                clientId = clientName;
-            } else if (userPool.getClientIdOverride().startsWith("append-to-name:")) {
-                clientId = clientName + userPool.getClientIdOverride().substring(15);
-            } else if (userPool.getClientIdOverride().startsWith("prepend-to-name:")) {
-                clientId = userPool.getClientIdOverride().substring(16) + clientName;
-            }
-        }
         client.setClientId(clientId);
         client.setUserPoolId(userPoolId);
         client.setClientName(clientName);
@@ -480,6 +1035,9 @@ public class CognitoService implements ResourceProvider {
         client.setExplicitAuthFlows(normalizedExplicitAuthFlows);
         client.setAccessTokenValidity(accessTokenValidity);
         client.setIdTokenValidity(idTokenValidity);
+        if (authSessionValidity != null) {
+            client.setAuthSessionValidity(authSessionValidity);
+        }
         client.setLogoutURLs(normalizedLogoutUrls);
         client.setPreventUserExistenceErrors(preventUserExistenceErrors);
         client.setReadAttributes(normalizedReadAttributes);
@@ -516,15 +1074,45 @@ public class CognitoService implements ResourceProvider {
     }
 
     public UserPoolClient describeUserPoolClient(String userPoolId, String clientId) {
-        UserPoolClient client = clientStore.get(clientId)
-                .orElseThrow(() -> new AwsException("ResourceNotFoundException", "User pool client not found", 400));
+        UserPoolClient client = describeUserPoolClient(clientId);
         if (!client.getUserPoolId().equals(userPoolId)) {
             throw new AwsException("ResourceNotFoundException", "User pool client not found", 400);
         }
         return client;
     }
 
+    /**
+     * The id a client created now with this name in this pool would get: derived from the name when
+     * the pool carries the {@code floci:override-cognito-client-id} tag, otherwise null because it
+     * would be random. Lets a caller that must not overwrite an existing client check first.
+     */
+    public String deterministicClientIdFor(String userPoolId, String clientName) {
+        UserPool userPool = describeUserPool(userPoolId);
+        return userPool.getClientIdOverride() == null ? null : clientIdFor(userPool, clientName);
+    }
+
+    private static String clientIdFor(UserPool userPool, String clientName) {
+        String override = userPool.getClientIdOverride();
+        if (override != null) {
+            if (override.equalsIgnoreCase("use-name")) {
+                return clientName;
+            } else if (override.startsWith("append-to-name:")) {
+                return clientName + override.substring(15);
+            } else if (override.startsWith("prepend-to-name:")) {
+                return override.substring(16) + clientName;
+            }
+        }
+        return UUID.randomUUID().toString().replace("-", "").substring(0, 26);
+    }
+
+    /** By id alone, for callers that hold only the client id, such as a CloudFormation stack resource. */
+    public UserPoolClient describeUserPoolClient(String clientId) {
+        return clientStore.get(clientId)
+                .orElseThrow(() -> new AwsException("ResourceNotFoundException", "User pool client not found", 400));
+    }
+
     public List<UserPoolClient> listUserPoolClients(String userPoolId) {
+        describeUserPool(userPoolId);
         return clientStore.scan(k -> clientStore.get(k).map(c -> c.getUserPoolId().equals(userPoolId)).orElse(false));
     }
 
@@ -586,6 +1174,26 @@ public class CognitoService implements ResourceProvider {
                                                List<String> writeAttributes,
                                                Map<String, Object> refreshTokenRotation,
                                                Boolean enableTokenRevocation) {
+        return updateUserPoolClient(userPoolId, clientId, clientName, allowedOAuthFlowsUserPoolClient,
+                allowedOAuthFlows, allowedOAuthScopes, analyticsConfiguration, callbackURLs,
+                defaultRedirectURI, explicitAuthFlows, accessTokenValidity, idTokenValidity,
+                logoutURLs, preventUserExistenceErrors, readAttributes, refreshTokenValidity,
+                supportedIdentityProviders, tokenValidityUnits, writeAttributes, refreshTokenRotation,
+                enableTokenRevocation, null);
+    }
+
+    public UserPoolClient updateUserPoolClient(String userPoolId, String clientId, String clientName,
+                                               Boolean allowedOAuthFlowsUserPoolClient,
+                                               List<String> allowedOAuthFlows, List<String> allowedOAuthScopes,
+                                               Map<String, Object> analyticsConfiguration, List<String> callbackURLs,
+                                               String defaultRedirectURI, List<String> explicitAuthFlows,
+                                               Integer accessTokenValidity, Integer idTokenValidity,
+                                               List<String> logoutURLs, String preventUserExistenceErrors,
+                                               List<String> readAttributes, Integer refreshTokenValidity,
+                                               List<String> supportedIdentityProviders, Map<String, String> tokenValidityUnits,
+                                               List<String> writeAttributes, Map<String, Object> refreshTokenRotation,
+                                               Boolean enableTokenRevocation, Integer authSessionValidity) {
+        validateAuthSessionValidity(authSessionValidity);
         UserPoolClient client = describeUserPoolClient(userPoolId, clientId);
         boolean effectiveAllowedOAuthFlowsUserPoolClient = allowedOAuthFlowsUserPoolClient != null
                 ? allowedOAuthFlowsUserPoolClient
@@ -686,11 +1294,78 @@ public class CognitoService implements ResourceProvider {
         if (enableTokenRevocation != null) {
             client.setEnableTokenRevocation(enableTokenRevocation);
         }
+        if (authSessionValidity != null) {
+            client.setAuthSessionValidity(authSessionValidity);
+        }
 
         client.setLastModifiedDate(System.currentTimeMillis() / 1000L);
         clientStore.put(clientId, client);
         LOG.infov("Updated User Pool Client: {0} for pool {1}", clientId, userPoolId);
         return client;
+    }
+
+    /**
+     * A copy of the settings {@link #updateUserPoolClient} can change, for a caller that puts them
+     * back with {@link #restoreUserPoolClientSettings}: the rollback of a CloudFormation update that
+     * changed the client in place. A deep copy, since an update mutates the stored client.
+     */
+    public UserPoolClient userPoolClientSettings(String userPoolId, String clientId) {
+        UserPoolClient settings = new UserPoolClient();
+        settings.setUserPoolId(userPoolId);
+        settings.setClientId(clientId);
+        copyUserPoolClientSettings(describeUserPoolClient(userPoolId, clientId), settings);
+        return MAPPER.convertValue(settings, UserPoolClient.class);
+    }
+
+    /**
+     * Puts back the settings {@link #userPoolClientSettings} copied, including clearing one the
+     * update added, which {@link #updateUserPoolClient} cannot do since a null there keeps the
+     * current value. The client's id, secrets and branding stay as they are now.
+     */
+    public UserPoolClient restoreUserPoolClientSettings(UserPoolClient settings) {
+        UserPoolClient client = describeUserPoolClient(settings.getUserPoolId(), settings.getClientId());
+        UserPoolClient restored = MAPPER.convertValue(client, UserPoolClient.class);
+        copyUserPoolClientSettings(MAPPER.convertValue(settings, UserPoolClient.class), restored);
+        restored.setLastModifiedDate(System.currentTimeMillis() / 1000L);
+        clientStore.put(restored.getClientId(), restored);
+        LOG.infov("Restored User Pool Client settings: {0} for pool {1}", restored.getClientId(),
+                restored.getUserPoolId());
+        return restored;
+    }
+
+    /** The name and every field {@link #updateUserPoolClient} sets. */
+    private static void copyUserPoolClientSettings(UserPoolClient from, UserPoolClient to) {
+        to.setClientName(from.getClientName());
+        to.setAllowedOAuthFlowsUserPoolClient(from.isAllowedOAuthFlowsUserPoolClient());
+        to.setAllowedOAuthFlows(from.getAllowedOAuthFlows());
+        to.setAllowedOAuthScopes(from.getAllowedOAuthScopes());
+        to.setAnalyticsConfiguration(from.getAnalyticsConfiguration());
+        to.setCallbackURLs(from.getCallbackURLs());
+        to.setDefaultRedirectURI(from.getDefaultRedirectURI());
+        to.setExplicitAuthFlows(from.getExplicitAuthFlows());
+        to.setAccessTokenValidity(from.getAccessTokenValidity());
+        to.setIdTokenValidity(from.getIdTokenValidity());
+        to.setAuthSessionValidity(from.getAuthSessionValidity());
+        to.setLogoutURLs(from.getLogoutURLs());
+        to.setPreventUserExistenceErrors(from.getPreventUserExistenceErrors());
+        to.setReadAttributes(from.getReadAttributes());
+        to.setRefreshTokenValidity(from.getRefreshTokenValidity());
+        to.setSupportedIdentityProviders(from.getSupportedIdentityProviders());
+        to.setTokenValidityUnits(from.getTokenValidityUnits());
+        to.setWriteAttributes(from.getWriteAttributes());
+        to.setRefreshTokenRotation(from.getRefreshTokenRotation());
+        to.setEnableTokenRevocation(from.getEnableTokenRevocation());
+    }
+
+    private static void validateAuthSessionValidity(Integer authSessionValidity) {
+        if (authSessionValidity != null && (authSessionValidity < 3 || authSessionValidity > 15)) {
+            String constraint = authSessionValidity < 3
+                    ? "Member must have value greater than or equal to 3"
+                    : "Member must have value less than or equal to 15";
+            throw new AwsException("InvalidParameterException",
+                    "1 validation error detected: Value '" + authSessionValidity
+                            + "' at 'authSessionValidity' failed to satisfy constraint: " + constraint, 400);
+        }
     }
 
     public List<UserPoolClientSecret> listUserPoolClientSecrets(String userPoolId, String clientId) {
@@ -821,6 +1496,509 @@ public class CognitoService implements ResourceProvider {
         resourceServerStore.delete(resourceServerKey(userPoolId, identifier));
     }
 
+    // ──────────────────────────── Identity Providers ────────────────────────────
+
+    private static final Set<String> PROVIDER_TYPES =
+            Set.of("Facebook", "SAML", "SignInWithApple", "LoginWithAmazon", "OIDC", "Google");
+
+    public IdentityProvider createIdentityProvider(String userPoolId, String providerName, String providerType,
+                                                   Map<String, String> providerDetails,
+                                                   Map<String, String> attributeMapping,
+                                                   List<String> idpIdentifiers) {
+        describeUserPool(userPoolId);
+        if (providerName == null || providerName.isBlank()) {
+            throw new AwsException("InvalidParameterException", "ProviderName is required", 400);
+        }
+        validateProviderType(providerType);
+
+        String key = identityProviderKey(userPoolId, providerName);
+        synchronized (identityProviderLock) {
+            // The pool was checked before the lock, so a DeleteUserPool that ran its
+            // cascade in between would leave this create writing a provider for a pool
+            // that no longer exists. Update needs no equivalent recheck: the cascade
+            // removes the provider, so its own lookup throws.
+            describeUserPool(userPoolId);
+            if (identityProviderStore.get(key).isPresent()) {
+                throw new AwsException("DuplicateProviderException",
+                        providerName + " already exists for tenant " + userPoolId + ".", 400);
+            }
+
+            IdentityProvider provider = new IdentityProvider();
+            provider.setUserPoolId(userPoolId);
+            provider.setProviderName(providerName);
+            provider.setProviderType(providerType);
+            provider.setProviderDetails(copyOrEmpty(providerDetails));
+            // AWS supplies a default mapping only when the member is absent; an explicitly
+            // empty map is stored as given.
+            provider.setAttributeMapping(attributeMapping == null
+                    ? new LinkedHashMap<>(Map.of("username", "sub"))
+                    : new LinkedHashMap<>(attributeMapping));
+            provider.setIdpIdentifiers(idpIdentifiers == null
+                    ? new ArrayList<>() : new ArrayList<>(idpIdentifiers));
+            identityProviderStore.put(key, provider);
+            return provider;
+        }
+    }
+
+    public IdentityProvider describeIdentityProvider(String userPoolId, String providerName) {
+        describeUserPool(userPoolId);
+        return identityProviderStore.get(identityProviderKey(userPoolId, providerName))
+                .orElseThrow(() -> new AwsException("ResourceNotFoundException",
+                        "Identity provider " + providerName + " for tenantId " + userPoolId
+                                + " does not exist.", 400));
+    }
+
+    public List<IdentityProvider> listIdentityProviders(String userPoolId) {
+        describeUserPool(userPoolId);
+        String prefix = userPoolId + "::";
+        return identityProviderStore.scan(k -> k.startsWith(prefix));
+    }
+
+    /**
+     * Members the request omits are left as they were: AWS preserves the stored
+     * {@code AttributeMapping} and {@code IdpIdentifiers} rather than clearing them, and an
+     * explicitly empty map or list is what clears them.
+     */
+    public IdentityProvider updateIdentityProvider(String userPoolId, String providerName,
+                                                   Map<String, String> providerDetails,
+                                                   Map<String, String> attributeMapping,
+                                                   List<String> idpIdentifiers) {
+        describeUserPool(userPoolId);
+        String key = identityProviderKey(userPoolId, providerName);
+        synchronized (identityProviderLock) {
+            IdentityProvider provider = copyOf(identityProviderStore.get(key)
+                    .orElseThrow(() -> new AwsException("ResourceNotFoundException",
+                            "Identity provider " + providerName + " in User Pool " + userPoolId
+                                    + " does not exist.", 400)));
+
+            if (providerDetails != null) {
+                provider.setProviderDetails(new LinkedHashMap<>(providerDetails));
+            }
+            if (attributeMapping != null) {
+                provider.setAttributeMapping(new LinkedHashMap<>(attributeMapping));
+            }
+            if (idpIdentifiers != null) {
+                provider.setIdpIdentifiers(new ArrayList<>(idpIdentifiers));
+            }
+            provider.setLastModifiedDate(System.currentTimeMillis() / 1000L);
+            identityProviderStore.put(key, provider);
+            return provider;
+        }
+    }
+
+    public void deleteIdentityProvider(String userPoolId, String providerName) {
+        synchronized (identityProviderLock) {
+            describeIdentityProvider(userPoolId, providerName);
+            identityProviderStore.delete(identityProviderKey(userPoolId, providerName));
+        }
+    }
+
+    private void validateProviderType(String providerType) {
+        if (providerType == null || !PROVIDER_TYPES.contains(providerType)) {
+            throw new AwsException("InvalidParameterException",
+                    "1 validation error detected: Value '" + providerType + "' at 'providerType' failed to "
+                            + "satisfy constraint: Member must satisfy enum value set: "
+                            + "[Facebook, SAML, SignInWithApple, LoginWithAmazon, OIDC, Google]", 400);
+        }
+    }
+
+    private Map<String, String> copyOrEmpty(Map<String, String> source) {
+        return source == null ? new LinkedHashMap<>() : new LinkedHashMap<>(source);
+    }
+
+    private IdentityProvider copyOf(IdentityProvider source) {
+        IdentityProvider copy = new IdentityProvider();
+        copy.setUserPoolId(source.getUserPoolId());
+        copy.setProviderName(source.getProviderName());
+        copy.setProviderType(source.getProviderType());
+        copy.setProviderDetails(new LinkedHashMap<>(source.getProviderDetails()));
+        copy.setAttributeMapping(new LinkedHashMap<>(source.getAttributeMapping()));
+        copy.setIdpIdentifiers(new ArrayList<>(source.getIdpIdentifiers()));
+        copy.setCreationDate(source.getCreationDate());
+        copy.setLastModifiedDate(source.getLastModifiedDate());
+        return copy;
+    }
+
+    // ──────────────────────────── User Pool Domains ────────────────────────────
+
+    private static final String CERTIFICATE_REGION = "us-east-1"; // partition-literal: CloudFront certificates live in us-east-1 by AWS's rule
+    private static final String CERTIFICATE_NOT_USABLE = "The specified SSL certificate doesn't exist, "
+            + "isn't in us-east-1 region, isn't valid, or doesn't include a valid certificate chain."; // partition-literal: AWS's message text
+
+    /**
+     * Creates either an Amazon Cognito prefix domain ({@code customDomainConfig == null})
+     * or a custom domain fronted by an ACM certificate. Domain names are globally unique
+     * across pools, matching AWS's shared namespace for hosted UI/managed login domains.
+     */
+    public UserPoolDomain createUserPoolDomain(String domain, String userPoolId,
+            Map<String, Object> customDomainConfig, Integer managedLoginVersion) {
+        describeUserPool(userPoolId);
+        if (domain == null || domain.isBlank()) {
+            throw new AwsException("InvalidParameterException", "Domain is required", 400);
+        }
+        if (!findDomains(domain).isEmpty()) {
+            throw new AwsException("InvalidParameterException",
+                    "Domain " + domain + " already associated with another user pool", 400);
+        }
+
+        UserPoolDomain userPoolDomain = new UserPoolDomain();
+        userPoolDomain.setDomain(domain);
+        userPoolDomain.setUserPoolId(userPoolId);
+        userPoolDomain.setAwsAccountId(regionResolver.getAccountId());
+        userPoolDomain.setManagedLoginVersion(managedLoginVersion);
+        userPoolDomain.setStatus("ACTIVE");
+        userPoolDomain.setVersion(generateDomainVersion());
+        userPoolDomain.setS3Bucket("aws-cognito-prod-" + regionResolver.getRegion() + "-assets");
+
+        if (customDomainConfig != null) {
+            String certificateArn = (String) customDomainConfig.get("CertificateArn");
+            if (certificateArn == null || certificateArn.isBlank()) {
+                throw new AwsException("InvalidParameterException",
+                        "CertificateArn is required in CustomDomainConfig", 400);
+            }
+            requireUsableCertificate(certificateArn);
+            userPoolDomain.setCertificateArn(certificateArn);
+            Object securityPolicy = customDomainConfig.get("SecurityPolicy");
+            userPoolDomain.setSecurityPolicy(securityPolicy != null ? securityPolicy.toString() : "TLS_V1_2_2021");
+            userPoolDomain.setCloudFrontDistribution(generateCloudFrontDomain());
+        }
+
+        // Check and write as one step: two accounts racing for one name write to different
+        // account-prefixed keys, so without the lock both would succeed and the name would be
+        // ambiguous for routing.
+        synchronized (domainLock) {
+            if (!findDomains(domain).isEmpty()) {
+                throw new AwsException("InvalidParameterException",
+                        "Domain " + domain + " already associated with another user pool", 400);
+            }
+            if (userPoolDomain.isCustomDomain()) {
+                registerCertificateUse(userPoolDomain.getCertificateArn(), userPoolDomain);
+            }
+            domainStore.put(domain, userPoolDomain);
+        }
+        // Outside the lock: the reissue blocks until the HTTPS listener has switched certificates.
+        // A prefix domain is served under amazoncognito.com on AWS, not by Floci; a custom domain is.
+        if (customDomainConfig != null && certificateManager != null) {
+            certificateManager.ensureHost(domain);
+        }
+        LOG.infov("Created User Pool Domain: {0} for pool {1}", domain, userPoolId);
+        return userPoolDomain;
+    }
+
+    public UserPoolDomain describeUserPoolDomain(String domain) {
+        if (domain == null || domain.isBlank()) {
+            throw new AwsException("InvalidParameterException", "Domain is required", 400);
+        }
+        return domainStore.get(domain)
+                .orElseThrow(() -> new AwsException("ResourceNotFoundException", "Domain does not exist", 400));
+    }
+
+    /**
+     * Resolves a request {@code Host} to the custom domain it names. An OAuth call carries no
+     * SigV4 account, so the lookup spans every account rather than the request's default one.
+     */
+    public Optional<UserPoolDomain> findCustomDomain(String hostname) {
+        List<UserPoolDomain> matches = findDomains(hostname).stream()
+                .filter(UserPoolDomain::isCustomDomain)
+                .toList();
+        if (matches.size() > 1) {
+            LOG.warnv("Custom domain {0} exists in {1} accounts and is not routed; delete the duplicates",
+                    hostname, matches.size());
+            return Optional.empty();
+        }
+        return matches.stream().findFirst();
+    }
+
+    /**
+     * Domain names are one namespace across every account on AWS, so this is also the
+     * uniqueness check {@link #createUserPoolDomain} runs. More than one match can only come
+     * from data persisted before that check spanned accounts.
+     */
+    private List<UserPoolDomain> findDomains(String name) {
+        if (name == null || name.isBlank()) {
+            return List.of();
+        }
+        return allDomains().stream()
+                .filter(d -> name.equalsIgnoreCase(d.getDomain()))
+                .toList();
+    }
+
+    public Optional<UserPoolDomain> findCustomDomainForPool(String poolId) {
+        return allDomains().stream()
+                .filter(d -> d.isCustomDomain() && poolId.equals(d.getUserPoolId()))
+                .findFirst();
+    }
+
+    private List<UserPoolDomain> allDomains() {
+        return domainStore instanceof AccountAwareStorageBackend<UserPoolDomain> aware
+                ? aware.scanAllAccounts()
+                : domainStore.scan(key -> true);
+    }
+
+    /**
+     * Changes a domain in place: the certificate behind a custom domain ({@code CustomDomainConfig})
+     * or the managed login version. As on AWS the domain keeps its CloudFront distribution, so a
+     * DNS alias pointing at it stays valid. A setting the request omits is left unchanged.
+     */
+    public UserPoolDomain updateUserPoolDomain(String domain, String userPoolId,
+            Map<String, Object> customDomainConfig, Integer managedLoginVersion) {
+        describeUserPool(userPoolId);
+        UserPoolDomain userPoolDomain = describeUserPoolDomain(domain);
+        if (!userPoolDomain.getUserPoolId().equals(userPoolId)) {
+            throw new AwsException("ResourceNotFoundException", "Domain does not exist", 400);
+        }
+        String previousCertificateArn = userPoolDomain.getCertificateArn();
+        String certificateArn = previousCertificateArn;
+        if (customDomainConfig != null) {
+            if (!userPoolDomain.isCustomDomain()) {
+                throw new AwsException("InvalidParameterException",
+                        "CustomDomainConfig cannot be set on an Amazon Cognito prefix domain", 400);
+            }
+            certificateArn = (String) customDomainConfig.get("CertificateArn");
+            if (certificateArn == null || certificateArn.isBlank()) {
+                throw new AwsException("InvalidParameterException",
+                        "CertificateArn is required in CustomDomainConfig", 400);
+            }
+        }
+        // A new certificate is checked and registered before anything changes, so a failure leaves
+        // the domain on its current certificate.
+        boolean certificateChanged = !Objects.equals(certificateArn, previousCertificateArn);
+        if (certificateChanged) {
+            requireUsableCertificate(certificateArn);
+            registerCertificateUse(certificateArn, userPoolDomain);
+        }
+        if (customDomainConfig != null) {
+            userPoolDomain.setCertificateArn(certificateArn);
+            Object securityPolicy = customDomainConfig.get("SecurityPolicy");
+            if (securityPolicy != null) {
+                userPoolDomain.setSecurityPolicy(securityPolicy.toString());
+            }
+        }
+        if (managedLoginVersion != null) {
+            userPoolDomain.setManagedLoginVersion(managedLoginVersion);
+        }
+        userPoolDomain.setLastModifiedDate(System.currentTimeMillis() / 1000L);
+        domainStore.put(domain, userPoolDomain);
+        if (certificateChanged) {
+            acmService.removeInUseBy(previousCertificateArn,
+                    cloudFrontDistributionArn(regionResolver.getPartition(), userPoolDomain), CERTIFICATE_REGION);
+        }
+        LOG.infov("Updated User Pool Domain: {0} for pool {1}", domain, userPoolId);
+        return userPoolDomain;
+    }
+
+    public void deleteUserPoolDomain(String domain, String userPoolId) {
+        UserPoolDomain userPoolDomain = describeUserPoolDomain(domain);
+        if (!userPoolDomain.getUserPoolId().equals(userPoolId)) {
+            throw new AwsException("ResourceNotFoundException", "Domain does not exist", 400);
+        }
+        domainStore.delete(domain);
+        if (userPoolDomain.isCustomDomain()) {
+            acmService.removeInUseBy(userPoolDomain.getCertificateArn(),
+                    cloudFrontDistributionArn(regionResolver.getPartition(), userPoolDomain), CERTIFICATE_REGION);
+        }
+        LOG.infov("Deleted User Pool Domain: {0} for pool {1}", domain, userPoolId);
+    }
+
+    /**
+     * Registers the domain on its certificate before the domain is stored or changed, so a
+     * certificate that disappears between the check and the registration leaves nothing behind.
+     */
+    private void registerCertificateUse(String certificateArn, UserPoolDomain userPoolDomain) {
+        try {
+            acmService.addInUseBy(certificateArn, cloudFrontDistributionArn(regionResolver.getPartition(), userPoolDomain), CERTIFICATE_REGION);
+        } catch (AwsException e) {
+            if (!"ResourceNotFoundException".equals(e.getErrorCode())) {
+                throw e;
+            }
+            throw new AwsException("InvalidParameterException", CERTIFICATE_NOT_USABLE, 400);
+        }
+    }
+
+    /**
+     * AWS accepts only an issued ACM certificate from us-east-1 behind a custom domain, and answers
+     * anything else with this one message.
+     */
+    private void requireUsableCertificate(String certificateArn) {
+        AwsArnUtils.Arn arn;
+        try {
+            arn = AwsArnUtils.parse(certificateArn);
+        } catch (IllegalArgumentException e) {
+            throw new AwsException("InvalidParameterException", CERTIFICATE_NOT_USABLE, 400);
+        }
+        if (!"acm".equals(arn.service()) || !CERTIFICATE_REGION.equals(arn.region())
+                || !arn.resource().startsWith("certificate/")) {
+            throw new AwsException("InvalidParameterException", CERTIFICATE_NOT_USABLE, 400);
+        }
+        Certificate certificate;
+        try {
+            certificate = acmService.describeCertificate(certificateArn, CERTIFICATE_REGION);
+        } catch (AwsException e) {
+            if (!"ResourceNotFoundException".equals(e.getErrorCode())) {
+                throw e;
+            }
+            throw new AwsException("InvalidParameterException", CERTIFICATE_NOT_USABLE, 400);
+        }
+        if (certificate.getStatus() != CertificateStatus.ISSUED) {
+            throw new AwsException("InvalidParameterException", CERTIFICATE_NOT_USABLE, 400);
+        }
+    }
+
+    /**
+     * What a custom domain registers on its certificate: the CloudFront distribution that serves
+     * it, which is what ACM lists on AWS. Floci has no distribution object, so the id is the label
+     * of the generated CloudFront name.
+     */
+    private static String cloudFrontDistributionArn(String partition, UserPoolDomain userPoolDomain) {
+        String name = userPoolDomain.getCloudFrontDistribution();
+        String id = name.substring(0, name.indexOf('.')).toUpperCase(Locale.ROOT);
+        return AwsArnUtils.Arn.global(partition, "cloudfront", userPoolDomain.getAwsAccountId(), "distribution/" + id).toString();
+    }
+
+    private String generateCloudFrontDomain() {
+        return UUID.randomUUID().toString().replace("-", "").substring(0, 14) + "." + cloudFrontDomainSuffix;
+    }
+
+    private String generateDomainVersion() {
+        return java.time.format.DateTimeFormatter.ofPattern("yyyyMMddHHmmss")
+                .withZone(java.time.ZoneOffset.UTC)
+                .format(java.time.Instant.now());
+    }
+
+    // ──────────────────────────── Log Delivery ────────────────────────────
+
+    private static final Set<String> LOG_LEVELS = Set.of("ERROR", "INFO");
+    private static final Set<String> LOG_EVENT_SOURCES = Set.of("userAuthEvents", "userNotification");
+    private static final int MAX_LOG_CONFIGURATIONS = 2;
+
+    /**
+     * Replaces the pool's log configuration wholesale: AWS has no merge semantics here, and an
+     * empty list is what clears it.
+     */
+    public UserPool setLogDeliveryConfiguration(String userPoolId, List<Map<String, Object>> logConfigurations) {
+        validateLogConfigurations(logConfigurations);
+        rejectUnusableEventSources(logConfigurations);
+
+        UserPool pool = describeUserPool(userPoolId);
+        pool.setLogConfigurations(new ArrayList<>(logConfigurations));
+        poolStore.put(userPoolId, pool);
+        return pool;
+    }
+
+    public UserPool getLogDeliveryConfiguration(String userPoolId) {
+        return describeUserPool(userPoolId);
+    }
+
+    /**
+     * The shape checks AWS runs before it looks the pool up, so an oversized or malformed request
+     * against a pool that does not exist reports the request problem rather than the missing pool.
+     * Every violation is collected into one message, the list-length one ahead of the per-element
+     * ones, the way the service reports them.
+     */
+    private void validateLogConfigurations(List<Map<String, Object>> configs) {
+        if (configs == null) {
+            throw validationErrors(List.of(
+                    "Value null at 'logConfigurations' failed to satisfy constraint: Member must not be null"));
+        }
+
+        List<String> errors = new ArrayList<>();
+        if (configs.size() > MAX_LOG_CONFIGURATIONS) {
+            errors.add("Value '" + renderLogConfigurations(configs) + "' at 'logConfigurations' failed to "
+                    + "satisfy constraint: Member must have length less than or equal to " + MAX_LOG_CONFIGURATIONS);
+        }
+        for (int i = 0; i < configs.size(); i++) {
+            Map<String, Object> config = configs.get(i);
+            collectLogMemberError(errors, config.get("LogLevel"), LOG_LEVELS, i, "logLevel", "[ERROR, INFO]");
+            collectLogMemberError(errors, config.get("EventSource"), LOG_EVENT_SOURCES, i, "eventSource",
+                    "[userAuthEvents, userNotification]");
+        }
+        if (!errors.isEmpty()) {
+            throw validationErrors(errors);
+        }
+    }
+
+    /**
+     * Both complaints share one message, the missing-destination clause first, and each event
+     * source is named once however many configurations carry it.
+     *
+     * <p>"more then once" is the service's own spelling, kept so the message matches byte for byte.
+     */
+    private void rejectUnusableEventSources(List<Map<String, Object>> configs) {
+        Set<String> withoutDestination = new LinkedHashSet<>();
+        Set<String> seen = new LinkedHashSet<>();
+        Set<String> duplicated = new LinkedHashSet<>();
+        for (Map<String, Object> config : configs) {
+            String eventSource = String.valueOf(config.get("EventSource"));
+            if (!hasLogDestination(config)) {
+                withoutDestination.add(eventSource);
+            }
+            if (!seen.add(eventSource)) {
+                duplicated.add(eventSource);
+            }
+        }
+
+        StringBuilder message = new StringBuilder();
+        if (!withoutDestination.isEmpty()) {
+            message.append(" Following event sources in request have no destination: ")
+                    .append(new ArrayList<>(withoutDestination)).append(".");
+        }
+        if (!duplicated.isEmpty()) {
+            message.append(" Following event sources appear more then once in a request: ")
+                    .append(new ArrayList<>(duplicated)).append(".");
+        }
+        if (!message.isEmpty()) {
+            throw new AwsException("InvalidParameterException", "Request validation Failed." + message, 400);
+        }
+    }
+
+    private AwsException validationErrors(List<String> errors) {
+        String header = errors.size() == 1
+                ? "1 validation error detected: "
+                : errors.size() + " validation errors detected: ";
+        return new AwsException("InvalidParameterException", header + String.join("; ", errors), 400);
+    }
+
+    /** Mirrors the request model's {@code toString}, which AWS embeds in the length-constraint message. */
+    private String renderLogConfigurations(List<Map<String, Object>> configs) {
+        List<String> rendered = new ArrayList<>();
+        for (Map<String, Object> config : configs) {
+            rendered.add("LogConfigurationType(logLevel=" + config.get("LogLevel")
+                    + ", eventSource=" + config.get("EventSource")
+                    + ", cloudWatchLogsConfiguration=" + renderLogDestination(
+                            config.get("CloudWatchLogsConfiguration"), "CloudWatchLogsConfigurationType",
+                            "LogGroupArn", "logGroupArn")
+                    + ", s3Configuration=" + renderLogDestination(
+                            config.get("S3Configuration"), "S3ConfigurationType", "BucketArn", "bucketArn")
+                    + ", firehoseConfiguration=" + renderLogDestination(
+                            config.get("FirehoseConfiguration"), "FirehoseConfigurationType",
+                            "StreamArn", "streamArn")
+                    + ")");
+        }
+        return "[" + String.join(", ", rendered) + "]";
+    }
+
+    private String renderLogDestination(Object value, String typeName, String requestMember, String modelMember) {
+        if (!(value instanceof Map<?, ?> destination)) {
+            return "null";
+        }
+        return typeName + "(" + modelMember + "=" + destination.get(requestMember) + ")";
+    }
+
+    private boolean hasLogDestination(Map<String, Object> config) {
+        return config.get("CloudWatchLogsConfiguration") != null
+                || config.get("FirehoseConfiguration") != null
+                || config.get("S3Configuration") != null;
+    }
+
+    /** AWS reports the offending member with a 1-based index, e.g. {@code logConfigurations.1.member.logLevel}. */
+    private void collectLogMemberError(List<String> errors, Object value, Set<String> allowed, int index,
+                                       String member, String enumSet) {
+        if (value == null || !allowed.contains(String.valueOf(value))) {
+            errors.add("Value '" + value + "' at 'logConfigurations." + (index + 1) + ".member." + member
+                    + "' failed to satisfy constraint: Member must satisfy enum value set: " + enumSet);
+        }
+    }
+
     // ──────────────────────────── Users ────────────────────────────
 
     public CognitoUser adminCreateUser(String userPoolId, String username, Map<String, String> attributes,
@@ -850,63 +2028,124 @@ public class CognitoService implements ResourceProvider {
                                        String temporaryPassword,
                                        String messageAction,
                                        boolean forceAliasCreation) {
-        UserPool pool = describeUserPool(userPoolId);
-        boolean resend = "RESEND".equalsIgnoreCase(messageAction);
-        boolean aliasPool = usesAliasUsernames(pool);
+        return adminCreateUser(userPoolId, username, attributes, temporaryPassword, messageAction,
+                forceAliasCreation, Map.of(), Map.of());
+    }
 
+    /**
+     * AdminCreateUser with the request's {@code ValidationData} and {@code ClientMetadata}, which
+     * reach only the PreSignUp trigger and are never stored.
+     */
+    public CognitoUser adminCreateUser(String userPoolId,
+                                       String username,
+                                       Map<String, String> attributes,
+                                       String temporaryPassword,
+                                       String messageAction,
+                                       boolean forceAliasCreation,
+                                       Map<String, String> validationData,
+                                       Map<String, String> clientMetadata) {
+        // Locked on the requested username/alias (not yet resolved to a canonical id, since
+        // an alias pool doesn't have one until creation), so two concurrent requests for the
+        // same identifier can't both pass the existence/alias check and create duplicates.
+        Object lock = userLock(userPoolId, username);
+        if ("RESEND".equalsIgnoreCase(messageAction)) {
+            synchronized (lock) {
+                return resendInvitationUnderUserLock(userPoolId, username);
+            }
+        }
+
+        // The PreSignUp trigger runs with no lock held: its function can call back into the pool,
+        // and a call that needs the same lock stripe would wait until the invocation timed out.
+        // A taken username or alias is refused before the trigger sees the request, and checked
+        // again under the lock once the trigger accepts, since users can change while it runs.
+        UserPool pool = describeUserPool(userPoolId);
+        // Claimed before the username is checked, so an overlapping request for it is refused here
+        // rather than passing the check while this one is in its trigger and invoking the trigger
+        // again. That includes a function calling back for the username it was given.
+        String inFlightKey = userKey(userPoolId, username);
+        if (!adminCreatesInFlight.add(inFlightKey)) {
+            throw new AwsException("UsernameExistsException", "User already exists", 400);
+        }
+        try {
+            aliasHolderToMove(pool, username, forceAliasCreation);
+            CognitoUser user = newAdminCreatedUser(pool, username, attributes, temporaryPassword);
+
+            // Before anything is stored, so a trigger that refuses the user leaves the pool unchanged,
+            // including the alias a ForceAliasCreation request would move.
+            authFlowHandler.firePreSignUpForAdminCreateUser(pool, user, validationData, clientMetadata);
+
+            synchronized (lock) {
+                return storeAdminCreatedUserUnderUserLock(userPoolId, username, forceAliasCreation, user);
+            }
+        } finally {
+            adminCreatesInFlight.remove(inFlightKey);
+        }
+    }
+
+    private CognitoUser resendInvitationUnderUserLock(String userPoolId, String username) {
+        UserPool pool = describeUserPool(userPoolId);
+        CognitoUser existing = userStore.get(userKey(userPoolId, username)).orElse(null);
+        if (usesAliasUsernames(pool) && existing == null) {
+            existing = findUserByAlias(userPoolId, aliasAttributeForValue(pool, username), username);
+        }
+        if (existing == null) {
+            throw new AwsException("UserNotFoundException", "User not found", 400);
+        }
+        if (!"FORCE_CHANGE_PASSWORD".equals(existing.getUserStatus())) {
+            final String userStateExceptionMessage = """
+                    User is in %s state and cannot be resent an invitation.
+                    """.formatted(existing.getUserStatus());
+            throw new AwsException("UnsupportedUserStateException", userStateExceptionMessage, 400);
+        }
+        existing.setLastModifiedDate(System.currentTimeMillis() / 1000L);
+        userStore.put(userKey(userPoolId, existing.getUsername()), existing);
+        LOG.infov("Resent invitation for user {0} in pool {1}", existing.getUsername(), userPoolId);
+        return existing;
+    }
+
+    /**
+     * The user whose verified alias an AdminCreateUser for {@code username} moves to the new user,
+     * or null when no user has that username or alias. Throws when one does and the request
+     * cannot take it: {@code UsernameExistsException} for a username or an unverified alias, and
+     * {@code AliasExistsException} for a verified alias without ForceAliasCreation.
+     */
+    private CognitoUser aliasHolderToMove(UserPool pool, String username, boolean forceAliasCreation) {
+        CognitoUser existing = userStore.get(userKey(pool.getId(), username)).orElse(null);
+        String aliasAttribute = null;
+        if (usesAliasUsernames(pool) && existing == null) {
+            aliasAttribute = aliasAttributeForValue(pool, username);
+            existing = findUserByAlias(pool.getId(), aliasAttribute, username);
+        }
+        if (existing == null) {
+            return null;
+        }
+        boolean existingAliasVerified = aliasAttribute != null
+                && "true".equalsIgnoreCase(existing.getAttributes().get(aliasAttribute + "_verified"));
+        if (!existingAliasVerified) {
+            throw new AwsException("UsernameExistsException", "User already exists", 400);
+        }
+        if (!forceAliasCreation) {
+            throw new AwsException("AliasExistsException",
+                    "An account with the given " + aliasAttribute + " already exists.", 400);
+        }
+        return existing;
+    }
+
+    private CognitoUser newAdminCreatedUser(UserPool pool, String username, Map<String, String> attributes,
+                                            String temporaryPassword) {
         Map<String, String> resolvedAttributes = attributes == null
                 ? new HashMap<>() : new HashMap<>(attributes);
 
-        CognitoUser existing = userStore.get(userKey(userPoolId, username)).orElse(null);
-        String aliasAttribute = null;
-        if (aliasPool && existing == null) {
-            aliasAttribute = aliasAttributeForValue(pool, username);
-            existing = findUserByAlias(userPoolId, aliasAttribute, username);
-        }
-
-        if (resend) {
-            if (existing == null) {
-                throw new AwsException("UserNotFoundException", "User not found", 400);
-            }
-            if (!"FORCE_CHANGE_PASSWORD".equals(existing.getUserStatus())) {
-                final String userStateExceptionMessage = """
-                        User is in %s state and cannot be resent an invitation.
-                        """.formatted(existing.getUserStatus());
-                throw new AwsException("UnsupportedUserStateException", userStateExceptionMessage, 400);
-            }
-            existing.setLastModifiedDate(System.currentTimeMillis() / 1000L);
-            userStore.put(userKey(userPoolId, existing.getUsername()), existing);
-            LOG.infov("Resent invitation for user {0} in pool {1}", existing.getUsername(), userPoolId);
-            return existing;
-        }
-
-        if (existing != null) {
-            boolean existingAliasVerified = aliasAttribute != null
-                    && "true".equalsIgnoreCase(existing.getAttributes().get(aliasAttribute + "_verified"));
-            if (existingAliasVerified) {
-                if (!forceAliasCreation) {
-                    throw new AwsException("AliasExistsException",
-                            "An account with the given " + aliasAttribute + " already exists.", 400);
-                }
-                existing.getAttributes().remove(aliasAttribute);
-                existing.getAttributes().put(aliasAttribute + "_verified", "false");
-                existing.setLastModifiedDate(System.currentTimeMillis() / 1000L);
-                userStore.put(userKey(userPoolId, existing.getUsername()), existing);
-            } else {
-                throw new AwsException("UsernameExistsException", "User already exists", 400);
-            }
-        }
-
         String canonicalUsername = username;
-        if (aliasPool) {
-            resolvedAttributes.put(aliasAttribute, username);
+        if (usesAliasUsernames(pool)) {
+            resolvedAttributes.put(aliasAttributeForValue(pool, username), username);
             canonicalUsername = UUID.randomUUID().toString();
             resolvedAttributes.put("sub", canonicalUsername);
         }
 
         CognitoUser user = new CognitoUser();
         user.setUsername(canonicalUsername);
-        user.setUserPoolId(userPoolId);
+        user.setUserPoolId(pool.getId());
         user.getAttributes().putAll(resolvedAttributes);
 
         // Ensure sub attribute is present
@@ -919,13 +2158,38 @@ public class CognitoService implements ResourceProvider {
             user.setTemporaryPassword(true);
             user.setUserStatus("FORCE_CHANGE_PASSWORD");
         }
+        return user;
+    }
 
-        userStore.put(userKey(userPoolId, canonicalUsername), user);
-        LOG.infov("Created user {0} in pool {1}", canonicalUsername, userPoolId);
+    private CognitoUser storeAdminCreatedUserUnderUserLock(String userPoolId, String username,
+                                                           boolean forceAliasCreation, CognitoUser user) {
+        // Read again under the lock rather than reused from before the trigger: while it ran, the
+        // pool may have been deleted, another request may have taken the username or alias, and
+        // the alias holder may have been updated or deleted, which writing back an earlier read
+        // would undo.
+        UserPool pool = describeUserPool(userPoolId);
+        CognitoUser aliasHolder = aliasHolderToMove(pool, username, forceAliasCreation);
+        if (aliasHolder != null) {
+            String aliasAttribute = aliasAttributeForValue(pool, username);
+            aliasHolder.getAttributes().remove(aliasAttribute);
+            aliasHolder.getAttributes().put(aliasAttribute + "_verified", "false");
+            aliasHolder.setLastModifiedDate(System.currentTimeMillis() / 1000L);
+            userStore.put(userKey(userPoolId, aliasHolder.getUsername()), aliasHolder);
+        }
+
+        userStore.put(userKey(userPoolId, user.getUsername()), user);
+        LOG.infov("Created user {0} in pool {1}", user.getUsername(), userPoolId);
         return user;
     }
 
     void adminCreateMigratedUser(String userPoolId, String username, String password,
+                                  Map<String, String> attributes, String finalUserStatus) {
+        synchronized (userLock(userPoolId, username)) {
+            adminCreateMigratedUserUnderUserLock(userPoolId, username, password, attributes, finalUserStatus);
+        }
+    }
+
+    private void adminCreateMigratedUserUnderUserLock(String userPoolId, String username, String password,
                                   Map<String, String> attributes, String finalUserStatus) {
         UserPool pool = describeUserPool(userPoolId);
         boolean aliasPool = usesAliasUsernames(pool);
@@ -987,27 +2251,17 @@ public class CognitoService implements ResourceProvider {
                     "1 validation error detected: Value at 'accessToken' failed to satisfy constraint: Member must not be null", 400);
         }
 
-        String username = extractUsernameFromToken(accessToken);
-        String poolId = extractPoolIdFromToken(accessToken);
-        String jti = extractJtiFromToken(accessToken);
-
-        if (username == null || poolId == null || jti == null) {
-            throw new AwsException("NotAuthorizedException", "Invalid access token", 400);
-        }
-
-        // A token that was already revoked (or issued before an earlier sign-out) cannot
-        // authorize a fresh sign-out.
-        validateTokenNotRevoked(jti, poolId, "access");
-        Long iat = extractIatFromToken(accessToken);
-        validateUserNotGloballySignedOut(username, poolId, "access", iat != null ? iat : 0L);
-
+        VerifiedAccessToken token = verifyAccessToken(accessToken);
+        requireScope(accessToken, USER_ADMIN_SCOPE);
+        String username = token.username();
+        String poolId = token.poolId();
         CognitoUser user;
         try {
             user = adminGetUser(poolId, username);
         } catch (AwsException e) {
             if ("UserNotFoundException".equals(e.getErrorCode())
                     || "ResourceNotFoundException".equals(e.getErrorCode())) {
-                throw new AwsException("NotAuthorizedException", "Invalid access token", 400);
+                throw new AwsException("NotAuthorizedException", INVALID_ACCESS_TOKEN_MESSAGE, 400);
             }
             throw e;
         }
@@ -1017,9 +2271,37 @@ public class CognitoService implements ResourceProvider {
         LOG.infov("GlobalSignOut: revoked all tokens for user {0} in pool {1}", user.getUsername(), poolId);
     }
 
+    /**
+     * DeleteUser: the self-service counterpart to AdminDeleteUser, authenticated with the caller's
+     * access token instead of admin credentials. Deletes the user profile and removes them from all
+     * groups, matching AWS behavior.
+     */
+    public void deleteUser(String accessToken) {
+        if (accessToken == null || accessToken.isEmpty()) {
+            throw new AwsException("InvalidParameterException",
+                    "1 validation error detected: Value at 'accessToken' failed to satisfy constraint: Member must not be null", 400);
+        }
+
+        VerifiedAccessToken token = verifyAccessToken(accessToken);
+        requireScope(accessToken, USER_ADMIN_SCOPE);
+        String username = token.username();
+        String poolId = token.poolId();
+        try {
+            adminDeleteUser(poolId, username);
+        } catch (AwsException e) {
+            if ("UserNotFoundException".equals(e.getErrorCode())
+                    || "ResourceNotFoundException".equals(e.getErrorCode())) {
+                throw new AwsException("NotAuthorizedException", INVALID_ACCESS_TOKEN_MESSAGE, 400);
+            }
+            throw e;
+        }
+
+        LOG.infov("DeleteUser: deleted user {0} in pool {1}", username, poolId);
+    }
+
     public CognitoUser adminGetUser(String userPoolId, String username) {
         UserPool pool = poolStore.get(userPoolId).orElseThrow(
-                () -> new AwsException("ResourceNotFoundException", "User pool not found", 400));
+                () -> userPoolNotFound(userPoolId));
         LinkedHashMap<String, CognitoUser> matches = new LinkedHashMap<>();
         userStore.get(userKey(userPoolId, username))
                 .ifPresent(u -> matches.put(u.getUsername(), u));
@@ -1038,6 +2320,13 @@ public class CognitoService implements ResourceProvider {
     }
 
     public void adminDeleteUser(String userPoolId, String username) {
+        CognitoUser resolvedUser = adminGetUser(userPoolId, username);
+        synchronized (userLock(userPoolId, resolvedUser.getUsername())) {
+            adminDeleteUserUnderUserLock(userPoolId, resolvedUser.getUsername());
+        }
+    }
+
+    private void adminDeleteUserUnderUserLock(String userPoolId, String username) {
         CognitoUser user = adminGetUser(userPoolId, username);
         for (String groupName : new ArrayList<>(user.getGroupNames())) {
             groupStore.get(groupKey(userPoolId, groupName)).ifPresent(group -> {
@@ -1050,6 +2339,14 @@ public class CognitoService implements ResourceProvider {
     }
 
     public void adminSetUserPassword(String userPoolId, String username, String password, boolean permanent) {
+        CognitoUser resolvedUser = adminGetUser(userPoolId, username);
+        synchronized (userLock(userPoolId, resolvedUser.getUsername())) {
+            adminSetUserPasswordUnderUserLock(userPoolId, resolvedUser.getUsername(), password, permanent);
+        }
+    }
+
+    private void adminSetUserPasswordUnderUserLock(String userPoolId, String username, String password,
+                                                    boolean permanent) {
         CognitoUser user = adminGetUser(userPoolId, username);
         updateUserPassword(user, password);
         user.setTemporaryPassword(!permanent);
@@ -1060,6 +2357,15 @@ public class CognitoService implements ResourceProvider {
     }
 
     public void adminUpdateUserAttributes(String userPoolId, String username, Map<String, String> attributes) {
+        CognitoUser resolvedUser = adminGetUser(userPoolId, username);
+        synchronized (userLock(userPoolId, resolvedUser.getUsername())) {
+            adminUpdateUserAttributesUnderUserLock(
+                    userPoolId, resolvedUser.getUsername(), attributes);
+        }
+    }
+
+    private void adminUpdateUserAttributesUnderUserLock(
+            String userPoolId, String username, Map<String, String> attributes) {
         CognitoUser user = adminGetUser(userPoolId, username);
         UserPool pool = describeUserPool(userPoolId);
         if (usesAliasUsernames(pool)) {
@@ -1075,15 +2381,27 @@ public class CognitoService implements ResourceProvider {
                 }
             }
         }
+        attributes.keySet().forEach(attributeName ->
+                clearPendingAttributeVerification(userPoolId, user, attributeName));
         user.getAttributes().putAll(attributes);
         user.setLastModifiedDate(System.currentTimeMillis() / 1000L);
         userStore.put(userKey(userPoolId, user.getUsername()), user);
     }
 
     public void adminDeleteUserAttributes(String userPoolId, String username, List<String> attributeNames) {
+        CognitoUser resolvedUser = adminGetUser(userPoolId, username);
+        synchronized (userLock(userPoolId, resolvedUser.getUsername())) {
+            adminDeleteUserAttributesUnderUserLock(
+                    userPoolId, resolvedUser.getUsername(), attributeNames);
+        }
+    }
+
+    private void adminDeleteUserAttributesUnderUserLock(
+            String userPoolId, String username, List<String> attributeNames) {
         CognitoUser user = adminGetUser(userPoolId, username);
         for (String attrName : attributeNames) {
             user.getAttributes().remove(attrName);
+            clearPendingAttributeVerification(userPoolId, user, attrName);
         }
         user.setLastModifiedDate(System.currentTimeMillis() / 1000L);
         userStore.put(userKey(userPoolId, user.getUsername()), user);
@@ -1091,6 +2409,13 @@ public class CognitoService implements ResourceProvider {
     }
 
     public void adminEnableUser(String userPoolId, String username) {
+        CognitoUser resolvedUser = adminGetUser(userPoolId, username);
+        synchronized (userLock(userPoolId, resolvedUser.getUsername())) {
+            adminEnableUserUnderUserLock(userPoolId, resolvedUser.getUsername());
+        }
+    }
+
+    private void adminEnableUserUnderUserLock(String userPoolId, String username) {
         CognitoUser user = adminGetUser(userPoolId, username);
         user.setEnabled(true);
         user.setLastModifiedDate(System.currentTimeMillis() / 1000L);
@@ -1099,6 +2424,13 @@ public class CognitoService implements ResourceProvider {
     }
 
     public void adminDisableUser(String userPoolId, String username) {
+        CognitoUser resolvedUser = adminGetUser(userPoolId, username);
+        synchronized (userLock(userPoolId, resolvedUser.getUsername())) {
+            adminDisableUserUnderUserLock(userPoolId, resolvedUser.getUsername());
+        }
+    }
+
+    private void adminDisableUserUnderUserLock(String userPoolId, String username) {
         CognitoUser user = adminGetUser(userPoolId, username);
         user.setEnabled(false);
         user.setLastModifiedDate(System.currentTimeMillis() / 1000L);
@@ -1107,11 +2439,31 @@ public class CognitoService implements ResourceProvider {
     }
 
     public void adminResetUserPassword(String userPoolId, String username) {
+        UserPool pool = describeUserPool(userPoolId);
+        if (accountRecoveryMechanisms(pool).contains("admin_only")) {
+            throw new AwsException("NotAuthorizedException",
+                    "This userpool does not have password recovery mechanism, the administrator must set a new password.",
+                    400);
+        }
+        CognitoUser resolvedUser = adminGetUser(userPoolId, username);
+        synchronized (userLock(userPoolId, resolvedUser.getUsername())) {
+            adminResetUserPasswordUnderUserLock(userPoolId, resolvedUser.getUsername());
+        }
+    }
+
+    private void adminResetUserPasswordUnderUserLock(String userPoolId, String username) {
         CognitoUser user = adminGetUser(userPoolId, username);
+        UserPool pool = describeUserPool(userPoolId);
+        String outgoingPasswordHash = user.getPasswordHash();
         user.setUserStatus("RESET_REQUIRED");
         user.setPasswordHash(null);
         user.setSrpVerifier(null);
         user.setSrpSalt(null);
+        // Archive the outgoing password now that the current slot is actually clear, so
+        // updatePasswordHistory retains a full PasswordHistorySize entries rather than n-1 --
+        // otherwise the reset would itself age the oldest still-protected password out of the
+        // window. A reset cannot be used to bypass PasswordHistorySize this way.
+        updatePasswordHistory(pool, user, outgoingPasswordHash);
         user.setLastModifiedDate(System.currentTimeMillis() / 1000L);
         userStore.put(userKey(userPoolId, user.getUsername()), user);
         LOG.infov("Reset password for user {0} in pool {1}", user.getUsername(), userPoolId);
@@ -1119,6 +2471,15 @@ public class CognitoService implements ResourceProvider {
 
     // Serializes adminLinkProviderForUser's check-then-write.
     private final Object identityLinkLock = new Object();
+
+    // Identity provider mutations are read-modify-write (update) and check-then-act
+    // (create, delete). AWS applies each of those atomically, so two overlapping
+    // updates that touch different optional members both survive there. Guarding
+    // every mutating path with one lock reproduces that.
+    private final Object identityProviderLock = new Object();
+
+    // Domain creation is check-then-act across every account's keys; see createUserPoolDomain.
+    private final Object domainLock = new Object();
 
     public void adminLinkProviderForUser(String userPoolId, String destinationUsername,
             String sourceProviderName, String sourceUserId) {
@@ -1135,10 +2496,20 @@ public class CognitoService implements ResourceProvider {
                     "SourceUser.ProviderAttributeValue is required.", 400);
         }
 
+        CognitoUser resolvedUser = adminGetUser(userPoolId, destinationUsername);
+        synchronized (userLock(userPoolId, resolvedUser.getUsername())) {
+            adminLinkProviderForUserUnderUserLock(userPoolId, resolvedUser.getUsername(),
+                    sourceProviderName, sourceUserId);
+        }
+    }
+
+    private void adminLinkProviderForUserUnderUserLock(String userPoolId, String destinationUsername,
+            String sourceProviderName, String sourceUserId) {
         // The uniqueness check and the write must not interleave with another
         // link of the same source identity. The UserPool object cannot serve as
         // the monitor — updateUserPool replaces the stored instance — so links
-        // serialize on a dedicated lock.
+        // serialize on a dedicated lock in addition to the per-user lock above,
+        // since the uniqueness check spans every user in the pool, not just this one.
         synchronized (identityLinkLock) {
             CognitoUser user = adminGetUser(userPoolId, destinationUsername);
             String prefix = userPoolId + "::";
@@ -1193,7 +2564,61 @@ public class CognitoService implements ResourceProvider {
         return MAPPER.createArrayNode();
     }
 
+    public Optional<CognitoUser> findFederatedUser(String userPoolId, String providerName, String subject) {
+        describeUserPool(userPoolId);
+        String prefix = userPoolId + "::";
+        return userStore.scan(key -> key.startsWith(prefix)).stream()
+                .filter(user -> providerName.equals(user.getFederatedProviderName())
+                        && subject.equals(user.getFederatedSubject()))
+                .findFirst();
+    }
+
+    public CognitoUser provisionFederatedUser(String userPoolId, IdentityProvider provider, String subject,
+                                               String issuer, Map<String, String> mappedAttributes) {
+        describeUserPool(userPoolId);
+        synchronized (identityLinkLock) {
+            CognitoUser user = findFederatedUser(userPoolId, provider.getProviderName(), subject).orElse(null);
+            if (user == null) {
+                user = new CognitoUser();
+                user.setUsername(provider.getProviderName() + "_" + UUID.randomUUID());
+                user.setUserPoolId(userPoolId);
+                user.getAttributes().put("sub", UUID.randomUUID().toString());
+            }
+            user.getAttributes().putAll(mappedAttributes);
+            user.setFederatedProviderName(provider.getProviderName());
+            user.setFederatedSubject(subject);
+            updateFederatedIdentity(user, provider, subject, issuer);
+            user.setEnabled(true);
+            user.setUserStatus("CONFIRMED");
+            user.setLastModifiedDate(System.currentTimeMillis() / 1000L);
+            userStore.put(userKey(userPoolId, user.getUsername()), user);
+            LOG.infov("Reconciled federated user {0} from provider {1} in pool {2}",
+                    user.getUsername(), provider.getProviderName(), userPoolId);
+            return user;
+        }
+    }
+
+    private void updateFederatedIdentity(CognitoUser user, IdentityProvider provider, String subject, String issuer) {
+        ArrayNode identities = readIdentities(user);
+        ArrayNode reconciled = MAPPER.createArrayNode();
+        for (JsonNode identity : identities) {
+            if (!provider.getProviderName().equals(identity.path("providerName").asText())
+                    || !subject.equals(identity.path("userId").asText())) {
+                reconciled.add(identity);
+            }
+        }
+        reconciled.addObject()
+                .put("userId", subject)
+                .put("providerName", provider.getProviderName())
+                .put("providerType", provider.getProviderType())
+                .put("issuer", issuer)
+                .put("primary", false)
+                .put("dateCreated", System.currentTimeMillis());
+        user.getAttributes().put(IDENTITIES_ATTRIBUTE, reconciled.toString());
+    }
+
     public List<CognitoUser> listUsers(String userPoolId, String filter) {
+        describeUserPool(userPoolId);
         String prefix = userPoolId + "::";
         List<CognitoUser> all = userStore.scan(k -> k.startsWith(prefix));
         if (filter == null || filter.isBlank()) {
@@ -1231,6 +2656,188 @@ public class CognitoService implements ResourceProvider {
             case "cognito:user_status", "status" -> user.getUserStatus();
             default -> user.getAttributes().get(attrName);
         };
+    }
+
+    // ──────────────────────────── Managed Login Branding ────────────────────────────
+
+    private static final Pattern BRANDING_ID_PATTERN = Pattern.compile(
+            "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[4][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$");
+    private static final int MAX_BRANDING_ASSETS = 40;
+
+    public ManagedLoginBranding createManagedLoginBranding(String userPoolId, String clientId,
+                                                           Boolean useCognitoProvidedValues,
+                                                           Map<String, Object> settings,
+                                                           List<Map<String, Object>> assets) {
+        List<String> errors = new ArrayList<>();
+        collectAssetsLengthError(errors, assets);
+        throwBrandingValidationErrors(errors);
+
+        UserPoolClient client = describeUserPoolClient(userPoolId, clientId);
+        validateBrandingSource(useCognitoProvidedValues, settings);
+        if (client.getManagedLoginBranding() != null) {
+            throw new AwsException("ManagedLoginBrandingExistsException",
+                    "A ManagedLoginBranding already exists for client " + clientId, 400);
+        }
+
+        ManagedLoginBranding branding = new ManagedLoginBranding();
+        branding.setManagedLoginBrandingId(UUID.randomUUID().toString());
+        branding.setUserPoolId(userPoolId);
+        branding.setUseCognitoProvidedValues(Boolean.TRUE.equals(useCognitoProvidedValues));
+        branding.setSettings(settings);
+        branding.setAssets(assets);
+        client.setManagedLoginBranding(branding);
+        clientStore.put(clientId, client);
+        return branding;
+    }
+
+    public ManagedLoginBranding describeManagedLoginBranding(String userPoolId, String brandingId) {
+        List<String> errors = new ArrayList<>();
+        collectBrandingIdError(errors, brandingId);
+        throwBrandingValidationErrors(errors);
+
+        describeUserPool(userPoolId);
+        return findBrandingClient(userPoolId, brandingId).getManagedLoginBranding();
+    }
+
+    public ManagedLoginBranding describeManagedLoginBrandingByClient(String userPoolId, String clientId) {
+        UserPoolClient client = describeUserPoolClient(userPoolId, clientId);
+        ManagedLoginBranding branding = client.getManagedLoginBranding();
+        if (branding == null) {
+            throw new AwsException("ResourceNotFoundException",
+                    "ManagedLoginBranding for client " + clientId + " does not exist.", 400);
+        }
+        return branding;
+    }
+
+    /**
+     * Members the request omits are left as they were, matching the identity provider update
+     * semantics; an explicitly empty list or map is what clears them.
+     */
+    public ManagedLoginBranding updateManagedLoginBranding(String userPoolId, String brandingId,
+                                                           Boolean useCognitoProvidedValues,
+                                                           Map<String, Object> settings,
+                                                           List<Map<String, Object>> assets) {
+        List<String> errors = new ArrayList<>();
+        collectAssetsLengthError(errors, assets);
+        collectBrandingIdError(errors, brandingId);
+        throwBrandingValidationErrors(errors);
+
+        describeManagedLoginBranding(userPoolId, brandingId);
+        validateBrandingSource(useCognitoProvidedValues, settings);
+        UserPoolClient client = findBrandingClient(userPoolId, brandingId);
+        ManagedLoginBranding branding = client.getManagedLoginBranding();
+
+        if (useCognitoProvidedValues != null) {
+            branding.setUseCognitoProvidedValues(useCognitoProvidedValues);
+        }
+        if (settings != null) {
+            branding.setSettings(settings);
+        }
+        if (assets != null) {
+            branding.setAssets(assets);
+        }
+        branding.setLastModifiedDate(System.currentTimeMillis() / 1000L);
+        clientStore.put(client.getClientId(), client);
+        return branding;
+    }
+
+    /**
+     * A branding request must select exactly one source of branding, and the same rule
+     * applies to create and to update. Measured against Cognito in ap-southeast-1:
+     *
+     * <pre>
+     * useCognitoProvidedValues  settings   result
+     * absent                    absent     InvalidParameterException
+     * true                      absent     accepted
+     * false                     absent     InvalidParameterException
+     * absent                    present    accepted
+     * true                      present    InvalidParameterException
+     * false                     present    accepted
+     * </pre>
+     *
+     * <p>So the member being present is not what counts: {@code false} selects no source,
+     * which is why it is rejected unless settings supply one.
+     */
+    private void validateBrandingSource(Boolean useCognitoProvidedValues, Map<String, Object> settings) {
+        if (Boolean.TRUE.equals(useCognitoProvidedValues) == (settings != null)) {
+            throw new AwsException("InvalidParameterException",
+                    "useCognitoProvidedValues or settings should be specified (but not both)", 400);
+        }
+    }
+
+    /**
+     * The shape checks AWS runs before it looks anything up, so an oversized asset list against a
+     * client or a branding id that does not exist reports the request problem rather than the
+     * missing resource. Measured against Cognito in ap-southeast-1: 41 assets with an unknown
+     * client reports the asset list, and 41 assets with a malformed branding id reports both, the
+     * asset list first.
+     */
+    private void collectAssetsLengthError(List<String> errors, List<Map<String, Object>> assets) {
+        if (assets != null && assets.size() > MAX_BRANDING_ASSETS) {
+            errors.add("Value '" + renderAssets(assets) + "' at 'assets' failed to satisfy constraint: "
+                    + "Member must have length less than or equal to " + MAX_BRANDING_ASSETS);
+        }
+    }
+
+    private void collectBrandingIdError(List<String> errors, String brandingId) {
+        if (brandingId == null || !BRANDING_ID_PATTERN.matcher(brandingId).matches()) {
+            errors.add("Value '" + brandingId + "' at 'managedLoginBrandingId' failed to satisfy "
+                    + "constraint: Member must satisfy regular expression pattern: "
+                    + BRANDING_ID_PATTERN.pattern());
+        }
+    }
+
+    private void throwBrandingValidationErrors(List<String> errors) {
+        if (errors.isEmpty()) {
+            return;
+        }
+        String header = errors.size() == 1
+                ? "1 validation error detected: "
+                : errors.size() + " validation errors detected: ";
+        throw new AwsException("InvalidParameterException", header + String.join("; ", errors), 400);
+    }
+
+    /** Mirrors the request model's {@code toString}, which AWS embeds in the length-constraint message. */
+    private String renderAssets(List<Map<String, Object>> assets) {
+        List<String> rendered = new ArrayList<>();
+        for (Map<String, Object> asset : assets) {
+            rendered.add("AssetType(category=" + asset.get("Category")
+                    + ", colorMode=" + asset.get("ColorMode")
+                    + ", extension=" + asset.get("Extension")
+                    + ", bytes=" + renderAssetBytes(asset.get("Bytes"))
+                    + ", resourceId=" + asset.get("ResourceId") + ")");
+        }
+        return "[" + String.join(", ", rendered) + "]";
+    }
+
+    /**
+     * AWS renders the blob as the buffer it decoded, so the reported length is the decoded byte
+     * count rather than the base64 string's. The lenient decoder is deliberate: this runs while
+     * building a rejection, and must not raise a second failure of its own.
+     */
+    private String renderAssetBytes(Object bytes) {
+        if (bytes == null) {
+            return "null";
+        }
+        int length = Base64.getMimeDecoder().decode(String.valueOf(bytes)).length;
+        return "java.nio.HeapByteBuffer[pos=0 lim=" + length + " cap=" + length + "]";
+    }
+
+    public void deleteManagedLoginBranding(String userPoolId, String brandingId) {
+        describeManagedLoginBranding(userPoolId, brandingId);
+        UserPoolClient client = findBrandingClient(userPoolId, brandingId);
+        client.setManagedLoginBranding(null);
+        clientStore.put(client.getClientId(), client);
+    }
+
+    private UserPoolClient findBrandingClient(String userPoolId, String brandingId) {
+        return clientStore.scan(k -> true).stream()
+                .filter(c -> userPoolId.equals(c.getUserPoolId())
+                        && c.getManagedLoginBranding() != null
+                        && brandingId.equals(c.getManagedLoginBranding().getManagedLoginBrandingId()))
+                .findFirst()
+                .orElseThrow(() -> new AwsException("ResourceNotFoundException",
+                        "ManagedLoginBranding does not exist.", 400));
     }
 
     // ──────────────────────────── Groups ────────────────────────────
@@ -1273,13 +2880,19 @@ public class CognitoService implements ResourceProvider {
     public void deleteGroup(String userPoolId, String groupName) {
         CognitoGroup group = getGroup(userPoolId, groupName);
         long now = System.currentTimeMillis() / 1000L;
+        // Each member is locked individually, one at a time, rather than holding every
+        // member's lock for the duration of the loop: this method never needs more than one
+        // user's invariant held at once, and locking them one at a time avoids having to
+        // reason about lock ordering across members.
         for (String username : new ArrayList<>(group.getUserNames())) {
-            userStore.get(userKey(userPoolId, username)).ifPresent(user -> {
-                if (user.getGroupNames().remove(groupName)) {
-                    user.setLastModifiedDate(now);
-                    userStore.put(userKey(userPoolId, user.getUsername()), user);
-                }
-            });
+            synchronized (userLock(userPoolId, username)) {
+                userStore.get(userKey(userPoolId, username)).ifPresent(user -> {
+                    if (user.getGroupNames().remove(groupName)) {
+                        user.setLastModifiedDate(now);
+                        userStore.put(userKey(userPoolId, user.getUsername()), user);
+                    }
+                });
+            }
         }
         groupStore.delete(groupKey(userPoolId, groupName));
         LOG.infov("Deleted Cognito group: {0} from pool {1}", groupName, userPoolId);
@@ -1305,6 +2918,13 @@ public class CognitoService implements ResourceProvider {
     }
 
     public void adminAddUserToGroup(String userPoolId, String groupName, String username) {
+        CognitoUser resolvedUser = adminGetUser(userPoolId, username);
+        synchronized (userLock(userPoolId, resolvedUser.getUsername())) {
+            adminAddUserToGroupUnderUserLock(userPoolId, groupName, resolvedUser.getUsername());
+        }
+    }
+
+    private void adminAddUserToGroupUnderUserLock(String userPoolId, String groupName, String username) {
         CognitoGroup group = getGroup(userPoolId, groupName);
         CognitoUser user = adminGetUser(userPoolId, username);
         long now = System.currentTimeMillis() / 1000L;
@@ -1320,6 +2940,13 @@ public class CognitoService implements ResourceProvider {
     }
 
     public void adminRemoveUserFromGroup(String userPoolId, String groupName, String username) {
+        CognitoUser resolvedUser = adminGetUser(userPoolId, username);
+        synchronized (userLock(userPoolId, resolvedUser.getUsername())) {
+            adminRemoveUserFromGroupUnderUserLock(userPoolId, groupName, resolvedUser.getUsername());
+        }
+    }
+
+    private void adminRemoveUserFromGroupUnderUserLock(String userPoolId, String groupName, String username) {
         CognitoGroup group = getGroup(userPoolId, groupName);
         CognitoUser user = adminGetUser(userPoolId, username);
         long now = System.currentTimeMillis() / 1000L;
@@ -1348,6 +2975,15 @@ public class CognitoService implements ResourceProvider {
                 .orElseThrow(() -> new AwsException("ResourceNotFoundException", "Client not found",
                         400));
         String userPoolId = client.getUserPoolId();
+        // Locked on the requested username/alias, same reasoning as adminCreateUser: an alias
+        // pool has no canonical id to lock on until creation succeeds.
+        synchronized (userLock(userPoolId, username)) {
+            return signUpUnderUserLock(client, userPoolId, username, password, attributes);
+        }
+    }
+
+    private CognitoUser signUpUnderUserLock(UserPoolClient client, String userPoolId,
+            String username, String password, Map<String, String> attributes) {
         UserPool pool = describeUserPool(userPoolId);
 
         boolean aliasPool = usesAliasUsernames(pool);
@@ -1414,8 +3050,10 @@ public class CognitoService implements ResourceProvider {
             try {
                 String code = verificationCodeService.issue(pool.getId(), user.getUsername(),
                         VerificationCode.Purpose.SIGNUP_CONFIRMATION, Duration.ofHours(24));
+                Map<String, Object> customMessage = authFlowHandler.fireCustomMessage(
+                        pool, client, user, "CustomMessage_SignUp");
                 messageDispatcher.dispatch(pool, user, VerificationCode.Purpose.SIGNUP_CONFIRMATION,
-                        code, List.of(deliveryTarget.deliveryMedium()));
+                        code, List.of(deliveryTarget.deliveryMedium()), customMessage);
             } catch (VerificationCodeException e) {
                 rollbackSignUpConfirmationArtifacts(pool.getId(), user.getUsername(), key);
                 throw mapVerificationCodeException(e);
@@ -1442,9 +3080,16 @@ public class CognitoService implements ResourceProvider {
         UserPoolClient client = clientStore.get(clientId)
                 .orElseThrow(() -> new AwsException("ResourceNotFoundException", "Client not found",
                         400));
-        UserPool pool = poolStore.get(client.getUserPoolId())
-                .orElseThrow(() -> new AwsException("ResourceNotFoundException",
-                        "User pool not found", 400));
+        String userPoolId = client.getUserPoolId();
+        synchronized (userLock(userPoolId, username)) {
+            confirmSignUpUnderUserLock(client, userPoolId, username, confirmationCode);
+        }
+    }
+
+    private void confirmSignUpUnderUserLock(UserPoolClient client, String userPoolId, String username,
+            String confirmationCode) {
+        UserPool pool = poolStore.get(userPoolId)
+                .orElseThrow(() -> userPoolNotFound(userPoolId));
         CognitoUser user = adminGetUser(client.getUserPoolId(), username);
         if (verificationCodeService != null && isSignUpConfirmationEnabled(pool)) {
             try {
@@ -1455,7 +3100,7 @@ public class CognitoService implements ResourceProvider {
                 throw mapVerificationCodeException(e);
             }
 
-            var signupDeliveryTarget = resolveSignUpDeliveryTarget(pool, user);
+            DeliveryTarget signupDeliveryTarget = resolveSignUpDeliveryTarget(pool, user);
 
             if (signupDeliveryTarget != null) {
                 if ("email".equals(signupDeliveryTarget.attributeName())) {
@@ -1511,8 +3156,10 @@ public class CognitoService implements ResourceProvider {
         try {
             String code = verificationCodeService.issue(pool.getId(), user.getUsername(),
                     VerificationCode.Purpose.SIGNUP_CONFIRMATION, Duration.ofHours(24));
+            Map<String, Object> customMessage = authFlowHandler.fireCustomMessage(
+                    pool, client, user, "CustomMessage_ResendCode");
             messageDispatcher.dispatch(pool, user, VerificationCode.Purpose.SIGNUP_CONFIRMATION,
-                    code, List.of(deliveryTarget.deliveryMedium()));
+                    code, List.of(deliveryTarget.deliveryMedium()), customMessage);
         } catch (VerificationCodeException e) {
             throw mapVerificationCodeException(e);
         } catch (RuntimeException e) {
@@ -1530,6 +3177,13 @@ public class CognitoService implements ResourceProvider {
     }
 
     public void adminConfirmSignUp(String userPoolId, String username) {
+        CognitoUser resolvedUser = adminGetUser(userPoolId, username);
+        synchronized (userLock(userPoolId, resolvedUser.getUsername())) {
+            adminConfirmSignUpUnderUserLock(userPoolId, resolvedUser.getUsername());
+        }
+    }
+
+    private void adminConfirmSignUpUnderUserLock(String userPoolId, String username) {
         CognitoUser user = adminGetUser(userPoolId, username);
         user.setUserStatus("CONFIRMED");
         user.setLastModifiedDate(System.currentTimeMillis() / 1000L);
@@ -1559,6 +3213,28 @@ public class CognitoService implements ResourceProvider {
         return authFlowHandler.adminInitiateAuth(userPoolId, clientId, authFlow, authParameters, clientMetadata);
     }
 
+    /** Managed login's username and password check; see {@link CognitoAuthFlowHandler#authenticateManagedLogin}. */
+    CognitoUser authenticateManagedLogin(UserPoolClient client, String username, String password) {
+        return authFlowHandler.authenticateManagedLogin(describeUserPool(client.getUserPoolId()), client,
+                username, password);
+    }
+
+    /** Managed login's choice-based sign-in; see {@link CognitoAuthFlowHandler#managedLoginFirstFactors}. */
+    List<String> managedLoginFirstFactors(UserPoolClient client) {
+        return authFlowHandler.managedLoginFirstFactors(describeUserPool(client.getUserPoolId()), client);
+    }
+
+    /** See {@link CognitoAuthFlowHandler#startManagedLoginEmailOtp}. */
+    String startManagedLoginEmailOtp(UserPoolClient client, String username) {
+        return authFlowHandler.startManagedLoginEmailOtp(describeUserPool(client.getUserPoolId()), client, username);
+    }
+
+    /** See {@link CognitoAuthFlowHandler#completeManagedLoginEmailOtp}. */
+    CognitoUser completeManagedLoginEmailOtp(UserPoolClient client, String session, String code) {
+        return authFlowHandler.completeManagedLoginEmailOtp(describeUserPool(client.getUserPoolId()), client,
+                session, code);
+    }
+
     public Map<String, Object> respondToAuthChallenge(String clientId, String challengeName,
                                                        String session, Map<String, String> responses) {
         return authFlowHandler.respondToAuthChallenge(clientId, challengeName, session, responses, Map.of());
@@ -1583,20 +3259,67 @@ public class CognitoService implements ResourceProvider {
         return authFlowHandler.adminRespondToAuthChallenge(userPoolId, clientId, challengeName, session, responses, clientMetadata);
     }
 
-    public void changePassword(String accessToken, String previousPassword, String proposedPassword) {
-        String username = extractUsernameFromToken(accessToken);
-        String poolId = extractPoolIdFromToken(accessToken);
-        String jti = extractJtiFromToken(accessToken);
+    public Map<String, Object> associateSoftwareToken(String accessToken, String session) {
+        return authFlowHandler.associateSoftwareToken(accessToken, session);
+    }
 
-        if (username == null || poolId == null) {
-            throw new AwsException("NotAuthorizedException", "Invalid access token", 400);
+    public Map<String, Object> verifySoftwareToken(String accessToken, String session, String userCode) {
+        return authFlowHandler.verifySoftwareToken(accessToken, session, userCode);
+    }
+
+    void beginSoftwareTokenMfa(String poolId, String username, String secret) {
+        synchronized (userLock(poolId, username)) {
+            CognitoUser user = adminGetUser(poolId, username);
+            user.setPendingSoftwareTokenMfaSecret(secret);
+            user.setPendingSoftwareTokenMfaAttemptsRemaining(CognitoTotp.MAX_FAILED_ATTEMPTS);
+            user.setLastModifiedDate(System.currentTimeMillis() / 1000L);
+            userStore.put(userKey(poolId, user.getUsername()), user);
         }
+    }
 
-        validateTokenNotRevoked(jti, poolId, "access");
-        validateOriginJtiNotRevoked(accessToken, poolId);
-        Long iat = extractIatFromToken(accessToken);
-        validateUserNotGloballySignedOut(username, poolId, "access", iat != null ? iat : 0L);
+    boolean activateSoftwareTokenMfa(String poolId, String username, String expectedSecret,
+                                     String code, Instant now) {
+        synchronized (userLock(poolId, username)) {
+            CognitoUser user = adminGetUser(poolId, username);
+            String pending = user.getPendingSoftwareTokenMfaSecret();
+            if (pending == null) {
+                throw new AwsException("InvalidParameterException", "No software token is awaiting verification", 400);
+            }
+            if (expectedSecret != null && !expectedSecret.equals(pending)) {
+                throw new AwsException("NotAuthorizedException", "Software token association has changed", 400);
+            }
+            Integer storedAttempts = user.getPendingSoftwareTokenMfaAttemptsRemaining();
+            int attemptsRemaining = storedAttempts == null ? CognitoTotp.MAX_FAILED_ATTEMPTS : storedAttempts;
+            if (attemptsRemaining <= 0) {
+                return false;
+            }
+            if (!CognitoTotp.validCode(pending, code, now)) {
+                user.setPendingSoftwareTokenMfaAttemptsRemaining(attemptsRemaining - 1);
+                userStore.put(userKey(poolId, user.getUsername()), user);
+                return false;
+            }
+            user.setSoftwareTokenMfaSecret(pending);
+            user.setPendingSoftwareTokenMfaSecret(null);
+            user.setPendingSoftwareTokenMfaAttemptsRemaining(null);
+            user.setLastModifiedDate(System.currentTimeMillis() / 1000L);
+            userStore.put(userKey(poolId, user.getUsername()), user);
+            return true;
+        }
+    }
 
+    public void changePassword(String accessToken, String previousPassword, String proposedPassword) {
+        VerifiedAccessToken token = verifyAccessToken(accessToken);
+        requireScope(accessToken, USER_ADMIN_SCOPE);
+        String username = token.username();
+        String poolId = token.poolId();
+
+        synchronized (userLock(poolId, username)) {
+            changePasswordUnderUserLock(poolId, username, previousPassword, proposedPassword);
+        }
+    }
+
+    private void changePasswordUnderUserLock(String poolId, String username, String previousPassword,
+            String proposedPassword) {
         CognitoUser user = adminGetUser(poolId, username);
         if (user.getPasswordHash() != null && !user.getPasswordHash().equals(hashPassword(previousPassword))) {
             throw new AwsException("NotAuthorizedException", "Incorrect username or password", 400);
@@ -1612,16 +3335,21 @@ public class CognitoService implements ResourceProvider {
     public Map<String, Object> forgotPassword(String clientId, String username) {
         UserPoolClient client = clientStore.get(clientId)
                 .orElseThrow(() -> new AwsException("ResourceNotFoundException", "Client not found", 400));
-        CognitoUser user = adminGetUser(client.getUserPoolId(), username);
         UserPool pool = describeUserPool(client.getUserPoolId());
+        if (accountRecoveryMechanisms(pool).contains("admin_only")) {
+            throw new AwsException("NotAuthorizedException", "Contact administrator to reset password.", 400);
+        }
+        CognitoUser user = adminGetUser(client.getUserPoolId(), username);
         ensureVerificationWiring();
         DeliveryTarget deliveryTarget = resolveForgotPasswordDeliveryTarget(pool, user);
 
         try {
             String code = verificationCodeService.issue(pool.getId(), user.getUsername(),
                     VerificationCode.Purpose.PASSWORD_RESET, Duration.ofHours(1));
+            Map<String, Object> customMessage = authFlowHandler.fireCustomMessage(
+                    pool, client, user, "CustomMessage_ForgotPassword");
             messageDispatcher.dispatch(pool, user, VerificationCode.Purpose.PASSWORD_RESET, code,
-                    List.of(deliveryTarget.deliveryMedium()));
+                    List.of(deliveryTarget.deliveryMedium()), customMessage);
         } catch (VerificationCodeException e) {
             throw mapVerificationCodeException(e);
         }
@@ -1648,42 +3376,71 @@ public class CognitoService implements ResourceProvider {
     }
 
     public Map<String, Object> getUser(String accessToken) {
-        String username = extractUsernameFromToken(accessToken);
-        String poolId = extractPoolIdFromToken(accessToken);
-        String jti = extractJtiFromToken(accessToken);
+        VerifiedAccessToken token = verifyAccessToken(accessToken);
+        requireScope(accessToken, USER_ADMIN_SCOPE);
+        String username = token.username();
+        String poolId = token.poolId();
 
-        if (username == null || poolId == null || jti == null) {
-            throw new AwsException("NotAuthorizedException", "Invalid access token", 400);
-        }
-
-        validateTokenNotRevoked(jti, poolId, "access");
-        validateOriginJtiNotRevoked(accessToken, poolId);
-        Long iat = extractIatFromToken(accessToken);
-        validateUserNotGloballySignedOut(username, poolId, "access", iat != null ? iat : 0L);
-        
         CognitoUser user = adminGetUser(poolId, username);
         Map<String, Object> result = new HashMap<>();
         result.put("Username", user.getUsername());
         List<Map<String, String>> attrs = new ArrayList<>();
         user.getAttributes().forEach((k, v) -> attrs.add(Map.of("Name", k, "Value", v)));
         result.put("UserAttributes", attrs);
+        putMfaSettings(result, describeUserPool(token.poolId()), user);
+        return result;
+    }
+
+    /**
+     * GetUserAuthFactors. The MFA members come from the email and software-token MFA preferences;
+     * SetUserMFAPreference accepts SMS settings without keeping them.
+     */
+    public Map<String, Object> getUserAuthFactors(String accessToken) {
+        VerifiedAccessToken token;
+        try {
+            token = verifyAccessToken(accessToken);
+        } catch (AwsException e) {
+            if ("NotAuthorizedException".equals(e.getErrorCode())
+                    && INVALID_ACCESS_TOKEN_MESSAGE.equals(e.getMessage())) {
+                throw new AwsException("NotAuthorizedException", "Invalid Access Token", 400);
+            }
+            throw e;
+        }
+        requireScope(accessToken, USER_ADMIN_SCOPE);
+
+        CognitoUser user = adminGetUser(token.poolId(), token.username());
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("Username", user.getUsername());
+        List<String> factors = authFlowHandler.configuredUserAuthFactors(user);
+        if (!factors.isEmpty()) {
+            result.put("ConfiguredUserAuthFactors", factors);
+        }
+        putMfaSettings(result, describeUserPool(token.poolId()), user);
         return result;
     }
 
     public Map<String, Object> getUserAttributeVerificationCode(String accessToken, String attributeName) {
-        String username = extractUsernameFromToken(accessToken);
-        String poolId = extractPoolIdFromToken(accessToken);
-        String jti = extractJtiFromToken(accessToken);
-
-        if (username == null || poolId == null || jti == null) {
-            throw new AwsException("NotAuthorizedException", "Invalid Access Token", 400);
+        VerifiedAccessToken token;
+        try {
+            token = verifyAccessToken(accessToken);
+        } catch (AwsException e) {
+            if ("NotAuthorizedException".equals(e.getErrorCode())
+                    && INVALID_ACCESS_TOKEN_MESSAGE.equals(e.getMessage())) {
+                throw new AwsException("NotAuthorizedException", "Invalid Access Token", 400);
+            }
+            throw e;
         }
+        requireScope(accessToken, USER_ADMIN_SCOPE);
+        String username = token.username();
+        String poolId = token.poolId();
 
-        validateTokenNotRevoked(jti, poolId, "access");
-        validateOriginJtiNotRevoked(accessToken, poolId);
-        Long iat = extractIatFromToken(accessToken);
-        validateUserNotGloballySignedOut(username, poolId, "access", iat != null ? iat : 0L);
+        synchronized (userLock(poolId, username)) {
+            return getUserAttributeVerificationCodeUnderUserLock(poolId, username, attributeName);
+        }
+    }
 
+    private Map<String, Object> getUserAttributeVerificationCodeUnderUserLock(
+            String poolId, String username, String attributeName) {
         if (!"email".equals(attributeName) && !"phone_number".equals(attributeName)) {
             throw new AwsException("InvalidParameterException",
                     "Invalid attribute name. Only phone_number and email can be verified.", 400);
@@ -1691,7 +3448,7 @@ public class CognitoService implements ResourceProvider {
 
         CognitoUser user = adminGetUser(poolId, username);
         UserPool pool = describeUserPool(poolId);
-        String destination = blankToNull(user.getAttributes().get(attributeName));
+        String destination = attributeVerificationDestination(user, attributeName);
         if (destination == null) {
             throw new AwsException("InvalidParameterException",
                     "email".equals(attributeName)
@@ -1708,7 +3465,7 @@ public class CognitoService implements ResourceProvider {
         try {
             String code = verificationCodeService.issue(poolId, user.getUsername(),
                     purpose, Duration.ofHours(24));
-            messageDispatcher.dispatch(pool, user, purpose, code, List.of(deliveryMedium));
+            dispatchAttributeVerificationCode(pool, user, attributeName, destination, purpose, code);
         } catch (VerificationCodeException e) {
             throw mapVerificationCodeException(e);
         }
@@ -1721,19 +3478,67 @@ public class CognitoService implements ResourceProvider {
         return response;
     }
 
-    public void updateUserAttributes(String accessToken, Map<String, String> attributes) {
-        String username = extractUsernameFromToken(accessToken);
-        String poolId = extractPoolIdFromToken(accessToken);
-        String jti = extractJtiFromToken(accessToken);
+    public void verifyUserAttribute(String accessToken, String attributeName, String code) {
+        VerifiedAccessToken token;
+        try {
+            token = verifyAccessToken(accessToken);
+        } catch (AwsException e) {
+            if ("NotAuthorizedException".equals(e.getErrorCode())
+                    && INVALID_ACCESS_TOKEN_MESSAGE.equals(e.getMessage())) {
+                throw new AwsException("NotAuthorizedException", "Invalid Access Token", 400);
+            }
+            throw e;
+        }
+        requireScope(accessToken, USER_ADMIN_SCOPE);
+        String username = token.username();
+        String poolId = token.poolId();
 
-        if (username == null || poolId == null) {
-            throw new AwsException("NotAuthorizedException", "Invalid access token", 400);
+        synchronized (userLock(poolId, username)) {
+            verifyUserAttributeUnderUserLock(poolId, username, attributeName, code);
+        }
+    }
+
+    private void verifyUserAttributeUnderUserLock(
+            String poolId, String username, String attributeName, String code) {
+        if (!"email".equals(attributeName) && !"phone_number".equals(attributeName)) {
+            throw new AwsException("InvalidParameterException",
+                    "Invalid attribute name. Only phone_number and email can be verified.", 400);
         }
 
-        validateTokenNotRevoked(jti, poolId, "access");
-        validateOriginJtiNotRevoked(accessToken, poolId);
-        Long iat = extractIatFromToken(accessToken);
-        validateUserNotGloballySignedOut(username, poolId, "access", iat != null ? iat : 0L);
+        CognitoUser user = MAPPER.convertValue(
+                adminGetUser(poolId, username), CognitoUser.class);
+        if (attributeVerificationDestination(user, attributeName) == null) {
+            throw new AwsException("InvalidParameterException",
+                    "Unable to verify attribute: " + attributeName + " no value set to verify",
+                    400);
+        }
+
+        VerificationCode.Purpose purpose = verificationPurpose(attributeName);
+        String pendingValue = blankToNull(user.getPendingAttributes().get(attributeName));
+        if (pendingValue != null) {
+            ensureAliasAvailable(describeUserPool(poolId), user, attributeName, pendingValue);
+        }
+        ensureVerificationWiring();
+        try {
+            verificationCodeService.consume(poolId, user.getUsername(), purpose, code);
+        } catch (VerificationCodeException e) {
+            throw mapVerificationCodeException(e);
+        }
+
+        if (pendingValue != null) {
+            user.getAttributes().put(attributeName, pendingValue);
+            user.getPendingAttributes().remove(attributeName);
+        }
+        user.getAttributes().put(attributeName + "_verified", "true");
+        user.setLastModifiedDate(System.currentTimeMillis() / 1000L);
+        userStore.put(userKey(poolId, user.getUsername()), user);
+    }
+
+    public List<Map<String, Object>> updateUserAttributes(String accessToken, Map<String, String> attributes) {
+        VerifiedAccessToken token = verifyAccessToken(accessToken);
+        requireScope(accessToken, USER_ADMIN_SCOPE);
+        String username = token.username();
+        String poolId = token.poolId();
 
         String verificationStatusAttribute = attributes.containsKey("email_verified")
                 ? "email_verified"
@@ -1745,28 +3550,103 @@ public class CognitoService implements ResourceProvider {
                     400);
         }
 
-        adminUpdateUserAttributes(poolId, username, attributes);
+        synchronized (userLock(poolId, username)) {
+            return updateUserAttributesUnderUserLock(poolId, username, attributes);
+        }
+    }
+
+    private List<Map<String, Object>> updateUserAttributesUnderUserLock(
+            String poolId, String username, Map<String, String> attributes) {
+        UserPool pool = describeUserPool(poolId);
+        CognitoUser currentUser = adminGetUser(poolId, username);
+
+        // Validate every entry (alias availability) before mutating the user or issuing any
+        // verification code. Otherwise a later entry failing leaves an earlier entry's code
+        // live against a user record that was never actually updated, and the request's
+        // attribute order would silently change what gets left behind.
+        for (Map.Entry<String, String> attribute : attributes.entrySet()) {
+            String attributeName = attribute.getKey();
+            String value = attribute.getValue();
+            if (isVerifiableContactAttribute(attributeName) && blankToNull(value) != null) {
+                ensureAliasAvailable(pool, currentUser, attributeName, value);
+            }
+        }
+
+        CognitoUser updatedUser = MAPPER.convertValue(currentUser, CognitoUser.class);
+        List<Map<String, Object>> deliveryDetails = new ArrayList<>();
+
+        try {
+            for (Map.Entry<String, String> attribute : attributes.entrySet()) {
+                String attributeName = attribute.getKey();
+                String value = attribute.getValue();
+
+                if (blankToNull(value) == null) {
+                    // AWS: "To delete an attribute from the user, submit the attribute in
+                    // your API request with a blank value."
+                    updatedUser.getAttributes().remove(attributeName);
+                    updatedUser.getAttributes().remove(attributeName + "_verified");
+                    updatedUser.getPendingAttributes().remove(attributeName);
+                    continue;
+                }
+
+                if (!isVerifiableContactAttribute(attributeName)) {
+                    updatedUser.getAttributes().put(attributeName, value);
+                    continue;
+                }
+
+                VerificationCode.Purpose purpose = verificationPurpose(attributeName);
+                ensureVerificationWiring();
+                String verificationCode = verificationCodeService.issue(
+                        poolId, currentUser.getUsername(), purpose, Duration.ofHours(24));
+                dispatchAttributeVerificationCode(pool, currentUser, attributeName, value,
+                        purpose, verificationCode);
+
+                if (requiresVerificationBeforeUpdate(pool, attributeName)) {
+                    updatedUser.getPendingAttributes().put(attributeName, value);
+                } else {
+                    updatedUser.getAttributes().put(attributeName, value);
+                    updatedUser.getAttributes().put(attributeName + "_verified", "false");
+                    updatedUser.getPendingAttributes().remove(attributeName);
+                }
+
+                Map<String, Object> detail = new LinkedHashMap<>();
+                detail.put("AttributeName", attributeName);
+                detail.put("DeliveryMedium", deliveryMedium(attributeName));
+                detail.put("Destination", maskAttributeDestination(attributeName, value));
+                deliveryDetails.add(detail);
+            }
+        } catch (VerificationCodeException e) {
+            throw mapVerificationCodeException(e);
+        } catch (AwsException e) {
+            throw e;
+        } catch (RuntimeException e) {
+            throw new AwsException("CodeDeliveryFailureException",
+                    "Failed to deliver verification code", 400);
+        }
+
+        updatedUser.setLastModifiedDate(System.currentTimeMillis() / 1000L);
+        userStore.put(userKey(poolId, updatedUser.getUsername()), updatedUser);
+        return deliveryDetails;
     }
 
     public void deleteUserAttributes(String accessToken, List<String> attributeNames) {
-        String username = extractUsernameFromToken(accessToken);
-        String poolId = extractPoolIdFromToken(accessToken);
-        String jti = extractJtiFromToken(accessToken);
+        VerifiedAccessToken token = verifyAccessToken(accessToken);
+        requireScope(accessToken, USER_ADMIN_SCOPE);
+        String username = token.username();
+        String poolId = token.poolId();
 
-        if (username == null || poolId == null) {
-            throw new AwsException("NotAuthorizedException", "Invalid access token", 400);
-        }
-
-        validateTokenNotRevoked(jti, poolId, "access");
-        validateOriginJtiNotRevoked(accessToken, poolId);
-        Long iat = extractIatFromToken(accessToken);
-        validateUserNotGloballySignedOut(username, poolId, "access", iat != null ? iat : 0L);
-        
         adminDeleteUserAttributes(poolId, username, attributeNames);
     }
 
-    public Map<String, Object> issueClientCredentialsToken(String clientId, String clientSecret, String scope) {
+    /**
+     * @param requiredPoolId the pool owning the custom domain the request arrived on, or
+     *                       {@code null} on Floci's own host. As on AWS, a client of another pool
+     *                       does not exist on that domain.
+     */
+    public Map<String, Object> issueClientCredentialsToken(String clientId, String clientSecret, String scope,
+                                                           String requiredPoolId) {
         UserPoolClient client = clientStore.get(clientId)
+                .filter(c -> requiredPoolId == null || requiredPoolId.equals(c.getUserPoolId()))
                 .orElseThrow(() -> new AwsException("ResourceNotFoundException", "Client not found", 400));
         UserPool pool = describeUserPool(client.getUserPoolId());
         validateClientAllowsClientCredentials(client);
@@ -1796,15 +3676,40 @@ public class CognitoService implements ResourceProvider {
         return getIssuer(poolId) + "/.well-known/jwks.json";
     }
 
-    public String getTokenEndpoint() {
-        return baseUrl + "/cognito-idp/oauth2/token";
+    /**
+     * A custom domain is HTTPS-only on AWS, so its endpoints are advertised as {@code https}
+     * regardless of Floci's own base URL.
+     */
+    public String getTokenEndpoint(String poolId) {
+        return oauthEndpoint(poolId, "token");
     }
 
-    public String getUserInfoEndpoint() {
-        return baseUrl + "/cognito-idp/oauth2/userInfo";
+    public String getUserInfoEndpoint(String poolId) {
+        return oauthEndpoint(poolId, "userInfo");
+    }
+
+    /**
+     * Returns the callback endpoint that an external identity provider uses to return its
+     * authorization response to Cognito.
+     */
+    public String getIdentityProviderCallbackEndpoint(String poolId) {
+        return findCustomDomainForPool(poolId)
+                .map(d -> "https://" + d.getDomain() + "/oauth2/idpresponse")
+                .orElse(baseUrl + "/cognito-idp/oauth2/idpresponse");
+    }
+
+    private String oauthEndpoint(String poolId, String operation) {
+        return findCustomDomainForPool(poolId)
+                .map(d -> "https://" + d.getDomain() + "/oauth2/" + operation)
+                .orElse(baseUrl + "/cognito-idp/oauth2/" + operation);
     }
 
     // ──────────────────────────── Private helpers ────────────────────────────
+
+    private static AwsException userPoolNotFound(String userPoolId) {
+        return new AwsException("ResourceNotFoundException",
+                "User pool " + userPoolId + " does not exist.", 400);
+    }
 
     UserPoolClient findClientById(String clientId) {
         return clientStore.get(clientId)
@@ -1824,14 +3729,14 @@ public class CognitoService implements ResourceProvider {
         String poolId = parts[0];
         String username = parts[1];
         String refreshTokenUuid = parts[4]; // UUID from refresh token
-        
+
         if (!client.getUserPoolId().equals(poolId)) {
             throw new AwsException("NotAuthorizedException", "Invalid refresh token", 400);
         }
         if (isRefreshTokenExpired(client, parts)) {
             throw new AwsException("NotAuthorizedException", "Refresh Token has expired", 400);
         }
-        
+
         // Check if refresh token has been revoked
         validateTokenNotRevoked(refreshTokenUuid, poolId, "refresh");
         long issuedAt = 0L;
@@ -1839,11 +3744,11 @@ public class CognitoService implements ResourceProvider {
             issuedAt = Long.parseLong(parts[3]);
         } catch (NumberFormatException ignored) {}
         validateUserNotGloballySignedOut(username, poolId, "refresh", issuedAt);
-        
+
         UserPool pool = describeUserPool(poolId);
         CognitoUser user = adminGetUser(poolId, username);
         ClaimsOverride override = authFlowHandler.preTokenGenerationForRefresh(pool, client, user);
-        
+
         // Use refresh token UUID as origin_jti for derived tokens
         Map<String, Object> auth = new HashMap<>();
         auth.put("AccessToken", generateSignedJwt(user, pool, "access", client, override, refreshTokenUuid));
@@ -1913,11 +3818,112 @@ public class CognitoService implements ResourceProvider {
         String originJti = UUID.randomUUID().toString();
         return generateAuthResult(user, pool, client, override, originJti);
     }
-    
+
+    /**
+     * Mints the tokens the OAuth token endpoint returns for a redeemed authorization code, firing
+     * PreTokenGeneration first, as AWS does for a hosted-UI sign-in, so a pool that customises its
+     * claims gets the same tokens here as it does from {@code InitiateAuth}.
+     *
+     * <p>{@code protocolClaims} carries claims the OIDC flow itself owns, currently the request's
+     * {@code nonce}. They are applied <em>after</em> the trigger's, so a trigger cannot displace them:
+     * AWS likewise refuses to let this trigger override {@code nonce} and the other reserved claims.
+     * Passing {@code null} for either side leaves the other's claims untouched.
+     *
+     * <p>{@code grantedScopes} are the scopes the authorization code was granted at authorize (see
+     * {@link #grantedScopes}). The access token carries them, narrowed to the ones the client still
+     * allows, rather than the {@code aws.cognito.signin.user.admin} of an API sign-in, and the ID
+     * token is minted only when they include {@code openid}, as on AWS. The trigger is told the same
+     * scopes, and a V2 trigger's scope changes apply on top of them.
+     */
+    Map<String, Object> generateAuthResultForHostedAuth(CognitoUser user, UserPool pool, UserPoolClient client,
+                                                        ClaimsOverride protocolClaims, List<String> grantedScopes) {
+        List<String> scopes = scopesStillAllowed(client, grantedScopes);
+        ClaimsOverride trigger = authFlowHandler.preTokenGenerationForHostedAuth(pool, client, user, scopes);
+        return generateAuthResult(user, pool, client, mergeUnderProtocolClaims(trigger, protocolClaims),
+                UUID.randomUUID().toString(), scopes, scopes.contains("openid"));
+    }
+
+    /**
+     * The scopes an authorization request is granted at authorize, where the authorization code is
+     * bound to them: every scope the client allows when it asked for none, as on AWS, and otherwise
+     * the requested scopes the client allows, in the order requested and without duplicates.
+     */
+    static List<String> grantedScopes(UserPoolClient client, List<String> requestedScopes) {
+        List<String> allowed = client.getAllowedOAuthScopes();
+        if (allowed == null || allowed.isEmpty()) {
+            return List.of();
+        }
+        if (requestedScopes == null || requestedScopes.isEmpty()) {
+            return List.copyOf(new LinkedHashSet<>(allowed));
+        }
+        return scopesStillAllowed(client, requestedScopes);
+    }
+
+    /**
+     * The code's granted scopes that the client still allows, in their order and without duplicates.
+     * The client's AllowedOAuthScopes can change between authorize and redemption: a scope removed in
+     * between is dropped, and one added in between is never granted. A V2 trigger is free to grant
+     * claims or add scopes based on what it is told was granted, so it is told only these.
+     */
+    private static List<String> scopesStillAllowed(UserPoolClient client, List<String> grantedScopes) {
+        List<String> allowed = client.getAllowedOAuthScopes();
+        if (allowed == null || grantedScopes == null) {
+            return List.of();
+        }
+        List<String> kept = new ArrayList<>();
+        for (String scope : grantedScopes) {
+            if (allowed.contains(scope) && !kept.contains(scope)) {
+                kept.add(scope);
+            }
+        }
+        return List.copyOf(kept);
+    }
+
+    /**
+     * Layers {@code protocolClaims} over {@code trigger}, keeping every other field the trigger set
+     * (suppressions, groups, roles, scopes).
+     */
+    private static ClaimsOverride mergeUnderProtocolClaims(ClaimsOverride trigger, ClaimsOverride protocolClaims) {
+        if (trigger == null) {
+            return protocolClaims;
+        }
+        if (protocolClaims == null) {
+            return trigger;
+        }
+        return new ClaimsOverride(
+                claimsWithProtocolLast(trigger.idClaimsToAddOrOverride(), protocolClaims.idClaimsToAddOrOverride()),
+                trigger.idClaimsToSuppress(),
+                claimsWithProtocolLast(trigger.accessClaimsToAddOrOverride(), protocolClaims.accessClaimsToAddOrOverride()),
+                trigger.accessClaimsToSuppress(),
+                trigger.scopesToAdd(), trigger.scopesToSuppress(),
+                trigger.groupsToOverride(), trigger.iamRolesToOverride(), trigger.preferredRole());
+    }
+
+    private static Map<String, Object> claimsWithProtocolLast(Map<String, Object> triggerClaims,
+                                                              Map<String, Object> protocolClaims) {
+        if (protocolClaims == null || protocolClaims.isEmpty()) {
+            return triggerClaims;
+        }
+        if (triggerClaims == null || triggerClaims.isEmpty()) {
+            return protocolClaims;
+        }
+        Map<String, Object> merged = new HashMap<>(triggerClaims);
+        merged.putAll(protocolClaims);
+        return merged;
+    }
+
     Map<String, Object> generateAuthResult(CognitoUser user, UserPool pool, UserPoolClient client, ClaimsOverride override, String originJti) {
+        return generateAuthResult(user, pool, client, override, originJti, API_SIGN_IN_SCOPES, true);
+    }
+
+    private Map<String, Object> generateAuthResult(CognitoUser user, UserPool pool, UserPoolClient client,
+                                                   ClaimsOverride override, String originJti,
+                                                   List<String> accessScopes, boolean withIdToken) {
         Map<String, Object> auth = new HashMap<>();
-        auth.put("AccessToken", generateSignedJwt(user, pool, "access", client, override, originJti));
-        auth.put("IdToken", generateSignedJwt(user, pool, "id", client, override, originJti));
+        auth.put("AccessToken", generateSignedJwt(user, pool, "access", client, override, originJti, accessScopes));
+        if (withIdToken) {
+            auth.put("IdToken", generateSignedJwt(user, pool, "id", client, override, originJti, accessScopes));
+        }
         auth.put("RefreshToken", buildRefreshToken(pool, user.getUsername(), client.getClientId(), originJti));
         auth.put("ExpiresIn", resolveAccessTokenLifetimeSeconds(client));
         auth.put("TokenType", "Bearer");
@@ -1927,8 +3933,17 @@ public class CognitoService implements ResourceProvider {
     String generateSignedJwt(CognitoUser user, UserPool pool, String type, UserPoolClient client, ClaimsOverride override) {
         return generateSignedJwt(user, pool, type, client, override, null);
     }
-    
+
     String generateSignedJwt(CognitoUser user, UserPool pool, String type, UserPoolClient client, ClaimsOverride override, String originJti) {
+        return generateSignedJwt(user, pool, type, client, override, originJti, API_SIGN_IN_SCOPES);
+    }
+
+    /**
+     * @param accessScopes the access token's {@code scope} claim before any V2 trigger changes, left
+     *                     out when empty; ignored for an ID token
+     */
+    private String generateSignedJwt(CognitoUser user, UserPool pool, String type, UserPoolClient client,
+                                     ClaimsOverride override, String originJti, List<String> accessScopes) {
         String header = encodeJwtHeader(pool);
         long now = System.currentTimeMillis() / 1000L;
         long lifetimeSeconds = resolveTokenLifetimeSeconds(client, type);
@@ -1944,7 +3959,9 @@ public class CognitoService implements ResourceProvider {
         claims.put("iat", now);
         if ("access".equals(type)) {
             claims.put("username", user.getUsername());
-            claims.put("scope", "aws.cognito.signin.user.admin");
+            if (!accessScopes.isEmpty()) {
+                claims.put("scope", String.join(" ", accessScopes));
+            }
         } else if ("id".equals(type)) {
             claims.put("cognito:username", user.getUsername());
         }
@@ -1952,11 +3969,11 @@ public class CognitoService implements ResourceProvider {
         // Add JWT ID (jti) claim for token revocation support
         String jti = UUID.randomUUID().toString();
         claims.put("jti", jti);
-        
+
         if (("access".equals(type) || "id".equals(type)) && originJti != null && isTokenRevocationEnabled(client)) {
             claims.put("origin_jti", originJti);
         }
-        
+
         String clientId = client != null ? client.getClientId() : null;
         if (clientId != null && !clientId.isBlank()) {
             if ("access".equals(type)) claims.put("client_id", clientId);
@@ -2017,8 +4034,18 @@ public class CognitoService implements ResourceProvider {
         boolean isAccess = "access".equals(tokenType);
         List<String> suppress = isAccess ? override.accessClaimsToSuppress() : override.idClaimsToSuppress();
         Map<String, Object> addOrOverride = isAccess ? override.accessClaimsToAddOrOverride() : override.idClaimsToAddOrOverride();
-        if (suppress != null) suppress.forEach(claims::remove);
-        if (addOrOverride != null) claims.putAll(addOrOverride);
+        if (suppress != null) {
+            suppress.stream()
+                    .filter(claim -> !isTriggerProtectedIdentityClaim(claim, isAccess))
+                    .forEach(claims::remove);
+        }
+        if (addOrOverride != null) {
+            addOrOverride.forEach((claim, value) -> {
+                if (!isTriggerProtectedIdentityClaim(claim, isAccess)) {
+                    claims.put(claim, value);
+                }
+            });
+        }
         if (override.groupsToOverride() != null) {
             claims.put("cognito:groups", override.groupsToOverride());
         }
@@ -2039,8 +4066,21 @@ public class CognitoService implements ResourceProvider {
             if (override.scopesToAdd() != null) {
                 for (String s : override.scopesToAdd()) if (!current.contains(s)) current.add(s);
             }
-            if (!current.isEmpty()) claims.put("scope", String.join(" ", current));
+            if (current.isEmpty()) {
+                claims.remove("scope");
+            } else {
+                claims.put("scope", String.join(" ", current));
+            }
         }
+    }
+
+    /**
+     * AWS lets no pre token generation trigger add, modify or suppress the claims that identify
+     * the user: {@code sub} in either token, {@code username} in the access token and
+     * {@code cognito:username} in the ID token.
+     */
+    private static boolean isTriggerProtectedIdentityClaim(String claim, boolean isAccess) {
+        return "sub".equals(claim) || (isAccess ? "username" : "cognito:username").equals(claim);
     }
 
     private String encodeJwtHeader(UserPool pool) {
@@ -2468,6 +4508,10 @@ public class CognitoService implements ResourceProvider {
     }
 
     private void updateUserPassword(CognitoUser user, String password) {
+        UserPool pool = describeUserPool(user.getUserPoolId());
+        validatePasswordAgainstPolicy(pool, user, password);
+        String previousPasswordHash = user.getPasswordHash();
+        String passwordHash = hashPassword(password);
         String saltHex = CognitoSrpHelper.generateSalt();
         String verifierHex = CognitoSrpHelper.computeVerifier(
                 CognitoSrpHelper.extractPoolName(user.getUserPoolId()),
@@ -2475,9 +4519,141 @@ public class CognitoService implements ResourceProvider {
                 password,
                 saltHex
         );
-        user.setPasswordHash(hashPassword(password));
+        user.setPasswordHash(passwordHash);
+        updatePasswordHistory(pool, user, previousPasswordHash);
         user.setSrpSalt(saltHex);
         user.setSrpVerifier(verifierHex);
+    }
+
+    @SuppressWarnings("unchecked")
+    private void validatePasswordAgainstPolicy(UserPool pool, CognitoUser user, String password) {
+        Map<String, Object> policies = pool.getPolicies();
+        if (policies == null || !(policies.get("PasswordPolicy") instanceof Map<?, ?> rawPolicy)) {
+            return;
+        }
+
+        Map<String, Object> policy = (Map<String, Object>) rawPolicy;
+        boolean invalid = password == null
+                || password.length() < policyInt(policy, "MinimumLength")
+                || policyBoolean(policy, "RequireUppercase")
+                    && password.codePoints().noneMatch(Character::isUpperCase)
+                || policyBoolean(policy, "RequireLowercase")
+                    && password.codePoints().noneMatch(Character::isLowerCase)
+                || policyBoolean(policy, "RequireNumbers")
+                    && password.codePoints().noneMatch(Character::isDigit)
+                || policyBoolean(policy, "RequireSymbols")
+                    && password.codePoints().noneMatch(
+                            codePoint -> COGNITO_PASSWORD_SYMBOLS.indexOf(codePoint) >= 0);
+
+        if (invalid) {
+            throw new AwsException(
+                    "InvalidPasswordException",
+                    "Password does not conform to the configured password policy.",
+                    400
+            );
+        }
+
+        String passwordHash = password == null ? "" : hashPassword(password);
+        int historySize = policyInt(policy, "PasswordHistorySize");
+        // AWS counts the current password as one of the `n` in PasswordHistorySize, so only
+        // n-1 additional prior passwords are blocked alongside it: "users can't set a password
+        // that matches any of n previous passwords, where n is PasswordHistorySize" together
+        // with the documented max of "current password or any of up to 23 additional previous
+        // passwords, for a maximum total of 24" (PasswordHistorySize's max value is 24). This
+        // runs before any mutation, so a null current here means a prior admin reset left no
+        // password occupying that slot — the full n entries in history are then still live,
+        // not n-1 (mirrors the same condition in updatePasswordHistory).
+        long historyCheckLimit = user.getPasswordHash() == null ? historySize : historySize - 1L;
+        boolean reused = historySize > 0 && (passwordHash.equals(user.getPasswordHash())
+                || user.getPasswordHistory().stream().limit(historyCheckLimit).anyMatch(passwordHash::equals));
+
+        if (reused) {
+            throw new AwsException(
+                    "PasswordHistoryPolicyViolationException",
+                    "Password matches a previously used password and does not comply with the "
+                            + "password history policy.",
+                    400
+            );
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private void updatePasswordHistory(UserPool pool, CognitoUser user, String previousPasswordHash) {
+        Map<String, Object> policies = pool.getPolicies();
+        if (policies == null || !(policies.get("PasswordPolicy") instanceof Map<?, ?> rawPolicy)) {
+            return;
+        }
+
+        int historySize = policyInt((Map<String, Object>) rawPolicy, "PasswordHistorySize");
+        if (historySize <= 0) {
+            return;
+        }
+
+        List<String> history = new ArrayList<>(user.getPasswordHistory());
+        if (previousPasswordHash != null) {
+            history.add(0, previousPasswordHash);
+        }
+        // Callers set the user's new current password hash (or null, for an admin reset that
+        // clears it) before calling this, so the state read here already reflects it. A current
+        // password occupies one of the n slots, leaving n-1 for history; a reset leaves none
+        // occupied, so the freed slot goes to history until a new password takes it — otherwise
+        // the outgoing password would fall out of the window a reset alone should not shrink.
+        long retain = user.getPasswordHash() == null ? historySize : historySize - 1L;
+        user.setPasswordHistory(history.stream().limit(Math.max(0, retain)).toList());
+    }
+
+    private int policyInt(Map<String, Object> policy, String key) {
+        Object value = policy.get(key);
+        if (value instanceof Number number) {
+            return number.intValue();
+        }
+        if (value instanceof String stringValue) {
+            try {
+                return Integer.parseInt(stringValue);
+            } catch (NumberFormatException ignored) {
+                return 0;
+            }
+        }
+        return 0;
+    }
+
+    /**
+     * Reads a password policy integer without narrowing it, so range checks see the real value.
+     * A value that is not a whole-number type or string is rejected: falling back to zero would
+     * let it pass the 0-based ranges of {@code TemporaryPasswordValidityDays} and
+     * {@code PasswordHistorySize} and be stored as-is.
+     */
+    private BigInteger policyInteger(Map<String, Object> policy, String key, String member) {
+        Object value = policy.get(key);
+        try {
+            if (value instanceof BigInteger integer) {
+                return integer;
+            }
+            if (value instanceof Number number) {
+                return new BigDecimal(number.toString()).toBigInteger();
+            }
+            if (value instanceof String stringValue) {
+                return new BigInteger(stringValue);
+            }
+        } catch (NumberFormatException e) {
+            throw notAnInteger(value, member);
+        }
+        throw notAnInteger(value, member);
+    }
+
+    private static AwsException notAnInteger(Object value, String member) {
+        return new AwsException(
+                "InvalidParameterException",
+                "1 validation error detected: Value '" + value + "' at 'policies.passwordPolicy." + member
+                        + "' failed to satisfy constraint: Member must be an integer",
+                400);
+    }
+
+    private boolean policyBoolean(Map<String, Object> policy, String key) {
+        Object value = policy.get(key);
+        return value instanceof Boolean booleanValue
+                ? booleanValue
+                : Boolean.parseBoolean(String.valueOf(value));
     }
 
     int getAccessTokenExpiresInSeconds(UserPoolClient client) {
@@ -2601,31 +4777,158 @@ public class CognitoService implements ResourceProvider {
         return null;
     }
 
-    private String extractUsernameFromToken(String token) {
+    record VerifiedAccessToken(String username, String poolId, String subject) {}
+
+    /** Verified JWT details for services that enforce Cognito user-pool authorizers. */
+    public record VerifiedApiGatewayToken(String poolId, String tokenUse, Map<String, Object> claims) {}
+
+    private record VerifiedJwt(String poolId, JsonNode claims) {}
+
+    /**
+     * Verifies an access or ID token using the persisted user-pool signing key. This deliberately
+     * does not fetch keys over the network because the emulator owns the pool and its key pair.
+     */
+    public VerifiedApiGatewayToken verifyApiGatewayToken(String token) {
         try {
-            String[] parts = token.split("\\.");
-            if (parts.length < 2) return null;
-            String payloadJson = new String(Base64.getUrlDecoder().decode(parts[1]), StandardCharsets.UTF_8);
-            // Simple extraction without full JSON parsing
-            return extractJsonField(payloadJson, "username");
+            VerifiedJwt verified = verifyJwtSignatureAndIssuer(token);
+            JsonNode claims = verified.claims();
+            String poolId = verified.poolId();
+            String tokenUse = textClaim(claims, "token_use");
+            long expiresAt = requiredNumericClaim(claims, "exp");
+            String subject = textClaim(claims, "sub");
+            if (!("access".equals(tokenUse) || "id".equals(tokenUse))
+                    || subject == null || expiresAt <= System.currentTimeMillis() / 1000L) {
+                throw new IllegalArgumentException("invalid token claims");
+            }
+            String clientId = "access".equals(tokenUse)
+                    ? textClaim(claims, "client_id") : textClaim(claims, "aud");
+            if (clientId == null || clientStore.get(clientId)
+                    .filter(c -> poolId.equals(c.getUserPoolId())).isEmpty()) {
+                throw new IllegalArgumentException("invalid client");
+            }
+            String jti = textClaim(claims, "jti");
+            validateTokenNotRevoked(jti, poolId, tokenUse);
+            String originJti = textClaim(claims, "origin_jti");
+            if (originJti != null) {
+                validateTokenNotRevoked(originJti, poolId, tokenUse);
+            }
+            String username = "access".equals(tokenUse)
+                    ? textClaim(claims, "username") : textClaim(claims, "cognito:username");
+            if (username != null) {
+                validateUserNotGloballySignedOut(username, poolId, tokenUse,
+                        requiredNumericClaim(claims, "iat"));
+            }
+            boolean clientCredentialsToken = "access".equals(tokenUse) && subject.equals(clientId);
+            if (!clientCredentialsToken) {
+                requireTokenUserExists(poolId, username, subject);
+            }
+            Map<String, Object> mapped = MAPPER.convertValue(claims, new TypeReference<Map<String, Object>>() {});
+            return new VerifiedApiGatewayToken(poolId, tokenUse, Map.copyOf(mapped));
+        } catch (AwsException e) {
+            throw e;
         } catch (Exception e) {
-            return null;
+            LOG.debug("API Gateway Cognito token verification failed", e);
+            throw new AwsException("NotAuthorizedException", INVALID_ACCESS_TOKEN_MESSAGE, 400);
         }
     }
 
-    private String extractPoolIdFromToken(String token) {
-        try {
-            String[] parts = token.split("\\.");
-            if (parts.length < 2) return null;
-            String payloadJson = new String(Base64.getUrlDecoder().decode(parts[1]), StandardCharsets.UTF_8);
-            String iss = extractJsonField(payloadJson, "iss");
-            if (iss == null) return null;
-            int lastSlash = iss.lastIndexOf('/');
-            return lastSlash >= 0 ? iss.substring(lastSlash + 1) : null;
-        } catch (Exception e) {
-            return null;
+    /**
+     * A deleted user's tokens keep a valid signature until they expire, so the authorizer also
+     * requires the user to still be in the pool. Every user token names its user, since no pre
+     * token generation trigger can remove the username claim, and matching {@code sub} keeps a user
+     * re-created under the same name from inheriting the deleted user's tokens.
+     */
+    private void requireTokenUserExists(String poolId, String username, String subject) {
+        CognitoUser user = username == null ? null : userStore.get(userKey(poolId, username)).orElse(null);
+        if (user == null || !subject.equals(user.getAttributes().getOrDefault("sub", user.getUsername()))) {
+            throw new AwsException("NotAuthorizedException", INVALID_ACCESS_TOKEN_MESSAGE, 400);
         }
     }
+
+    /**
+     * Verifies the Cognito access-token contract before any self-service operation uses its claims.
+     * The pool's persisted public key is the trust anchor; claims are never trusted before the
+     * signature, issuer, client, token-use, and lifetime checks succeed.
+     */
+    VerifiedAccessToken verifyAccessToken(String token) {
+        try {
+            VerifiedJwt verified = verifyJwtSignatureAndIssuer(token);
+            JsonNode claims = verified.claims();
+            String poolId = verified.poolId();
+
+            String verifiedPoolId = poolId;
+            String username = textClaim(claims, "username");
+            String subject = textClaim(claims, "sub");
+            String jti = textClaim(claims, "jti");
+            String clientId = textClaim(claims, "client_id");
+            long issuedAt = requiredNumericClaim(claims, "iat");
+            long expiresAt = requiredNumericClaim(claims, "exp");
+            if (username == null || subject == null || jti == null || clientId == null
+                    || !"access".equals(textClaim(claims, "token_use"))
+                    || clientStore.get(clientId).filter(c -> verifiedPoolId.equals(c.getUserPoolId())).isEmpty()
+                    || expiresAt <= System.currentTimeMillis() / 1000L) {
+                throw new IllegalArgumentException("invalid access-token claims");
+            }
+
+            String originJti = textClaim(claims, "origin_jti");
+            validateTokenNotRevoked(jti, poolId, "access");
+            if (originJti != null) {
+                validateTokenNotRevoked(originJti, poolId, "access");
+            }
+            validateUserNotGloballySignedOut(username, poolId, "access", issuedAt);
+            return new VerifiedAccessToken(username, poolId, subject);
+        } catch (AwsException e) {
+            throw e;
+        } catch (Exception e) {
+            LOG.debug("Access token verification failed", e);
+            throw new AwsException("NotAuthorizedException", INVALID_ACCESS_TOKEN_MESSAGE, 400);
+        }
+    }
+
+    private VerifiedJwt verifyJwtSignatureAndIssuer(String token) throws Exception {
+        if (token == null || token.isBlank()) {
+            throw new IllegalArgumentException("missing token");
+        }
+        String[] parts = token.split("\\.", -1);
+        if (parts.length != 3 || Arrays.stream(parts).anyMatch(String::isEmpty)) {
+            throw new IllegalArgumentException("malformed JWT");
+        }
+        JsonNode header = MAPPER.readTree(Base64.getUrlDecoder().decode(parts[0]));
+        JsonNode claims = MAPPER.readTree(Base64.getUrlDecoder().decode(parts[1]));
+        if (!"RS256".equals(header.path("alg").asText())
+                || !"JWT".equalsIgnoreCase(header.path("typ").asText())) {
+            throw new IllegalArgumentException("unsupported JWT algorithm");
+        }
+        String issuer = textClaim(claims, "iss");
+        String poolId = issuer != null && issuer.startsWith(baseUrl + "/")
+                ? issuer.substring((baseUrl + "/").length()) : null;
+        UserPool pool = poolId == null ? null : poolStore.get(poolId).orElse(null);
+        if (pool == null || !getIssuer(poolId).equals(issuer)
+                || !getSigningKeyId(pool).equals(textClaim(header, "kid"))) {
+            throw new IllegalArgumentException("invalid issuer or key");
+        }
+        Signature verifier = Signature.getInstance("SHA256withRSA");
+        verifier.initVerify(getSigningPublicKey(pool));
+        verifier.update((parts[0] + "." + parts[1]).getBytes(StandardCharsets.UTF_8));
+        if (!verifier.verify(Base64.getUrlDecoder().decode(parts[2]))) {
+            throw new IllegalArgumentException("invalid signature");
+        }
+        return new VerifiedJwt(poolId, claims);
+    }
+
+    private static String textClaim(JsonNode claims, String name) {
+        JsonNode value = claims.path(name);
+        return value.isTextual() && !value.asText().isBlank() ? value.asText() : null;
+    }
+
+    private static long requiredNumericClaim(JsonNode claims, String name) {
+        JsonNode value = claims.path(name);
+        if (!value.isIntegralNumber()) {
+            throw new IllegalArgumentException("missing numeric claim");
+        }
+        return value.asLong();
+    }
+
 
     private void validateGroupName(String groupName) {
         if (groupName == null || groupName.isBlank()) {
@@ -2633,16 +4936,6 @@ public class CognitoService implements ResourceProvider {
         }
     }
 
-
-    private String extractJsonField(String json, String field) {
-        String search = "\"" + field + "\":\"";
-        int start = json.indexOf(search);
-        if (start < 0) return null;
-        start += search.length();
-        int end = json.indexOf('"', start);
-        if (end < 0) return null;
-        return json.substring(start, end);
-    }
 
     private String userKey(String poolId, String username) {
         return poolId + "::" + username;
@@ -2654,6 +4947,10 @@ public class CognitoService implements ResourceProvider {
 
     private String resourceServerKey(String userPoolId, String identifier) {
         return userPoolId + "::" + identifier;
+    }
+
+    private String identityProviderKey(String userPoolId, String providerName) {
+        return userPoolId + "::" + providerName;
     }
 
     private String escapeJson(String value) {
@@ -2679,53 +4976,47 @@ public class CognitoService implements ResourceProvider {
         return updated;
     }
 
+
+
     /**
-     * Extract JWT ID (jti) claim from a JWT token.
+     * The scopes in the space-separated {@code scope} claim of an already-verified access token
+     * (call after {@link #verifyAccessToken}), empty when the claim is absent or blank. An access
+     * token lacks the claim only when a PreTokenGeneration trigger removed it, or when an
+     * authorization code was granted no scope because its client allows none, which AWS does not let
+     * an OAuth client do. Such a token grants no scope.
      */
-    private String extractJtiFromToken(String token) {
+    private Set<String> extractScopesFromToken(String token) {
         try {
-            String[] parts = token.split("\\.");
-            if (parts.length < 2) return null;
-            String payloadJson = new String(Base64.getUrlDecoder().decode(parts[1]), StandardCharsets.UTF_8);
-            return extractJsonField(payloadJson, "jti");
+            String[] parts = token.split("\\.", -1);
+            JsonNode claims = MAPPER.readTree(Base64.getUrlDecoder().decode(parts[1]));
+            String scope = textClaim(claims, "scope");
+            Set<String> scopes = new HashSet<>();
+            if (scope == null) {
+                return scopes;
+            }
+            for (String s : scope.split(" ")) {
+                if (!s.isBlank()) scopes.add(s);
+            }
+            return scopes;
         } catch (Exception e) {
-            return null;
+            LOG.debug("Could not read the scope claim of an access token", e);
+            return Set.of();
         }
     }
 
-    private String extractOriginJtiFromToken(String token) {
-        try {
-            String[] parts = token.split("\\.");
-            if (parts.length < 2) return null;
-            String payloadJson = new String(Base64.getUrlDecoder().decode(parts[1]), StandardCharsets.UTF_8);
-            return extractJsonField(payloadJson, "origin_jti");
-        } catch (Exception e) {
-            return null;
+    /**
+     * AWS requires an access token carrying the given scope for some operations (every operation
+     * authorized by the user's access token requires aws.cognito.signin.user.admin), and refuses a
+     * token with no scope claim. Call after {@link #verifyAccessToken}, which already confirms the
+     * token is a valid, unexpired access token; this only adds the scope check on top.
+     */
+    void requireScope(String accessToken, String requiredScope) {
+        Set<String> scopes = extractScopesFromToken(accessToken);
+        if (!scopes.contains(requiredScope)) {
+            throw new AwsException("NotAuthorizedException", "Access Token does not have required scopes", 400);
         }
     }
 
-    private Long extractIatFromToken(String token) {
-        try {
-            String[] parts = token.split("\\.");
-            if (parts.length < 2) return null;
-            String payloadJson = new String(Base64.getUrlDecoder().decode(parts[1]), StandardCharsets.UTF_8);
-            String iatStr = extractJsonField(payloadJson, "iat");
-            if (iatStr != null) {
-                return Long.parseLong(iatStr);
-            }
-            // In case the simple extractor doesn't work for numbers (it extracts strings between quotes usually)
-            // let's use MAPPER for this specific field
-            Map<String, Object> payload = MAPPER.readValue(payloadJson, new TypeReference<>() {});
-            Object iat = payload.get("iat");
-            if (iat instanceof Number n) {
-                return n.longValue();
-            }
-        } catch (Exception e) {
-            return null;
-        }
-        return null;
-    }
-    
     /**
      * Validate that a refresh token has not been revoked, including global user sign-out.
      * Called from CognitoAuthFlowHandler for the REFRESH_TOKEN_AUTH flow.
@@ -2734,7 +5025,7 @@ public class CognitoService implements ResourceProvider {
         validateTokenNotRevoked(jti, poolId, "refresh");
         validateUserNotGloballySignedOut(username, poolId, "refresh", iat);
     }
-    
+
     /**
      * Validate that a token has not been revoked.
      * @param jti The JWT ID to check
@@ -2746,20 +5037,20 @@ public class CognitoService implements ResourceProvider {
         if (jti == null) {
             return; // Skip validation for tokens without jti (legacy tokens)
         }
-        
+
         // Check for specific token revocation
         String revokedKey = revokedTokenKey(poolId, jti);
         Optional<RevokedTokenInfo> revoked = revokedTokenStore.get(revokedKey);
-        
+
         if (revoked.isPresent()) {
             RevokedTokenInfo revokedInfo = revoked.get();
-            
+
             // Clean up expired revocation records
             if (revokedInfo.isExpired()) {
                 revokedTokenStore.delete(revokedKey);
                 return;
             }
-            
+
             // Token has been revoked
             String errorMessage = switch (tokenType) {
                 case "access" -> "Access Token has been revoked";
@@ -2770,13 +5061,7 @@ public class CognitoService implements ResourceProvider {
             throw new AwsException("NotAuthorizedException", errorMessage, 400);
         }
     }
-    
-    private void validateOriginJtiNotRevoked(String accessToken, String poolId) {
-        String originJti = extractOriginJtiFromToken(accessToken);
-        if (originJti != null) {
-            validateTokenNotRevoked(originJti, poolId, "access");
-        }
-    }
+
 
     /**
      * Check if a user has been globally signed out (affects all their tokens).
@@ -2785,13 +5070,13 @@ public class CognitoService implements ResourceProvider {
     private void validateUserNotGloballySignedOut(String username, String poolId, String tokenType, long iat) {
         String globalRevokeKey = revokedTokenKey(poolId, "global:" + username);
         Optional<RevokedTokenInfo> globalRevoked = revokedTokenStore.get(globalRevokeKey);
-        
+
         if (globalRevoked.isPresent()) {
             RevokedTokenInfo globalInfo = globalRevoked.get();
             if (!globalInfo.isExpired()) {
                 long revokedAtMs = globalInfo.getRevokedAt();
                 boolean revoked = false;
-                
+
                 if (iat > 1000000000000L) {
                     // iat is in milliseconds (refresh token)
                     revoked = iat <= revokedAtMs;
@@ -2804,7 +5089,7 @@ public class CognitoService implements ResourceProvider {
                 if (revoked) {
                     String errorMessage = switch (tokenType) {
                         case "access" -> "Access Token has been revoked";
-                        case "id" -> "ID Token has been revoked"; 
+                        case "id" -> "ID Token has been revoked";
                         case "refresh" -> "Refresh Token has been revoked";
                         default -> "Token has been revoked";
                     };
@@ -2815,24 +5100,24 @@ public class CognitoService implements ResourceProvider {
             }
         }
     }
-    
+
     /**
      * Revoke all tokens (refresh, access, ID) for a specific user.
      * This implements the core logic for AdminUserGlobalSignOut.
      */
     private void revokeAllUserTokens(String userPoolId, String username) {
         long nowMs = System.currentTimeMillis();
-        
+
         // Note: In a real implementation, we would need to track all active tokens for a user.
         // Since Floci doesn't currently maintain a token registry, we implement a simpler
         // approach that marks the user as globally signed out with a future expiration.
         // This covers the most common use case where tokens are checked at validation time.
-        
+
         // Create a revocation record for the user with a future expiration
         // This will catch any existing tokens when they're next validated
         String globalRevokeKey = revokedTokenKey(userPoolId, "global:" + username);
         long globalExpiration = nowMs + (365L * 24L * 60L * 60L * 1000L); // 1 year from now in ms
-        
+
         RevokedTokenInfo globalRevocation = new RevokedTokenInfo(
             "global:" + username,
             "global",
@@ -2841,17 +5126,89 @@ public class CognitoService implements ResourceProvider {
             nowMs,
             globalExpiration
         );
-        
+
         revokedTokenStore.put(globalRevokeKey, globalRevocation);
-        
+
         LOG.debugv("Created global revocation record for user {0} in pool {1}", username, userPoolId);
     }
-    
+
     /**
      * Generate a storage key for revoked token information.
      */
     private String revokedTokenKey(String poolId, String jti) {
         return "revoked:" + poolId + ":" + jti;
+    }
+
+    private boolean isVerifiableContactAttribute(String attributeName) {
+        return "email".equals(attributeName) || "phone_number".equals(attributeName);
+    }
+
+    private void clearPendingAttributeVerification(String userPoolId, CognitoUser user,
+                                                   String attributeName) {
+        if (!isVerifiableContactAttribute(attributeName)) {
+            return;
+        }
+        user.getPendingAttributes().remove(attributeName);
+        if (verificationCodeService != null) {
+            verificationCodeService.invalidatePrevious(
+                    userPoolId, user.getUsername(), verificationPurpose(attributeName));
+        }
+    }
+
+    private VerificationCode.Purpose verificationPurpose(String attributeName) {
+        return "email".equals(attributeName)
+                ? VerificationCode.Purpose.EMAIL_ATTRIBUTE_VERIFICATION
+                : VerificationCode.Purpose.PHONE_ATTRIBUTE_VERIFICATION;
+    }
+
+    private String deliveryMedium(String attributeName) {
+        return "email".equals(attributeName) ? "EMAIL" : "SMS";
+    }
+
+    private String maskAttributeDestination(String attributeName, String destination) {
+        return "email".equals(attributeName)
+                ? maskEmail(destination)
+                : maskPhoneNumber(destination);
+    }
+
+    private String attributeVerificationDestination(CognitoUser user, String attributeName) {
+        String pending = blankToNull(user.getPendingAttributes().get(attributeName));
+        return pending != null ? pending : blankToNull(user.getAttributes().get(attributeName));
+    }
+
+    private boolean requiresVerificationBeforeUpdate(UserPool pool, String attributeName) {
+        Object configured = pool.getUserAttributeUpdateSettings()
+                .get("AttributesRequireVerificationBeforeUpdate");
+        return configured instanceof List<?> attributes && attributes.contains(attributeName);
+    }
+
+    private void dispatchAttributeVerificationCode(UserPool pool, CognitoUser user,
+                                                    String attributeName, String destination,
+                                                    VerificationCode.Purpose purpose, String code) {
+        CognitoUser deliveryUser = MAPPER.convertValue(user, CognitoUser.class);
+        deliveryUser.getAttributes().put(attributeName, destination);
+        messageDispatcher.dispatch(pool, deliveryUser, purpose, code,
+                List.of(deliveryMedium(attributeName)));
+    }
+
+    private void ensureAliasAvailable(UserPool pool, CognitoUser currentUser,
+                                      String attributeName, String value) {
+        boolean aliasAttribute = pool.getAliasAttributes().contains(attributeName);
+        boolean usernameAttribute = pool.getUsernameAttributes().contains(attributeName);
+        if (!aliasAttribute && !usernameAttribute) {
+            return;
+        }
+
+        String prefix = pool.getId() + "::";
+        boolean conflict = userStore.scan(key -> key.startsWith(prefix)).stream()
+                .filter(candidate -> !candidate.getUsername().equals(currentUser.getUsername()))
+                .filter(candidate -> value.equals(candidate.getAttributes().get(attributeName)))
+                .anyMatch(candidate -> !aliasAttribute
+                        || isActiveAliasAttribute(candidate, attributeName));
+        if (conflict) {
+            throw new AwsException("AliasExistsException",
+                    "An account with the given " + attributeName + " already exists", 400);
+        }
     }
 
     private void ensureVerificationWiring() {
@@ -2932,6 +5289,55 @@ public class CognitoService implements ResourceProvider {
             case RATE_LIMIT -> new AwsException("LimitExceededException",
                     "Attempt limit exceeded, please try again later", 400);
         };
+    }
+
+    /** Whether the sign-in verification-code path (EMAIL_OTP/SMS_OTP under USER_AUTH) is wired up. */
+    boolean verificationServicesConfigured() {
+        return verificationCodeService != null && messageDispatcher != null;
+    }
+
+    /**
+     * Issues and delivers a one-time code for a USER_AUTH EMAIL_OTP/SMS_OTP challenge, mirroring
+     * the SignUp/ForgotPassword code-delivery path. Returns the masked CODE_DELIVERY challenge
+     * parameters for the InitiateAuth/RespondToAuthChallenge response.
+     */
+    Map<String, String> issueSignInOtp(UserPool pool, CognitoUser user, VerificationCode.Purpose purpose,
+            String attributeName, String deliveryMedium, Map<String, Object> customMessageResponse) {
+        ensureVerificationWiring();
+        String destination = user.getAttributes().get(attributeName);
+        String code;
+        try {
+            code = verificationCodeService.issue(pool.getId(), user.getUsername(), purpose, Duration.ofMinutes(5));
+            messageDispatcher.dispatch(pool, user, purpose, code, List.of(deliveryMedium), customMessageResponse);
+        } catch (VerificationCodeException e) {
+            throw mapVerificationCodeException(e);
+        } catch (RuntimeException e) {
+            // The code was already issued and stored before dispatch failed; invalidate it so
+            // the rate limiter doesn't block an immediate retry for a code the user never
+            // received, matching how signUp's rollback treats the same failure shape.
+            verificationCodeService.invalidatePrevious(pool.getId(), user.getUsername(), purpose);
+            LOG.warnv(e, "Failed to deliver a USER_AUTH {0} code for pool {1}: {2}",
+                    purpose, pool.getId(), e.getMessage());
+            // Unlike SignUp/ResendConfirmationCode/ForgotPassword, none of InitiateAuth,
+            // AdminInitiateAuth, RespondToAuthChallenge or AdminRespondToAuthChallenge declare
+            // CodeDeliveryFailureException; all four declare InternalErrorException instead.
+            throw new AwsException("InternalErrorException", "Failed to deliver the message.", 500);
+        }
+        String masked = "email".equals(attributeName) ? maskEmail(destination) : maskPhoneNumber(destination);
+        Map<String, String> details = new LinkedHashMap<>();
+        details.put("CODE_DELIVERY_DELIVERY_MEDIUM", deliveryMedium);
+        details.put("CODE_DELIVERY_DESTINATION", masked);
+        return details;
+    }
+
+    /** Consumes a USER_AUTH EMAIL_OTP/SMS_OTP code, translating a wrong/expired code to the AWS shape. */
+    void consumeSignInOtp(String userPoolId, String username, VerificationCode.Purpose purpose, String code) {
+        ensureVerificationWiring();
+        try {
+            verificationCodeService.consume(userPoolId, username, purpose, code);
+        } catch (VerificationCodeException e) {
+            throw mapVerificationCodeException(e);
+        }
     }
 
     private boolean matchesAliasOrUsernameAttribute(UserPool pool, CognitoUser user,
@@ -3026,7 +5432,7 @@ public class CognitoService implements ResourceProvider {
         }
         return recoveryMechanisms.stream().filter(Map.class::isInstance).map(Map.class::cast)
                 .sorted(Comparator.comparingInt(this::recoveryPriority))
-                .map(m -> String.valueOf(m.get("Name"))).filter(name -> !"admin_only".equals(name))
+                .map(m -> String.valueOf(m.get("Name")))
                 .toList();
     }
 
@@ -3074,6 +5480,168 @@ public class CognitoService implements ResourceProvider {
             return value.substring(0, value.length() - 1);
         }
         return value;
+    }
+    /**
+     * One factor's settings from an MFA preference request ({@code EmailMfaSettings},
+     * {@code SoftwareTokenMfaSettings}). A null member leaves the stored value alone.
+     */
+    public record MfaSettingsUpdate(Boolean enabled, Boolean preferredMfa) {
+        public static final MfaSettingsUpdate NONE = new MfaSettingsUpdate(null, null);
+
+        boolean isEmpty() {
+            return enabled == null && preferredMfa == null;
+        }
+    }
+
+    public void adminSetUserMFAPreference(String userPoolId, String username,
+                                          MfaSettingsUpdate email, MfaSettingsUpdate softwareToken) {
+        CognitoUser resolvedUser = adminGetUser(userPoolId, username);
+        synchronized (userLock(userPoolId, resolvedUser.getUsername())) {
+            updateMfaPreferenceUnderUserLock(userPoolId, resolvedUser.getUsername(), email, softwareToken);
+        }
+    }
+
+    public void setUserMFAPreference(String accessToken, MfaSettingsUpdate email, MfaSettingsUpdate softwareToken) {
+        VerifiedAccessToken token = verifyAccessToken(accessToken);
+        requireScope(accessToken, USER_ADMIN_SCOPE);
+        synchronized (userLock(token.poolId(), token.username())) {
+            updateMfaPreferenceUnderUserLock(token.poolId(), token.username(), email, softwareToken);
+        }
+    }
+
+    private void updateMfaPreferenceUnderUserLock(String poolId, String username,
+                                                  MfaSettingsUpdate email, MfaSettingsUpdate softwareToken) {
+        CognitoUser user = adminGetUser(poolId, username);
+        if (Boolean.TRUE.equals(email.preferredMfa()) && Boolean.TRUE.equals(softwareToken.preferredMfa())) {
+            throw new AwsException("InvalidParameterException",
+                    "Only one MFA method can be set as preferred.", 400);
+        }
+        EmailMfaSettings emailSettings = user.getEmailMfaSettings();
+        SoftwareTokenMfaSettings tokenSettings = user.getSoftwareTokenMfaSettings();
+        FactorState emailState = resolveMfaSettings(email, emailSettings == null
+                ? FactorState.OFF : new FactorState(emailSettings.isEnabled(), emailSettings.isPreferredMfa()));
+        FactorState tokenState = resolveMfaSettings(softwareToken, tokenSettings == null
+                ? FactorState.OFF : new FactorState(tokenSettings.isEnabled(), tokenSettings.isPreferredMfa()));
+        // AWS refuses to turn on TOTP MFA for a user who has not verified an authenticator.
+        if (Boolean.TRUE.equals(softwareToken.enabled()) && user.getSoftwareTokenMfaSecret() == null) {
+            throw new AwsException("InvalidParameterException",
+                    "User does not have delivery config set to turn on SOFTWARE_TOKEN_MFA", 400);
+        }
+        // Only one factor is preferred, so preferring one drops the preference of the others.
+        if (Boolean.TRUE.equals(email.preferredMfa())) {
+            tokenState = new FactorState(tokenState.enabled(), false);
+        } else if (Boolean.TRUE.equals(softwareToken.preferredMfa())) {
+            emailState = new FactorState(emailState.enabled(), false);
+        }
+        if (!email.isEmpty() || emailSettings != null) {
+            EmailMfaSettings settings = emailSettings != null ? emailSettings : new EmailMfaSettings();
+            settings.setEnabled(emailState.enabled());
+            settings.setPreferredMfa(emailState.preferred());
+            user.setEmailMfaSettings(settings);
+        }
+        if (!softwareToken.isEmpty() || tokenSettings != null) {
+            SoftwareTokenMfaSettings settings = tokenSettings != null ? tokenSettings : new SoftwareTokenMfaSettings();
+            settings.setEnabled(tokenState.enabled());
+            settings.setPreferredMfa(tokenState.preferred());
+            user.setSoftwareTokenMfaSettings(settings);
+        }
+        user.setLastModifiedDate(System.currentTimeMillis() / 1000L);
+        userStore.put(userKey(poolId, user.getUsername()), user);
+    }
+
+    private record FactorState(boolean enabled, boolean preferred) {
+        static final FactorState OFF = new FactorState(false, false);
+    }
+
+    /**
+     * The state a factor ends up in after {@code update}. Disabling a factor drops its preference,
+     * and preferring a disabled one is refused.
+     */
+    private static FactorState resolveMfaSettings(MfaSettingsUpdate update, FactorState current) {
+        boolean enabled = update.enabled() != null ? update.enabled() : current.enabled();
+        boolean preferred = update.preferredMfa() != null ? update.preferredMfa() : current.preferred();
+        if (!enabled && Boolean.TRUE.equals(update.preferredMfa())) {
+            throw new AwsException("InvalidParameterException",
+                    "Preferred MFA setting cannot be enabled when the MFA method is disabled.", 400);
+        }
+        return new FactorState(enabled, enabled && preferred);
+    }
+
+    /**
+     * Marks the user's newly registered authenticator as their MFA factor, which completing the
+     * {@code MFA_SETUP} challenge does on AWS. It becomes the preferred factor when no other is.
+     */
+    void activateSoftwareTokenMfaAfterSetup(String poolId, String username) {
+        synchronized (userLock(poolId, username)) {
+            CognitoUser user = adminGetUser(poolId, username);
+            SoftwareTokenMfaSettings settings = user.getSoftwareTokenMfaSettings() != null
+                    ? user.getSoftwareTokenMfaSettings() : new SoftwareTokenMfaSettings();
+            settings.setEnabled(true);
+            if (preferredMfaSetting(describeUserPool(poolId), user) == null) {
+                settings.setPreferredMfa(true);
+            }
+            user.setSoftwareTokenMfaSettings(settings);
+            user.setLastModifiedDate(System.currentTimeMillis() / 1000L);
+            userStore.put(userKey(poolId, user.getUsername()), user);
+        }
+    }
+
+    /**
+     * {@code UserMFASettingList}: the MFA factors activated for the user, in the order the API
+     * reference lists them. Software-token MFA counts once the user has a verified authenticator
+     * that is turned on, or that a pool requiring software-token MFA asks for at every sign-in.
+     */
+    static List<String> userMfaSettingList(UserPool pool, CognitoUser user) {
+        List<String> factors = new ArrayList<>();
+        if (user.getEmailMfaSettings() != null && user.getEmailMfaSettings().isEnabled()) {
+            factors.add("EMAIL_OTP");
+        }
+        if (softwareTokenMfaActive(pool, user)) {
+            factors.add("SOFTWARE_TOKEN_MFA");
+        }
+        return factors;
+    }
+
+    /** {@code PreferredMfaSetting}: the user's preferred MFA factor, or null when none is. */
+    static @Nullable String preferredMfaSetting(UserPool pool, CognitoUser user) {
+        EmailMfaSettings email = user.getEmailMfaSettings();
+        if (email != null && email.isEnabled() && email.isPreferredMfa()) {
+            return "EMAIL_OTP";
+        }
+        SoftwareTokenMfaSettings token = user.getSoftwareTokenMfaSettings();
+        if (token != null && token.isPreferredMfa() && softwareTokenMfaActive(pool, user)) {
+            return "SOFTWARE_TOKEN_MFA";
+        }
+        return null;
+    }
+
+    /** Whether the user has turned on software-token MFA for a verified authenticator. */
+    static boolean softwareTokenMfaEnabled(CognitoUser user) {
+        SoftwareTokenMfaSettings settings = user.getSoftwareTokenMfaSettings();
+        return settings != null && settings.isEnabled() && user.getSoftwareTokenMfaSecret() != null;
+    }
+
+    /**
+     * Whether software-token MFA is active for the user: turned on, or required. A pool that requires
+     * software-token MFA asks for a registered authenticator at every sign-in, whether or not it was
+     * turned on, and AWS lets users there choose only which factor is preferred.
+     */
+    private static boolean softwareTokenMfaActive(UserPool pool, CognitoUser user) {
+        return softwareTokenMfaEnabled(user)
+                || (user.getSoftwareTokenMfaSecret() != null && "ON".equals(pool.getMfaConfiguration())
+                        && Boolean.TRUE.equals(pool.getSoftwareTokenMfaEnabled()));
+    }
+
+    /** Adds {@code UserMFASettingList} and {@code PreferredMfaSetting} to a user response, when set. */
+    static void putMfaSettings(Map<String, Object> response, UserPool pool, CognitoUser user) {
+        String preferred = preferredMfaSetting(pool, user);
+        if (preferred != null) {
+            response.put("PreferredMfaSetting", preferred);
+        }
+        List<String> factors = userMfaSettingList(pool, user);
+        if (!factors.isEmpty()) {
+            response.put("UserMFASettingList", factors);
+        }
     }
 
     private record DeliveryTarget(String attributeName, String deliveryMedium, String destination) {

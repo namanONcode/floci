@@ -102,10 +102,13 @@ class LambdaFunctionConfigTest {
                 .as("default TracingConfig.Mode must be PassThrough")
                 .isEqualTo("PassThrough");
 
-        // Environment block must always be present (even when empty)
+        // AWS omits Environment entirely for a function with no variables — verified
+        // against the live service — so the SDK deserialises it as null here, the same
+        // as layers() and vpcConfig(). Returning an empty block instead gives Terraform
+        // a permanent `- environment {}` diff.
         assertThat(resp.environment())
-                .as("Environment must always be present in the response")
-                .isNotNull();
+                .as("Environment must be omitted when no variables are set")
+                .isNull();
     }
 
     // ─── UpdateFunctionConfiguration ─────────────────────────────────────────
@@ -207,16 +210,23 @@ class LambdaFunctionConfigTest {
                 .containsEntry("KEY_A", "value-a")
                 .containsEntry("KEY_B", "value-b");
 
-        // Clear environment — response must still include the Environment block
-        UpdateFunctionConfigurationResponse cleared = lambda.updateFunctionConfiguration(
+        // An Environment with no Variables member is "leave unchanged", not "clear" — the
+        // existing variables survive. Verified against the live service: sending
+        // Environment={} keeps {"KEY_A": "value-a"} on both the update response and the
+        // following read. (Clearing takes an empty Variables map, which AWS answers by
+        // omitting the member entirely.)
+        UpdateFunctionConfigurationResponse unchanged = lambda.updateFunctionConfiguration(
                 UpdateFunctionConfigurationRequest.builder()
                         .functionName(FN)
                         .environment(Environment.builder().build())
                         .build());
 
-        assertThat(cleared.environment())
-                .as("Environment block must be present even after clearing variables")
+        assertThat(unchanged.environment())
+                .as("an Environment with no Variables member must leave the variables alone")
                 .isNotNull();
+        assertThat(unchanged.environment().variables())
+                .containsEntry("KEY_A", "value-a")
+                .containsEntry("KEY_B", "value-b");
     }
 
     @Test
@@ -263,6 +273,59 @@ class LambdaFunctionConfigTest {
             try {
                 lambda.deleteFunction(DeleteFunctionRequest.builder().functionName(imageFn).build());
             } catch (Exception ignored) {}
+        }
+    }
+
+    @Test
+    @Order(7)
+    @DisplayName("DurableConfig round-trips via create, update and get")
+    void durableConfigRoundTrips() {
+        String durableFn = TestFixtures.uniqueName("fn-durable");
+        try {
+            CreateFunctionResponse createResp = lambda.createFunction(CreateFunctionRequest.builder()
+                    .functionName(durableFn)
+                    .runtime(Runtime.NODEJS20_X)
+                    .role(ROLE)
+                    .handler("index.handler")
+                    .code(FunctionCode.builder()
+                            .zipFile(SdkBytes.fromByteArray(LambdaUtils.minimalZip()))
+                            .build())
+                    .durableConfig(DurableConfig.builder().executionTimeout(3600).build())
+                    .build());
+
+            assertThat(createResp.durableConfig().executionTimeout()).isEqualTo(3600);
+            assertThat(createResp.durableConfig().retentionPeriodInDays())
+                    .as("RetentionPeriodInDays defaults to 14")
+                    .isEqualTo(14);
+            assertThat(createResp.timeout())
+                    .as("Timeout of a durable function defaults to the 15 minute cap")
+                    .isEqualTo(900);
+
+            UpdateFunctionConfigurationResponse updateResp = lambda.updateFunctionConfiguration(
+                    UpdateFunctionConfigurationRequest.builder()
+                            .functionName(durableFn)
+                            .durableConfig(DurableConfig.builder().retentionPeriodInDays(7).build())
+                            .build());
+            assertThat(updateResp.durableConfig().executionTimeout())
+                    .as("a member left out of the update keeps its value")
+                    .isEqualTo(3600);
+            assertThat(updateResp.durableConfig().retentionPeriodInDays()).isEqualTo(7);
+
+            GetFunctionConfigurationResponse getResp = lambda.getFunctionConfiguration(
+                    GetFunctionConfigurationRequest.builder().functionName(durableFn).build());
+            assertThat(getResp.durableConfig().retentionPeriodInDays()).isEqualTo(7);
+
+            GetFunctionConfigurationResponse plain = lambda.getFunctionConfiguration(
+                    GetFunctionConfigurationRequest.builder().functionName(FN).build());
+            assertThat(plain.durableConfig())
+                    .as("a function created without DurableConfig has none")
+                    .isNull();
+        } finally {
+            try {
+                lambda.deleteFunction(DeleteFunctionRequest.builder().functionName(durableFn).build());
+            } catch (Exception ignored) {
+                // Cleanup only. A failed delete must not hide the test result.
+            }
         }
     }
 }

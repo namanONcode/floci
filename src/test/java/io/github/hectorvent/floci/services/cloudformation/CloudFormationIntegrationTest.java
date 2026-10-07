@@ -4,6 +4,8 @@ import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.testing.MutableClock;
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
+import io.restassured.response.ValidatableResponse;
+import io.restassured.specification.RequestSpecification;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
@@ -48,6 +50,7 @@ class CloudFormationIntegrationTest {
     private static final String SSM_CONTENT_TYPE = "application/x-amz-json-1.1";
     private static final String SM_CONTENT_TYPE = "application/x-amz-json-1.1";
     private static final String COGNITO_CONTENT_TYPE = "application/x-amz-json-1.1";
+    private static final String TAGGING_CONTENT_TYPE = "application/x-amz-json-1.1";
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
 
     @Inject
@@ -78,6 +81,46 @@ class CloudFormationIntegrationTest {
         } catch (Exception e) {
             throw new RuntimeException(e);
         }
+    }
+
+    /**
+     * DeleteStack answers before the stack is gone: the deletion runs on an executor. Waits until
+     * DescribeStacks reports DELETE_COMPLETE or no longer knows the stack, and fails on DELETE_FAILED
+     * or after ten seconds, so a test can assert on the deleted resources afterwards.
+     */
+    private static void awaitStackDeleted(String stackNameOrArn) {
+        awaitStackStatus(stackNameOrArn, "DELETE_COMPLETE");
+    }
+
+    private static void awaitStackStatus(String stackNameOrArn, String expectedStatus) {
+        long deadline = System.currentTimeMillis() + 10_000;
+        String statusXml = "";
+        while (System.currentTimeMillis() < deadline) {
+            statusXml = given()
+                .contentType("application/x-www-form-urlencoded")
+                .formParam("Action", "DescribeStacks")
+                .formParam("StackName", stackNameOrArn)
+            .when()
+                .post("/")
+            .then()
+                .extract().body().asString();
+            if ("DELETE_COMPLETE".equals(expectedStatus)) {
+                assertThat(statusXml, not(containsString("<StackStatus>DELETE_FAILED</StackStatus>")));
+                if (statusXml.contains("<StackStatus>DELETE_COMPLETE</StackStatus>")
+                        || statusXml.contains("does not exist")) {
+                    return;
+                }
+            } else if (statusXml.contains("<StackStatus>" + expectedStatus + "</StackStatus>")) {
+                return;
+            }
+            try {
+                Thread.sleep(50);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new AssertionError("Interrupted while waiting for stack " + stackNameOrArn + " to reach " + expectedStatus, e);
+            }
+        }
+        assertThat(statusXml, containsString("<StackStatus>" + expectedStatus + "</StackStatus>"));
     }
 
     private static String firstPhysicalResourceId(String xml) {
@@ -170,7 +213,7 @@ class CloudFormationIntegrationTest {
         .then()
             .statusCode(200)
             .body(containsString("cf-test-queue"));
-        
+
         // 4. Describe Stacks
         given()
             .contentType("application/x-www-form-urlencoded")
@@ -514,6 +557,150 @@ class CloudFormationIntegrationTest {
     }
 
     @Test
+    void createStack_s3BucketWithVersioningConfiguration() {
+        String template = """
+            {
+              "Resources": {
+                "MyBucket": {
+                  "Type": "AWS::S3::Bucket",
+                  "Properties": {
+                    "BucketName": "cfn-versioning-test-bucket",
+                    "VersioningConfiguration": {
+                      "Status": "Enabled"
+                    }
+                  }
+                }
+              }
+            }
+            """;
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", "cfn-versioning-stack")
+            .formParam("TemplateBody", template)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<StackId>"));
+
+        // The bucket's ?versioning subresource should reflect the CloudFormation VersioningConfiguration.
+        given()
+        .when()
+            .get("/cfn-versioning-test-bucket?versioning")
+        .then()
+            .statusCode(200)
+            .body(containsString("<Status>Enabled</Status>"));
+    }
+
+    @Test
+    void createStack_s3BucketWithoutVersioningConfigurationLeavesVersioningUnset() {
+        String template = """
+            {
+              "Resources": {
+                "MyBucket": {
+                  "Type": "AWS::S3::Bucket",
+                  "Properties": {
+                    "BucketName": "cfn-versioning-unset-bucket"
+                  }
+                }
+              }
+            }
+            """;
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", "cfn-versioning-unset-stack")
+            .formParam("TemplateBody", template)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        // No VersioningConfiguration in the template → versioning must stay unset (no <Status> element),
+        // matching real AWS behavior for a bucket that was never versioned.
+        given()
+        .when()
+            .get("/cfn-versioning-unset-bucket?versioning")
+        .then()
+            .statusCode(200)
+            .body(not(containsString("<Status>")));
+    }
+
+    @Test
+    void updateStack_s3BucketVersioningConfigurationIsReconciled() {
+        String stackName = "cfn-versioning-update-stack";
+        String bucketName = "cfn-versioning-update-bucket";
+        String enabled = """
+            {
+              "Resources": {
+                "MyBucket": {
+                  "Type": "AWS::S3::Bucket",
+                  "Properties": {
+                    "BucketName": "%s",
+                    "VersioningConfiguration": {
+                      "Status": "Enabled"
+                    }
+                  }
+                }
+              }
+            }
+            """.formatted(bucketName);
+        String suspended = """
+            {
+              "Resources": {
+                "MyBucket": {
+                  "Type": "AWS::S3::Bucket",
+                  "Properties": {
+                    "BucketName": "%s",
+                    "VersioningConfiguration": {
+                      "Status": "Suspended"
+                    }
+                  }
+                }
+              }
+            }
+            """.formatted(bucketName);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody", enabled)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+        .when()
+            .get("/" + bucketName + "?versioning")
+        .then()
+            .statusCode(200)
+            .body(containsString("<Status>Enabled</Status>"));
+
+        // Update: Status changes to Suspended → versioning is reconciled to match the template.
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "UpdateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody", suspended)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+        .when()
+            .get("/" + bucketName + "?versioning")
+        .then()
+            .statusCode(200)
+            .body(containsString("<Status>Suspended</Status>"));
+    }
+
+    @Test
     void createStack_lambdaWithS3Code() {
         byte[] zipBytes = buildHandlerZip();
 
@@ -722,6 +909,93 @@ class CloudFormationIntegrationTest {
     }
 
     @Test
+    void updateStack_unnamedQueueKeepsItsUrlAndReconcilesAttributes() {
+        // QueueName is createOnly, so an unnamed queue keeps its generated name across updates.
+        // The second UpdateStack then reaches SqsService with a name that exists, which answers
+        // QueueAlreadyExists once an attribute differs: the changed VisibilityTimeout must go
+        // through SetQueueAttributes against the same queue URL instead of a second create.
+        String stackName = "cfn-queue-stable-name-stack";
+        String template = """
+            {
+              "Resources": {
+                "MyQueue": {
+                  "Type": "AWS::SQS::Queue",
+                  "Properties": { "VisibilityTimeout": %d }
+                }
+              }
+            }
+            """;
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody", template.formatted(30))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<StackId>"));
+
+        String createdResourceXml = given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStackResources")
+            .formParam("StackName", stackName)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<LogicalResourceId>MyQueue</LogicalResourceId>"))
+            .extract().asString();
+        String queueUrl = firstPhysicalResourceId(createdResourceXml);
+        assertThat(queueUrl, containsString("/" + stackName + "-MyQueue-"));
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "UpdateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody", template.formatted(45))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<StackId>"));
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStacks")
+            .formParam("StackName", stackName)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<StackStatus>UPDATE_COMPLETE</StackStatus>"));
+
+        String updatedResourceXml = given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStackResources")
+            .formParam("StackName", stackName)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract().asString();
+        assertThat(firstPhysicalResourceId(updatedResourceXml), equalTo(queueUrl));
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "GetQueueAttributes")
+            .formParam("QueueUrl", queueUrl)
+            .formParam("AttributeName.1", "VisibilityTimeout")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<Name>VisibilityTimeout</Name>"))
+            .body(containsString("<Value>45</Value>"));
+    }
+
+    @Test
     void updateStack_lambdaMutableConfigurationUpdatesInPlace() {
         String stackName = "cfn-lambda-config-update-stack";
         String functionName = "cfn-lambda-config-update-func";
@@ -820,6 +1094,292 @@ class CloudFormationIntegrationTest {
             .body("Configuration.FunctionName", equalTo(functionName))
             .body("Configuration.Timeout", equalTo(9))
             .body("Configuration.Environment.Variables.STAGE", equalTo("green"));
+    }
+
+    @Test
+    void updateStack_lambdaFunctionTagsFollowTheTemplate() {
+        String stackName = "cfn-lambda-tags-stack";
+        String functionName = "cfn-lambda-tags-func";
+        String functionArn = "arn:aws:lambda:us-east-1:000000000000:function:" + functionName;
+        String template = """
+            {
+              "Resources": {
+                "MyFunction": {
+                  "Type": "AWS::Lambda::Function",
+                  "Properties": {
+                    "FunctionName": "%s",
+                    "Runtime": "nodejs20.x",
+                    "Handler": "index.handler",
+                    "Role": "arn:aws:iam::000000000000:role/cfn-test-lambda-role"%s
+                  }
+                }
+              }
+            }
+            """;
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody", template.formatted(functionName, """
+                ,
+                    "Tags": [{"Key": "a", "Value": "1"}, {"Key": "b", "Value": "2"}]"""))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+        .when()
+            .get("/2017-03-31/tags/" + functionArn)
+        .then()
+            .statusCode(200)
+            .body("Tags.size()", equalTo(2))
+            .body("Tags.a", equalTo("1"))
+            .body("Tags.b", equalTo("2"));
+
+        given()
+            .header("X-Amz-Target", "ResourceGroupsTaggingAPI_20170126.GetResources")
+            .contentType(TAGGING_CONTENT_TYPE)
+            .body("""
+                {"ResourceTypeFilters": ["lambda:function"], "TagFilters": [{"Key": "a", "Values": ["1"]}]}
+                """)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("ResourceTagMappingList.ResourceARN", hasItem(functionArn));
+
+        given()
+            .contentType("application/json")
+            .body("""
+                {"Tags": {"oob": "x"}}
+                """)
+        .when()
+            .post("/2017-03-31/tags/" + functionArn)
+        .then()
+            .statusCode(204);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "UpdateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody", template.formatted(functionName, """
+                ,
+                    "Tags": [{"Key": "a", "Value": "1"}, {"Key": "c", "Value": "3"}]"""))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+        .when()
+            .get("/2017-03-31/tags/" + functionArn)
+        .then()
+            .statusCode(200)
+            .body("Tags.size()", equalTo(3))
+            .body("Tags.a", equalTo("1"))
+            .body("Tags.c", equalTo("3"))
+            .body("Tags.oob", equalTo("x"));
+    }
+
+    @Test
+    void updateStack_ssmParameterTagsFollowTheTemplate() {
+        String stackName = "cfn-ssm-tags-stack";
+        String parameterName = "/cfn/ssm-tags-param";
+
+        createSsmParameterStackWithOutOfTemplateTag(stackName, parameterName);
+        updateSsmParameterStack(stackName, parameterName, """
+            ,
+                    "Tags": {"a": "changed"}""");
+
+        ssmParameterTags(parameterName)
+            .body("TagList.size()", equalTo(2))
+            .body("TagList.find { it.Key == 'a' }.Value", equalTo("changed"))
+            .body("TagList.find { it.Key == 'ext' }.Value", equalTo("x"));
+    }
+
+    @Test
+    void updateStack_ssmParameterTagsPropertyRemovedKeepsOutOfTemplateTags() {
+        String stackName = "cfn-ssm-tags-removed-stack";
+        String parameterName = "/cfn/ssm-tags-removed-param";
+
+        createSsmParameterStackWithOutOfTemplateTag(stackName, parameterName);
+        updateSsmParameterStack(stackName, parameterName, "");
+
+        ssmParameterTags(parameterName)
+            .body("TagList.size()", equalTo(1))
+            .body("TagList.find { it.Key == 'ext' }.Value", equalTo("x"));
+    }
+
+    @Test
+    void updateStack_ssmParameterInvalidTagKeyFailsBeforeWritingANewVersion() {
+        String stackName = "cfn-ssm-invalid-tag-stack";
+        String parameterName = "/cfn/ssm-invalid-tag-param";
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody", ssmParameterTemplate(parameterName, ""))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "UpdateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody", ssmParameterTemplate(parameterName, "v2", """
+                ,
+                    "Tags": {"a,b": "x"}"""))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+        awaitStackStatus(stackName, "UPDATE_ROLLBACK_COMPLETE");
+
+        given()
+            .header("X-Amz-Target", "AmazonSSM.GetParameter")
+            .contentType(SSM_CONTENT_TYPE)
+            .body("""
+                {"Name": "%s"}
+                """.formatted(parameterName))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("Parameter.Value", equalTo("v"))
+            .body("Parameter.Version", equalTo(1));
+    }
+
+    @Test
+    void updateStack_lambdaInvalidTagKeyFailsBeforeChangingTheFunction() {
+        String stackName = "cfn-lambda-invalid-tag-stack";
+        String functionName = "cfn-lambda-invalid-tag-func";
+        String template = """
+            {
+              "Resources": {
+                "MyFunction": {
+                  "Type": "AWS::Lambda::Function",
+                  "Properties": {
+                    "FunctionName": "%s",
+                    "Runtime": "nodejs20.x",
+                    "Handler": "index.handler",
+                    "Role": "arn:aws:iam::000000000000:role/cfn-test-lambda-role",
+                    "Description": "%s"%s
+                  }
+                }
+              }
+            }
+            """;
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody", template.formatted(functionName, "before", ""))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "UpdateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody", template.formatted(functionName, "after", """
+                ,
+                    "Tags": [{"Key": "a,b", "Value": "x"}]"""))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+        awaitStackStatus(stackName, "UPDATE_ROLLBACK_COMPLETE");
+
+        given()
+        .when()
+            .get("/2015-03-31/functions/" + functionName)
+        .then()
+            .statusCode(200)
+            .body("Configuration.Description", equalTo("before"));
+    }
+
+    private static String ssmParameterTemplate(String parameterName, String tagsProperty) {
+        return ssmParameterTemplate(parameterName, "v", tagsProperty);
+    }
+
+    private static String ssmParameterTemplate(String parameterName, String value, String tagsProperty) {
+        return """
+            {
+              "Resources": {
+                "MyParameter": {
+                  "Type": "AWS::SSM::Parameter",
+                  "Properties": {
+                    "Name": "%s",
+                    "Type": "String",
+                    "Value": "%s"%s
+                  }
+                }
+              }
+            }
+            """.formatted(parameterName, value, tagsProperty);
+    }
+
+    private static void createSsmParameterStackWithOutOfTemplateTag(String stackName, String parameterName) {
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody", ssmParameterTemplate(parameterName, """
+                ,
+                    "Tags": {"a": "1", "b": "2"}"""))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        ssmParameterTags(parameterName)
+            .body("TagList.size()", equalTo(2))
+            .body("TagList.find { it.Key == 'a' }.Value", equalTo("1"))
+            .body("TagList.find { it.Key == 'b' }.Value", equalTo("2"));
+
+        given()
+            .header("X-Amz-Target", "AmazonSSM.AddTagsToResource")
+            .contentType(SSM_CONTENT_TYPE)
+            .body("""
+                {"ResourceType": "Parameter", "ResourceId": "%s", "Tags": [{"Key": "ext", "Value": "x"}]}
+                """.formatted(parameterName))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+    }
+
+    private static void updateSsmParameterStack(String stackName, String parameterName, String tagsProperty) {
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "UpdateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody", ssmParameterTemplate(parameterName, tagsProperty))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+    }
+
+    private static ValidatableResponse ssmParameterTags(String parameterName) {
+        return given()
+            .header("X-Amz-Target", "AmazonSSM.ListTagsForResource")
+            .contentType(SSM_CONTENT_TYPE)
+            .body("""
+                {"ResourceType": "Parameter", "ResourceId": "%s"}
+                """.formatted(parameterName))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
     }
 
     @Test
@@ -1087,6 +1647,97 @@ class CloudFormationIntegrationTest {
             .body("Tags.TagKey", hasItem("env"))
             .body("Tags.find { it.TagKey == 'env' }.TagValue", equalTo("test"))
             .body("Tags.find { it.TagKey == 'floci:override-id' }", nullValue());
+    }
+
+    @Test
+    void updateStack_httpApiWithOverrideTagKeepsPinnedId() {
+        String template = """
+            {
+              "Resources": {
+                "MyApi": {
+                  "Type": "AWS::ApiGatewayV2::Api",
+                  "Properties": {
+                    "Name": "cfn-override-api",
+                    "ProtocolType": "HTTP",
+                    "Description": "%s",
+                    "Tags": {
+                      "floci:override-id": "cfn-pinned-api",
+                      "env": "test"
+                    }
+                  }
+                }
+              }
+            }
+            """;
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", "cfn-http-api-override-stack")
+            .formParam("TemplateBody", template.formatted("before"))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        // Infrastructure tools resend the full tag set, override included, on every update.
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "UpdateStack")
+            .formParam("StackName", "cfn-http-api-override-stack")
+            .formParam("TemplateBody", template.formatted("after"))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStacks")
+            .formParam("StackName", "cfn-http-api-override-stack")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<StackStatus>UPDATE_COMPLETE</StackStatus>"));
+
+        given()
+        .when()
+            .get("/v2/apis/cfn-pinned-api")
+        .then()
+            .statusCode(200)
+            .body("description", equalTo("after"))
+            .body("tags.env", equalTo("test"))
+            .body("tags.'floci:override-id'", nullValue());
+
+        // A different override would rename the API, which is still refused after creation.
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "UpdateStack")
+            .formParam("StackName", "cfn-http-api-override-stack")
+            .formParam("TemplateBody", template.formatted("renamed").replace("cfn-pinned-api", "cfn-renamed-api"))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStacks")
+            .formParam("StackName", "cfn-http-api-override-stack")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<StackStatus>UPDATE_ROLLBACK_COMPLETE</StackStatus>"));
+
+        given()
+        .when()
+            .get("/v2/apis/cfn-pinned-api")
+        .then()
+            .statusCode(200)
+            .body("description", equalTo("after"))
+            .body("tags.env", equalTo("test"));
     }
 
     @Test
@@ -1775,26 +2426,7 @@ class CloudFormationIntegrationTest {
         .then()
             .statusCode(200);
 
-        long deadline = System.currentTimeMillis() + 10_000;
-        while (System.currentTimeMillis() < deadline) {
-            String statusXml = given()
-                .contentType("application/x-www-form-urlencoded")
-                .formParam("Action", "DescribeStacks")
-                .formParam("StackName", "cfn-1668-delete-stack")
-            .when()
-                .post("/")
-            .then()
-                .extract().body().asString();
-
-            assertThat(statusXml, not(containsString("<StackStatus>DELETE_FAILED</StackStatus>")));
-
-            if (statusXml.contains("<StackStatus>DELETE_COMPLETE</StackStatus>")
-                    || statusXml.contains("does not exist")) {
-                return;
-            }
-            Thread.sleep(200);
-        }
-        throw new AssertionError("Stack did not reach DELETE_COMPLETE within timeout");
+        awaitStackDeleted("cfn-1668-delete-stack");
     }
 
     // Regression: issue #1966. A resource removed outside CloudFormation must be treated as
@@ -1877,24 +2509,7 @@ class CloudFormationIntegrationTest {
         .then()
             .statusCode(200);
 
-        long deleteDeadline = System.currentTimeMillis() + 10_000;
-        while (System.currentTimeMillis() < deleteDeadline) {
-            String statusXml = given()
-                .contentType("application/x-www-form-urlencoded")
-                .formParam("Action", "DescribeStacks")
-                .formParam("StackName", stackArn)
-            .when()
-                .post("/")
-            .then()
-                .statusCode(200)
-                .extract().asString();
-            if (statusXml.contains("<StackStatus>DELETE_COMPLETE</StackStatus>")) {
-                return;
-            }
-            assertThat(statusXml, not(containsString("<StackStatus>DELETE_FAILED</StackStatus>")));
-            Thread.sleep(200);
-        }
-        throw new AssertionError("Stack did not reach DELETE_COMPLETE within timeout");
+        awaitStackDeleted(stackArn);
     }
 
     @Test
@@ -1976,6 +2591,179 @@ class CloudFormationIntegrationTest {
         .then()
             .statusCode(400)
             .body(containsString("does not exist"));
+    }
+
+    @Test
+    void describeDeletedStack_byArn_reportsItsDeletionTime() throws Exception {
+        String stackArn = createAndDeleteStack("deleted-deletion-time-stack",
+                "deleted-deletion-time-test-bucket");
+
+        String xml = given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStacks")
+            .formParam("StackName", stackArn)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract().asString();
+
+        assertThat(xml, containsString("<StackStatus>DELETE_COMPLETE</StackStatus>"));
+        // The service clock, not the wall clock: the test clock starts the run at 2026-01-01.
+        assertThat(xml, containsString("<DeletionTime>2026-01-01T"));
+    }
+
+    @Test
+    void describeLiveStack_reportsNoDeletionTime() {
+        String template = """
+            {
+              "Resources": {
+                "MyBucket": {
+                  "Type": "AWS::S3::Bucket",
+                  "Properties": { "BucketName": "live-no-deletion-time-test-bucket" }
+                }
+              }
+            }
+            """;
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", "live-no-deletion-time-stack")
+            .formParam("TemplateBody", template)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStacks")
+            .formParam("StackName", "live-no-deletion-time-stack")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(not(containsString("<DeletionTime>")));
+    }
+
+    @Test
+    void listStacks_includesADeletedStackAsDeleteComplete() throws Exception {
+        String stackArn = createAndDeleteStack("listed-deleted-stack",
+                "listed-deleted-test-bucket");
+
+        String member = listStacksMemberFor(listStacksXml(null), stackArn);
+
+        assertThat(member, containsString("<StackName>listed-deleted-stack</StackName>"));
+        assertThat(member, containsString("<StackStatus>DELETE_COMPLETE</StackStatus>"));
+        assertThat(member, containsString("<DeletionTime>2026-01-01T"));
+    }
+
+    @Test
+    void listStacks_filteredToDeleteComplete_returnsTheDeletedStackAndNoLiveOne() throws Exception {
+        String stackArn = createAndDeleteStack("listed-filtered-deleted-stack",
+                "listed-filtered-deleted-test-bucket");
+
+        String xml = listStacksXml("DELETE_COMPLETE");
+
+        assertThat(xml, containsString("<StackId>" + stackArn + "</StackId>"));
+        assertThat(xml, not(containsString("<StackStatus>CREATE_COMPLETE</StackStatus>")));
+    }
+
+    @Test
+    void listStacks_afterTheRetentionWindow_dropsTheDeletedStack() throws Exception {
+        String stackArn = createAndDeleteStack("listed-expiring-deleted-stack",
+                "listed-expiring-deleted-test-bucket");
+
+        assertThat(listStacksXml(null), containsString("<StackId>" + stackArn + "</StackId>"));
+
+        clock.advance(Duration.ofSeconds(31));
+
+        assertThat(listStacksXml(null), not(containsString("<StackId>" + stackArn + "</StackId>")));
+    }
+
+    /**
+     * Creates a single-bucket stack, deletes it, and answers its stack ARN once the delete has
+     * reached DELETE_COMPLETE. DeleteStack hands the work to a background executor, so the
+     * DELETE_COMPLETE event is what says the retained record is in place.
+     */
+    private String createAndDeleteStack(String stackName, String bucketName) throws Exception {
+        String template = """
+            {
+              "Resources": {
+                "MyBucket": {
+                  "Type": "AWS::S3::Bucket",
+                  "Properties": { "BucketName": "%s" }
+                }
+              }
+            }
+            """.formatted(bucketName);
+
+        String createResponse = given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody", template)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<StackId>"))
+            .extract().asString();
+
+        String stackArn = createResponse.substring(
+                createResponse.indexOf("<StackId>") + "<StackId>".length(),
+                createResponse.indexOf("</StackId>"));
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DeleteStack")
+            .formParam("StackName", stackName)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        long deadline = System.currentTimeMillis() + 10_000;
+        while (System.currentTimeMillis() < deadline) {
+            String events = given()
+                .contentType("application/x-www-form-urlencoded")
+                .formParam("Action", "DescribeStackEvents")
+                .formParam("StackName", stackArn)
+            .when()
+                .post("/")
+            .then()
+                .statusCode(200)
+                .extract().asString();
+
+            if (events.contains("<ResourceStatus>DELETE_COMPLETE</ResourceStatus>")) {
+                return stackArn;
+            }
+            Thread.sleep(200);
+        }
+        throw new AssertionError("stack " + stackName + " never reached DELETE_COMPLETE");
+    }
+
+    private String listStacksXml(String statusFilter) {
+        RequestSpecification request = given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "ListStacks");
+        if (statusFilter != null) {
+            request = request.formParam("StackStatusFilter.member.1", statusFilter);
+        }
+        return request
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract().asString();
+    }
+
+    /** The one ListStacks summary carrying this stack id, so an assertion cannot match another. */
+    private static String listStacksMemberFor(String xml, String stackArn) {
+        int idAt = xml.indexOf("<StackId>" + stackArn + "</StackId>");
+        assertTrue(idAt >= 0, "stack " + stackArn + " is not listed:\n" + xml);
+        return xml.substring(xml.lastIndexOf("<member>", idAt), xml.indexOf("</member>", idAt));
     }
 
     @Test
@@ -2314,6 +3102,65 @@ class CloudFormationIntegrationTest {
         .then()
             .statusCode(200)
             .body(containsString("CaseSensitive-Stack-MyMixedCaseQueue-"));
+    }
+
+    @Test
+    void createStack_schedulerScheduleGroup_isActuallyProvisioned() {
+        // github.com/floci-io/floci/issues/2396: AWS::Scheduler::ScheduleGroup fell through to the
+        // generic stub, so the stack reported CREATE_COMPLETE with a fake physical id and the group
+        // never actually existed. GetScheduleGroup used to return ResourceNotFoundException here.
+        // ArnParam pins Fn::GetAtt MyGroup.Arn against the group's actual ARN, so an omission or
+        // rename of the provisioner's Arn attribute fails this test rather than only the direct
+        // GetScheduleGroup check below (Greptile review on PR #2796).
+        String template = """
+            {
+              "Resources": {
+                "MyGroup": {
+                  "Type": "AWS::Scheduler::ScheduleGroup",
+                  "Properties": {
+                    "Name": "group-repro"
+                  }
+                },
+                "ArnParam": {
+                  "Type": "AWS::SSM::Parameter",
+                  "Properties": {
+                    "Name": "/app/schedule-group-arn",
+                    "Type": "String",
+                    "Value": {"Fn::GetAtt": ["MyGroup", "Arn"]}
+                  }
+                }
+              }
+            }
+            """;
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", "SchedulerGroupStack")
+            .formParam("TemplateBody", template)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+        .when()
+            .get("/schedule-groups/group-repro")
+        .then()
+            .statusCode(200)
+            .body(containsString("group-repro"));
+
+        given()
+            .header("X-Amz-Target", "AmazonSSM.GetParameter")
+            .contentType(SSM_CONTENT_TYPE)
+            .body("""
+                {"Name": "/app/schedule-group-arn", "WithDecryption": true}
+                """)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("Parameter.Value", equalTo("arn:aws:scheduler:us-east-1:000000000000:schedule-group/group-repro"));
     }
 
     @Test
@@ -3881,15 +4728,7 @@ class CloudFormationIntegrationTest {
             .statusCode(200);
 
         // 4. Stack should reach CREATE_COMPLETE
-        given()
-            .contentType("application/x-www-form-urlencoded")
-            .formParam("Action", "DescribeStacks")
-            .formParam("StackName", "cfn-cs-arn-stack")
-        .when()
-            .post("/")
-        .then()
-            .statusCode(200)
-            .body(containsString("<StackStatus>CREATE_COMPLETE</StackStatus>"));
+        awaitStackStatus("cfn-cs-arn-stack", "CREATE_COMPLETE");
     }
 
     @Test
@@ -3982,6 +4821,208 @@ class CloudFormationIntegrationTest {
             .get("/v1/pipes/cfn-test-pipe")
         .then()
             .statusCode(404);
+    }
+
+    @Test
+    void updateStack_reconcilesExistingPipe() {
+        // provision() re-runs on every UpdateStack for every resource regardless of whether its
+        // properties changed, so a fixed-name pipe used to call CreatePipe again and roll back with
+        // "Pipe cfn-update-test-pipe already exists.".
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", "cfn-pipe-update-stack")
+            .formParam("TemplateBody", pipeUpdateTemplate("FirstTargetQueue"))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "UpdateStack")
+            .formParam("StackName", "cfn-pipe-update-stack")
+            .formParam("TemplateBody", pipeUpdateTemplate("SecondTargetQueue"))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStacks")
+            .formParam("StackName", "cfn-pipe-update-stack")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<StackStatus>UPDATE_COMPLETE</StackStatus>"))
+            .body(not(containsString("ROLLBACK")));
+
+        // The target change was reconciled in place under the same pipe name.
+        given()
+            .contentType("application/json")
+        .when()
+            .get("/v1/pipes/cfn-update-test-pipe")
+        .then()
+            .statusCode(200)
+            .body("Name", equalTo("cfn-update-test-pipe"))
+            .body("Source", containsString("cfn-pipe-update-source"))
+            .body("Target", containsString("cfn-pipe-update-target-second"));
+
+        // Delete the stack and verify the pipe is gone, so the pipe does not outlive this test in
+        // the shared emulator and skew a sibling test counting pipes globally.
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DeleteStack")
+            .formParam("StackName", "cfn-pipe-update-stack")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+            .contentType("application/json")
+        .when()
+            .get("/v1/pipes/cfn-update-test-pipe")
+        .then()
+            .statusCode(404);
+    }
+
+    private static String pipeUpdateTemplate(String targetLogicalId) {
+        return """
+            {
+              "Resources": {
+                "SourceQueue": {
+                  "Type": "AWS::SQS::Queue",
+                  "Properties": {"QueueName": "cfn-pipe-update-source"}
+                },
+                "FirstTargetQueue": {
+                  "Type": "AWS::SQS::Queue",
+                  "Properties": {"QueueName": "cfn-pipe-update-target-first"}
+                },
+                "SecondTargetQueue": {
+                  "Type": "AWS::SQS::Queue",
+                  "Properties": {"QueueName": "cfn-pipe-update-target-second"}
+                },
+                "MyPipe": {
+                  "Type": "AWS::Pipes::Pipe",
+                  "Properties": {
+                    "Name": "cfn-update-test-pipe",
+                    "Source": { "Fn::GetAtt": ["SourceQueue", "Arn"] },
+                    "Target": { "Fn::GetAtt": ["%s", "Arn"] },
+                    "RoleArn": "arn:aws:iam::000000000000:role/pipe-role",
+                    "DesiredState": "STOPPED"
+                  }
+                }
+              }
+            }
+            """.formatted(targetLogicalId);
+    }
+
+    /**
+     * CloudFormation rolls back every resource an update touched, not only the one that failed. A
+     * pipe reconciled in place before a later resource fails goes back to the target it carried,
+     * and the stack reaches UPDATE_ROLLBACK_COMPLETE instead of reporting the pipe as UPDATE_FAILED
+     * for want of a rollback.
+     */
+    @Test
+    void updateStack_laterFailureRestoresThePipeTarget() {
+        String suffix = Long.toString(System.nanoTime(), 36);
+        String stackName = "cfn-pipe-rollback-stack-" + suffix;
+        String pipeName = "cfn-pipe-rollback-pipe-" + suffix;
+        String failingSecret = """
+            ,
+                "BadSecret": {
+                  "Type": "AWS::SecretsManager::Secret",
+                  "DependsOn": "MyPipe",
+                  "Properties": {
+                    "Name": "cfn-pipe-rollback-secret-%s",
+                    "SecretString": "explicit",
+                    "GenerateSecretString": {"PasswordLength": 32}
+                  }
+                }""".formatted(suffix);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody",
+                    pipeRollbackTemplate(pipeName, "cfn-pipe-rollback-target-first", ""))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "UpdateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody",
+                    pipeRollbackTemplate(pipeName, "cfn-pipe-rollback-target-second", failingSecret))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStacks")
+            .formParam("StackName", stackName)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<StackStatus>UPDATE_ROLLBACK_COMPLETE</StackStatus>"));
+
+        given()
+            .contentType("application/json")
+        .when()
+            .get("/v1/pipes/" + pipeName)
+        .then()
+            .statusCode(200)
+            .body("Target", equalTo("arn:aws:sqs:us-east-1:000000000000:cfn-pipe-rollback-target-first"));
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DeleteStack")
+            .formParam("StackName", stackName)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+            .contentType("application/json")
+        .when()
+            .get("/v1/pipes/" + pipeName)
+        .then()
+            .statusCode(404);
+    }
+
+    /**
+     * The pipe alone, addressing its queues by ARN. An AWS::SQS::Queue in the same stack would
+     * report UPDATE_FAILED for want of its own rollback and hide the pipe's outcome behind
+     * UPDATE_ROLLBACK_FAILED.
+     */
+    private static String pipeRollbackTemplate(String pipeName, String targetQueueName,
+                                               String failingResource) {
+        return """
+            {
+              "Resources": {
+                "MyPipe": {
+                  "Type": "AWS::Pipes::Pipe",
+                  "Properties": {
+                    "Name": "%1$s",
+                    "Source": "arn:aws:sqs:us-east-1:000000000000:cfn-pipe-rollback-source",
+                    "Target": "arn:aws:sqs:us-east-1:000000000000:%2$s",
+                    "RoleArn": "arn:aws:iam::000000000000:role/pipe-role",
+                    "DesiredState": "STOPPED"
+                  }
+                }%3$s
+              }
+            }
+            """.formatted(pipeName, targetQueueName, failingResource);
     }
 
     // ── TemplateURL (path-style AWS S3) ──────────────────────────────────────
@@ -4200,7 +5241,8 @@ class CloudFormationIntegrationTest {
                     "FunctionName": { "Ref": "MyFunction" },
                     "EventSourceArn": { "Fn::GetAtt": ["MyQueue", "Arn"] },
                     "Enabled": true,
-                    "BatchSize": 5
+                    "BatchSize": 5,
+                    "FunctionResponseTypes": ["ReportBatchItemFailures"]
                   }
                 }
               }
@@ -4254,6 +5296,15 @@ class CloudFormationIntegrationTest {
         JsonNode esmList = OBJECT_MAPPER.readTree(esmJson);
         String esmUuid = esmList.path("EventSourceMappings").get(0).path("UUID").asText();
 
+        // github.com/floci-io/floci/issues/2848: the CloudFormation path never read
+        // FunctionResponseTypes, so a CFN-provisioned mapping always came back with an empty
+        // list even though the template declared it and the direct CreateEventSourceMapping API
+        // path already honored it.
+        JsonNode responseTypes = esmList.path("EventSourceMappings").get(0).path("FunctionResponseTypes");
+        assertTrue(responseTypes.isArray() && responseTypes.size() == 1
+                        && "ReportBatchItemFailures".equals(responseTypes.get(0).asText()),
+                "expected FunctionResponseTypes to carry through from the template but was: " + responseTypes);
+
         // 5. Delete stack and verify ESM is gone
         given()
             .contentType("application/x-www-form-urlencoded")
@@ -4264,7 +5315,230 @@ class CloudFormationIntegrationTest {
         .then()
             .statusCode(200);
 
-        // Wait for async stack deletion to complete
+        awaitStackDeleted(stackName);
+
+        given()
+        .when()
+            .get("/2015-03-31/event-source-mappings/" + esmUuid)
+        .then()
+            .statusCode(404);
+    }
+
+    @Test
+    void createStack_lambdaEventSourceMappingWithConditionalFunctionResponseTypes() throws Exception {
+        // github.com/floci-io/floci/issues/2848 follow-up (Greptile review on the fix): a
+        // whole-property intrinsic such as Fn::If must still resolve FunctionResponseTypes, not
+        // just a plain array. resolveStringList (via the engine's resolveList) now resolves
+        // Fn::If, Fn::Split and a CommaDelimitedList Ref, and drops any resulting blank entries.
+        String stackName = "cfn-esm-conditional-stack";
+        String funcName = "cfn-esm-conditional-func";
+        String queueName = "cfn-esm-conditional-queue";
+
+        String template = """
+            {
+              "Parameters": {
+                "ReportBatchFailures": { "Type": "String", "Default": "true" }
+              },
+              "Conditions": {
+                "ShouldReportBatchFailures": { "Fn::Equals": [{ "Ref": "ReportBatchFailures" }, "true"] }
+              },
+              "Resources": {
+                "MyQueue": {
+                  "Type": "AWS::SQS::Queue",
+                  "Properties": { "QueueName": "%s" }
+                },
+                "MyFunction": {
+                  "Type": "AWS::Lambda::Function",
+                  "Properties": {
+                    "FunctionName": "%s",
+                    "Runtime": "nodejs20.x",
+                    "Handler": "index.handler",
+                    "Role": "arn:aws:iam::000000000000:role/lambda-role",
+                    "Code": {
+                      "ZipFile": "exports.handler = async (e) => ({ statusCode: 200 });"
+                    }
+                  }
+                },
+                "MyESM": {
+                  "Type": "AWS::Lambda::EventSourceMapping",
+                  "Properties": {
+                    "FunctionName": { "Ref": "MyFunction" },
+                    "EventSourceArn": { "Fn::GetAtt": ["MyQueue", "Arn"] },
+                    "BatchSize": 5,
+                    "FunctionResponseTypes": {
+                      "Fn::If": ["ShouldReportBatchFailures", ["ReportBatchItemFailures"], []]
+                    }
+                  }
+                }
+              }
+            }
+            """.formatted(queueName, funcName);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody", template)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStacks")
+            .formParam("StackName", stackName)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<StackStatus>CREATE_COMPLETE</StackStatus>"));
+
+        String esmJson = given()
+        .when()
+            .get("/2015-03-31/event-source-mappings?FunctionName=" + funcName)
+        .then()
+            .statusCode(200)
+            .extract().body().asString();
+
+        JsonNode esmList = OBJECT_MAPPER.readTree(esmJson);
+        JsonNode responseTypes = esmList.path("EventSourceMappings").get(0).path("FunctionResponseTypes");
+        assertTrue(responseTypes.isArray() && responseTypes.size() == 1
+                        && "ReportBatchItemFailures".equals(responseTypes.get(0).asText()),
+                "expected the Fn::If-selected branch to carry through but was: " + responseTypes);
+    }
+
+    @Test
+    void createStack_lambdaEventSourceMappingKafka() throws Exception {
+        String stackName = "cfn-esm-kafka-stack";
+        String funcName = "cfn-esm-kafka-func";
+
+        String template = """
+            {
+              "Resources": {
+                "MyFunction": {
+                  "Type": "AWS::Lambda::Function",
+                  "Properties": {
+                    "FunctionName": "%s",
+                    "Runtime": "nodejs20.x",
+                    "Handler": "index.handler",
+                    "Role": "arn:aws:iam::000000000000:role/lambda-role",
+                    "Code": {
+                      "ZipFile": "exports.handler = async (e) => ({ statusCode: 200 });"
+                    }
+                  }
+                },
+                "MyKafkaESM": {
+                  "Type": "AWS::Lambda::EventSourceMapping",
+                  "Properties": {
+                    "FunctionName": { "Ref": "MyFunction" },
+                    "Enabled": true,
+                    "BatchSize": 100,
+                    "Topics": ["orders-topic", "events-topic"],
+                    "SelfManagedEventSource": {
+                      "Endpoints": {
+                        "KAFKA_BOOTSTRAP_SERVERS": ["kafka-broker-1:9092", "kafka-broker-2:9092"]
+                      }
+                    },
+                    "SourceAccessConfigurations": [
+                      {
+                        "Type": "SASL_SCRAM_512_AUTH",
+                        "URI": "arn:aws:secretsmanager:us-east-1:000000000000:secret:kafka-auth"
+                      }
+                    ]
+                  }
+                }
+              },
+              "Outputs": {
+                "EsmId": {
+                  "Value": { "Fn::GetAtt": ["MyKafkaESM", "Id"] }
+                },
+                "EsmArn": {
+                  "Value": { "Fn::GetAtt": ["MyKafkaESM", "EventSourceMappingArn"] }
+                },
+                "EsmRef": {
+                  "Value": { "Ref": "MyKafkaESM" }
+                }
+              }
+            }
+            """.formatted(funcName);
+
+        // 1. Create stack
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody", template)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<StackId>"));
+
+        // 2. Stack must reach CREATE_COMPLETE
+        String describeXml = given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStacks")
+            .formParam("StackName", stackName)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<StackStatus>CREATE_COMPLETE</StackStatus>"))
+            .extract().body().asString();
+
+        String getAttId = outputValue(describeXml, "EsmId");
+        String getAttArn = outputValue(describeXml, "EsmArn");
+        String getAttRef = outputValue(describeXml, "EsmRef");
+
+        // 3. Lambda list-event-source-mappings must return our ESM with Kafka properties populated
+        String esmJson = given()
+        .when()
+            .get("/2015-03-31/event-source-mappings?FunctionName=" + funcName)
+        .then()
+            .statusCode(200)
+            .body(containsString(funcName))
+            .extract().body().asString();
+
+        JsonNode esmList = OBJECT_MAPPER.readTree(esmJson);
+        assertEquals(1, esmList.path("EventSourceMappings").size());
+        JsonNode esmNode = esmList.path("EventSourceMappings").get(0);
+        String esmUuid = esmNode.path("UUID").asText();
+
+        // Verify Fn::GetAtt attributes and Ref
+        assertEquals(esmUuid, getAttId);
+        assertEquals(esmUuid, getAttRef);
+        assertEquals("arn:aws:lambda:us-east-1:000000000000:event-source-mapping:" + esmUuid, getAttArn);
+
+        // Verify Topics
+        JsonNode topics = esmNode.path("Topics");
+        assertTrue(topics.isArray() && topics.size() == 2);
+        assertEquals("orders-topic", topics.get(0).asText());
+        assertEquals("events-topic", topics.get(1).asText());
+
+        // Verify SelfManagedEventSource
+        JsonNode smes = esmNode.path("SelfManagedEventSource");
+        assertTrue(smes.isObject());
+        JsonNode endpoints = smes.path("Endpoints").path("KAFKA_BOOTSTRAP_SERVERS");
+        assertTrue(endpoints.isArray() && endpoints.size() == 2);
+        assertEquals("kafka-broker-1:9092", endpoints.get(0).asText());
+
+        // Verify SourceAccessConfigurations
+        JsonNode accessConfigs = esmNode.path("SourceAccessConfigurations");
+        assertTrue(accessConfigs.isArray() && accessConfigs.size() == 1);
+        assertEquals("SASL_SCRAM_512_AUTH", accessConfigs.get(0).path("Type").asText());
+        assertEquals("arn:aws:secretsmanager:us-east-1:000000000000:secret:kafka-auth", accessConfigs.get(0).path("URI").asText());
+
+        // 4. Delete stack
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DeleteStack")
+            .formParam("StackName", stackName)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
         long deadline = System.currentTimeMillis() + 10_000;
         while (System.currentTimeMillis() < deadline) {
             String deleteStatus = given()
@@ -4920,6 +6194,84 @@ class CloudFormationIntegrationTest {
             .body("item[0].id", equalTo(authorizerId))
             .body("item[0].name", equalTo("MyTokenAuth"))
             .body("item[0].type", equalTo("TOKEN"));
+    }
+
+    // A native AWS::ApiGateway::RestApi's Body is not SAM-only: the same provisioner materializes
+    // it for a hand-written template, so a declared Body must create the resources and methods
+    // its OpenAPI document describes, not sit ignored as it did before.
+    @Test
+    void createStack_withApiGatewayRestApiBody_createsMethodFromOpenApiDocument() {
+        String stackName = "cfn-apigw-restapi-body-stack";
+        String template = """
+            {
+              "Resources": {
+                "RestApi": {
+                  "Type": "AWS::ApiGateway::RestApi",
+                  "Properties": {
+                    "Name": "cfn-apigw-restapi-body-api",
+                    "Body": {
+                      "openapi": "3.0.1",
+                      "paths": {
+                        "/hello": {
+                          "get": {
+                            "x-amazon-apigateway-integration": { "type": "MOCK" }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+            """;
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody", template)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStacks")
+            .formParam("StackName", stackName)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<StackStatus>CREATE_COMPLETE</StackStatus>"));
+
+        String resourcesXml = given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStackResources")
+            .formParam("StackName", stackName)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract().asString();
+
+        String apiId = physicalIdByLogicalId(resourcesXml, "RestApi");
+
+        String helloResourceId = given()
+        .when()
+            .get("/restapis/" + apiId + "/resources")
+        .then()
+            .statusCode(200)
+            .body("item.path", hasItem("/hello"))
+            .extract()
+            .path("item.find { it.path == '/hello' }.id");
+
+        given()
+        .when()
+            .get("/restapis/" + apiId + "/resources/" + helloResourceId + "/methods/GET/integration")
+        .then()
+            .statusCode(200)
+            .body("type", equalTo("MOCK"));
     }
 
     // ── Issue #1163: AWS::ApiGateway::Deployment with inline StageName creates the stage ──
@@ -5699,6 +7051,8 @@ class CloudFormationIntegrationTest {
         .then()
             .statusCode(200);
 
+        awaitStackDeleted(stackName);
+
         // 6. Verify resources are deleted
         given()
             .header("X-Amz-Target", "AWSCognitoIdentityProviderService.DescribeUserPool")
@@ -5907,6 +7261,97 @@ class CloudFormationIntegrationTest {
         .then()
             .statusCode(200)
             .body(containsString("nested-stack-child-queue"));
+    }
+
+    /**
+     * Pins the actual root cause behind issue #3854 (a parent stack output resolving to the raw
+     * {@code LogicalId.Outputs.Key} literal instead of a nested stack's value), which turned out
+     * to have nothing to do with cross-thread visibility.
+     *
+     * <p>{@code executeNestedStack} copies {@code childStack.getOutputs()} into the parent
+     * resource's {@code Outputs.*} attributes right after the child's (synchronous, same-thread)
+     * {@code executeTemplate} call returns. When the child's own resource loop fails, {@code
+     * executeTemplate} never reaches its Outputs block at all: {@code rollbackFailedExecution}
+     * rewrites the child's status straight from {@code CREATE_FAILED} into {@code
+     * ROLLBACK_COMPLETE} before returning. {@code executeNestedStack} used to detect a failed
+     * child only by checking for the literal strings {@code CREATE_FAILED}/{@code UPDATE_FAILED},
+     * which a rolled-back create can never match, so the parent kept going and reported
+     * {@code CREATE_COMPLETE} with its {@code Fn::GetAtt} on the child's outputs left unresolved:
+     * exactly the symptom in #3854. That matching bug was already fixed by allow-listing the
+     * success statuses instead (commit 700d403, PR #3609) before #3854 was even filed; this test
+     * only adds the missing regression coverage tying it to this issue.
+     */
+    @Test
+    void createStack_failingNestedStackResource_rollsBackParentInsteadOfReportingUnresolvedOutput() {
+        String childTemplate = """
+            {
+              "Resources": {
+                "ConflictingSecret": {
+                  "Type": "AWS::SecretsManager::Secret",
+                  "Properties": {
+                    "Name": "cfn-3854-nested-conflict-secret",
+                    "SecretString": "explicit",
+                    "GenerateSecretString": { "PasswordLength": 32 }
+                  }
+                }
+              },
+              "Outputs": {
+                "SecretArn": { "Value": { "Ref": "ConflictingSecret" } }
+              }
+            }
+            """;
+
+        given().when().put("/issue-3854-templates").then();
+        given().contentType("application/json").body(childTemplate)
+                .when().put("/issue-3854-templates/failing-child.json")
+                .then().statusCode(200);
+
+        String parentTemplate = """
+            {
+              "Resources": {
+                "FailingNestedStack": {
+                  "Type": "AWS::CloudFormation::Stack",
+                  "Properties": {
+                    "TemplateURL": "http://localhost/issue-3854-templates/failing-child.json"
+                  }
+                }
+              },
+              "Outputs": {
+                "childSecretArn": {
+                  "Value": { "Fn::GetAtt": ["FailingNestedStack", "Outputs.SecretArn"] }
+                }
+              }
+            }
+            """;
+
+        String stackName = "issue-3854-failing-nested-parent";
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody", parentTemplate)
+        .when().post("/").then().statusCode(200);
+
+        String xml = null;
+        long deadline = System.currentTimeMillis() + 20_000;
+        while (System.currentTimeMillis() < deadline) {
+            xml = given()
+                .contentType("application/x-www-form-urlencoded")
+                .formParam("Action", "DescribeStacks")
+                .formParam("StackName", stackName)
+            .when().post("/")
+            .then().statusCode(200)
+            .extract().asString();
+            if (xml.contains("<StackStatus>ROLLBACK_COMPLETE</StackStatus>")
+                    || xml.contains("<StackStatus>CREATE_COMPLETE</StackStatus>")) {
+                break;
+            }
+        }
+
+        assertThat(xml, containsString("<StackStatus>ROLLBACK_COMPLETE</StackStatus>"));
+        assertThat(xml, not(containsString("<StackStatus>CREATE_COMPLETE</StackStatus>")));
+        assertThat(xml, not(containsString("FailingNestedStack.Outputs")));
     }
 
     // ── Issue #1072: AWS::ApiGatewayV2::Api WEBSOCKET drops RouteSelectionExpression ───
@@ -6301,7 +7746,7 @@ class CloudFormationIntegrationTest {
             .body("services[0].taskDefinition",
                     equalTo("arn:aws:ecs:us-east-1:000000000000:task-definition/cfn-ecs-update-taskdef:2"));
     }
-    
+
     @Test
     void deleteStack_ec2SecurityGroup_leavesNoOrphans() {
         String stackName = "sg-delete-cleanup-stack";
@@ -6344,6 +7789,7 @@ class CloudFormationIntegrationTest {
                 .formParam("StackName", stackName)
                 .when().post("/")
                 .then().statusCode(200);
+        awaitStackDeleted(stackName);
 
         given()
                 .formParam("Action", "DescribeSecurityGroups")
@@ -6433,6 +7879,8 @@ class CloudFormationIntegrationTest {
             .post("/")
         .then()
             .statusCode(200);
+
+        awaitStackDeleted(stackName);
 
         // Cluster is gone (deleted in reverse order, after the service)
         given()
@@ -6787,6 +8235,8 @@ class CloudFormationIntegrationTest {
             .post("/")
         .then()
             .statusCode(200);
+
+        awaitStackDeleted(stackName);
 
         // Load balancer is gone
         given()
@@ -7226,6 +8676,55 @@ class CloudFormationIntegrationTest {
     }
 
     @Test
+    void createStack_apiGatewayV2AuthorizerRejectsOutOfRangeResultTtl() {
+        String template = """
+            {
+              "Resources": {
+                "HttpApi": {
+                  "Type": "AWS::ApiGatewayV2::Api",
+                  "Properties": { "Name": "cfn-apigwv2-authz-ttl-api", "ProtocolType": "HTTP" }
+                },
+                "Authorizer": {
+                  "Type": "AWS::ApiGatewayV2::Authorizer",
+                  "Properties": {
+                    "ApiId": { "Ref": "HttpApi" },
+                    "Name": "cfn-request-authorizer-ttl",
+                    "AuthorizerType": "REQUEST",
+                    "AuthorizerUri": "arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/arn:aws:lambda:us-east-1:000000000000:function:auth/invocations",
+                    "AuthorizerPayloadFormatVersion": "2.0",
+                    "IdentitySource": ["$request.header.Authorization"],
+                    "AuthorizerResultTtlInSeconds": 3601
+                  }
+                }
+              }
+            }
+            """;
+
+        String stackName = "cfn-apigwv2-authorizer-ttl-stack";
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody", template)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStackEvents")
+            .formParam("StackName", stackName)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("ROLLBACK_COMPLETE"))
+            .body(containsString("authorizerResultTtlInSeconds must be an integer between 0 and 3600"));
+    }
+
+    @Test
     void createStack_apiGatewayV2RouteResolvesAuthorizerIdViaGetAtt() {
         // Ref already resolved AuthorizerId via the physical id (covered above); Fn::GetAtt reads
         // a separate attributes map that provisionApiGatewayV2Authorizer must also populate, or
@@ -7370,7 +8869,7 @@ class CloudFormationIntegrationTest {
 
     @Test
     void createStack_samFunctionWithPackageTypeImageDeploysAsImageFunction() {
-        // Without PackageType carried through by the SAM transform, CloudFormationResourceProvisioner
+        // Without PackageType carried through by the SAM transform, the Lambda provisioner
         // defaults PackageType to "Zip" (buildLambdaDesiredState's resolveOrDefault), which then also
         // forces Runtime/Handler defaults onto a function that declared neither — the function is
         // created as a broken Zip function instead of running the real container image.
@@ -7382,7 +8881,7 @@ class CloudFormationIntegrationTest {
                   "Type": "AWS::Serverless::Function",
                   "Properties": {
                     "PackageType": "Image",
-                    "ImageUri": "000000000000.dkr.ecr.us-east-1.localhost:5100/my-repo:latest"
+                    "ImageUri": "000000000000.dkr.ecr.us-east-1.localhost:4566/my-repo:latest"
                   }
                 }
               }
@@ -7419,12 +8918,12 @@ class CloudFormationIntegrationTest {
             .then()
             .statusCode(200)
             .body("Configuration.PackageType", equalTo("Image"))
-            .body("Code.ImageUri", equalTo("000000000000.dkr.ecr.us-east-1.localhost:5100/my-repo:latest"));
+            .body("Code.ImageUri", equalTo("000000000000.dkr.ecr.us-east-1.localhost:4566/my-repo:latest"));
     }
 
     @Test
     void createStack_samFunctionWithImageConfigDeploysWithOverrides() {
-        // ImageConfig must also be carried through the SAM transform to CloudFormationResourceProvisioner,
+        // ImageConfig must also be carried through the SAM transform to the Lambda provisioner,
         // which already reads it (provisionLambda's putResolvedMapIfPresent(configRequest, props,
         // "ImageConfig", ...)) — without the transform copying it, a PackageType: Image SAM function's
         // EntryPoint/Command/WorkingDirectory override silently never reaches the deployed function.
@@ -7436,7 +8935,7 @@ class CloudFormationIntegrationTest {
                   "Type": "AWS::Serverless::Function",
                   "Properties": {
                     "PackageType": "Image",
-                    "ImageUri": "000000000000.dkr.ecr.us-east-1.localhost:5100/my-repo:latest",
+                    "ImageUri": "000000000000.dkr.ecr.us-east-1.localhost:4566/my-repo:latest",
                     "ImageConfig": {
                       "EntryPoint": ["/bootstrap"],
                       "Command": ["handler.main"],
@@ -7589,7 +9088,7 @@ class CloudFormationIntegrationTest {
     void createStack_samHttpApiAuthorizerHonorsCustomIdentitySource() {
         // SAM's Authorizers.<Name>.IdentitySource lets a JWT authorizer read the token from
         // somewhere other than the default Authorization header — e.g. a query-string token,
-        // the same case CloudFormationResourceProvisioner/ApiGatewayExecuteController already
+        // the same case the API Gateway provisioner/ApiGatewayExecuteController already
         // support end-to-end for raw (non-SAM) templates. The SAM transform must forward it
         // rather than always emitting the header default.
         String template = """
@@ -9127,6 +10626,7 @@ class CloudFormationIntegrationTest {
             .post("/")
         .then()
             .statusCode(200);
+        awaitStackDeleted(stackName);
         given().when().delete("/" + bucket + "/" + key).then().statusCode(204);
         given().when().delete("/" + bucket).then().statusCode(204);
     }
@@ -9992,6 +11492,7 @@ class CloudFormationIntegrationTest {
             .formParam("Action", "DeleteStack")
             .formParam("StackName", stackName)
         .when().post("/").then().statusCode(200);
+        awaitStackDeleted(stackName);
 
         String workingTemplate = """
             {
@@ -10075,12 +11576,7 @@ class CloudFormationIntegrationTest {
             .formParam("ChangeSetName", "deploy-attempt-2")
         .when().post("/").then().statusCode(200);
 
-        given()
-            .contentType("application/x-www-form-urlencoded")
-            .formParam("Action", "DescribeStacks")
-            .formParam("StackName", stackName)
-        .when().post("/")
-        .then().statusCode(200).body(containsString("<StackStatus>CREATE_COMPLETE</StackStatus>"));
+        awaitStackStatus(stackName, "CREATE_COMPLETE");
     }
 
     @Test
@@ -10293,6 +11789,90 @@ class CloudFormationIntegrationTest {
     }
 
     @Test
+    void createStack_eventBridgeRuleWithInputTransformer_deliversTransformedBodyToSqs() {
+        String template = """
+            {
+              "Resources": {
+                "TargetQueue": {
+                  "Type": "AWS::SQS::Queue",
+                  "Properties": { "QueueName": "cfn-it-transform-queue" }
+                },
+                "MyRule": {
+                  "Type": "AWS::Events::Rule",
+                  "Properties": {
+                    "Name": "cfn-it-transform-rule",
+                    "EventPattern": { "source": ["cfn.transform.test"] },
+                    "Targets": [
+                      {
+                        "Id": "T0",
+                        "Arn": { "Fn::GetAtt": ["TargetQueue", "Arn"] },
+                        "InputTransformer": {
+                          "InputPathsMap": { "e": "$.detail.eventName" },
+                          "InputTemplate": "{\\"e\\":<e>}"
+                        }
+                      }
+                    ]
+                  }
+                }
+              }
+            }
+            """;
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", "cfn-it-transform-stack")
+            .formParam("TemplateBody", template)
+        .when().post("/").then().statusCode(200).body(containsString("<StackId>"));
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStacks")
+            .formParam("StackName", "cfn-it-transform-stack")
+        .when().post("/")
+        .then().statusCode(200).body(containsString("<StackStatus>CREATE_COMPLETE</StackStatus>"));
+
+        // The transformer survived CFN provisioning.
+        given()
+            .contentType("application/x-amz-json-1.1")
+            .header("X-Amz-Target", "AWSEvents.ListTargetsByRule")
+            .body("{\"Rule\":\"cfn-it-transform-rule\"}")
+        .when().post("/")
+        .then().statusCode(200)
+            .body("Targets[0].InputTransformer.InputTemplate", equalTo("{\"e\":<e>}"));
+
+        given()
+            .contentType("application/x-amz-json-1.1")
+            .header("X-Amz-Target", "AWSEvents.PutEvents")
+            .body("""
+                {"Entries":[{"Source":"cfn.transform.test","DetailType":"t",
+                 "Detail":"{\\"eventName\\":\\"site.created\\"}"}]}
+                """)
+        .when().post("/")
+        .then().statusCode(200).body("FailedEntryCount", equalTo(0));
+
+        String getUrlXml = given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "GetQueueUrl")
+            .formParam("QueueName", "cfn-it-transform-queue")
+        .when().post("/")
+        .then().statusCode(200).extract().body().asString();
+        String queueUrl = getUrlXml.substring(
+                getUrlXml.indexOf("<QueueUrl>") + "<QueueUrl>".length(),
+                getUrlXml.indexOf("</QueueUrl>"));
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "ReceiveMessage")
+            .formParam("QueueUrl", queueUrl)
+            .formParam("MaxNumberOfMessages", "1")
+            .formParam("WaitTimeSeconds", "0")
+        .when().post("/")
+        .then().statusCode(200)
+            .body(containsString("{&quot;e&quot;:&quot;site.created&quot;}"));
+    }
+
+    @Test
     void createStack_withEventBus_createsRealBusAndResolvesRefAndGetAtt() {
         String template = """
             {
@@ -10413,6 +11993,7 @@ class CloudFormationIntegrationTest {
             .formParam("Action", "DeleteStack")
             .formParam("StackName", "cfn-teardown-stack")
         .when().post("/").then().statusCode(200);
+        awaitStackDeleted("cfn-teardown-stack");
 
         // The rule is gone from the custom bus...
         given()

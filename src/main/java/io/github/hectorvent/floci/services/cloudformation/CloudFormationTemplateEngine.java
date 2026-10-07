@@ -2,8 +2,11 @@ package io.github.hectorvent.floci.services.cloudformation;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.fasterxml.jackson.databind.node.TextNode;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.AwsRegions;
 import org.jboss.logging.Logger;
 
 import java.util.ArrayList;
@@ -14,6 +17,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.function.Function;
+import java.util.function.UnaryOperator;
 import java.util.regex.Pattern;
 
 /**
@@ -36,6 +40,22 @@ public class CloudFormationTemplateEngine {
     private final Map<String, JsonNode> mappings;
     private final ObjectMapper objectMapper;
     private final Function<String, String> importValueResolver;
+    private final UnaryOperator<String> dynamicReferenceResolver;
+    private final List<String> unresolvedIntrinsics = new ArrayList<>();
+
+    /**
+     * A minimal engine for a resource provisioned outside any stack (Cloud Control CreateResource).
+     * Desired state carries resolved values, so it needs no parameters, mappings, conditions or
+     * sibling resources: only intrinsics and dynamic references. The constructors stay
+     * package-private so tests in {@code provisioners/} keep mocking the engine.
+     */
+    public static CloudFormationTemplateEngine standalone(String accountId, String region, String stackName,
+                                                          ObjectMapper objectMapper,
+                                                          UnaryOperator<String> dynamicReferenceResolver) {
+        return new CloudFormationTemplateEngine(accountId, region, stackName, stackName,
+                Map.of(), new HashMap<>(), new HashMap<>(), Map.of(), Map.of(), objectMapper,
+                name -> null, dynamicReferenceResolver);
+    }
 
     CloudFormationTemplateEngine(String accountId, String region, String stackName, String stackId,
                                  Map<String, String> parameters,
@@ -45,6 +65,29 @@ public class CloudFormationTemplateEngine {
                                  Map<String, JsonNode> mappings,
                                  ObjectMapper objectMapper,
                                  Function<String, String> importValueResolver) {
+        this(accountId, region, stackName, stackId, parameters, physicalIds, resourceAttributes,
+                conditions, mappings, objectMapper, importValueResolver, null);
+    }
+
+    /**
+     * @param dynamicReferenceResolver resolves a value that may contain CloudFormation dynamic
+     *                                 references ({@code {{resolve:ssm:...}}},
+     *                                 {@code {{resolve:secretsmanager:...}}}) against the live
+     *                                 services, leaving a value with no dynamic reference syntax
+     *                                 untouched. {@code null} skips this stage entirely, which
+     *                                 keeps template values that only ever contain intrinsics
+     *                                 (tests, Cloud Control desired-state resolution) free of the
+     *                                 dependency.
+     */
+    CloudFormationTemplateEngine(String accountId, String region, String stackName, String stackId,
+                                 Map<String, String> parameters,
+                                 Map<String, String> physicalIds,
+                                 Map<String, Map<String, String>> resourceAttributes,
+                                 Map<String, Boolean> conditions,
+                                 Map<String, JsonNode> mappings,
+                                 ObjectMapper objectMapper,
+                                 Function<String, String> importValueResolver,
+                                 UnaryOperator<String> dynamicReferenceResolver) {
         this.accountId = accountId;
         this.region = region;
         this.stackName = stackName;
@@ -56,9 +99,38 @@ public class CloudFormationTemplateEngine {
         this.mappings = mappings;
         this.objectMapper = objectMapper;
         this.importValueResolver = importValueResolver;
+        this.dynamicReferenceResolver = dynamicReferenceResolver;
     }
 
+    /** The id of the stack this engine resolves for, as {@code AWS::StackId} returns it. */
+    public String stackId() {
+        return stackId;
+    }
+
+    /**
+     * Resolves a property value, including CloudFormation dynamic reference syntax
+     * ({@code {{resolve:ssm:...}}}, {@code {{resolve:secretsmanager:...}}}) in the result, the same
+     * way {@link #resolveNode} does. This is the entry point every scalar-property resolution in
+     * this codebase goes through, directly or via {@link #resolveNode}, so a dynamic reference is
+     * substituted regardless of which of the two a caller uses.
+     */
     public String resolve(JsonNode node) {
+        return resolveDynamicReferences(resolveIntrinsic(node)).asText();
+    }
+
+    /**
+     * Resolves intrinsics only, leaving any {@code {{resolve:...}}} dynamic reference syntax in the
+     * result untouched. For the one property family where {@code ssm-secure} is a valid dynamic
+     * reference service (RDS {@code MasterUsername}/{@code MasterUserPassword}): {@link #resolve}
+     * rejects {@code ssm-secure} outright since it is invalid everywhere else, so that property has
+     * to skip the general dynamic-reference stage and resolve it separately, with the permission
+     * only that property is allowed.
+     */
+    public String resolveWithoutDynamicReferences(JsonNode node) {
+        return resolveIntrinsic(node);
+    }
+
+    private String resolveIntrinsic(JsonNode node) {
         if (node == null || node.isNull() || node.isMissingNode()) {
             return "";
         }
@@ -116,33 +188,63 @@ public class CloudFormationTemplateEngine {
         if (node == null || node.isNull() || node.isMissingNode()) {
             return node;
         }
-        if (node.isTextual() || node.isNumber() || node.isBoolean()) {
+        if (node.isTextual()) {
+            return resolveDynamicReferences(node.textValue());
+        }
+        if (node.isNumber() || node.isBoolean()) {
             return node;
         }
         if (node.isObject()) {
+            if (node.has("Fn::If")) {
+                // Unlike the other intrinsics below, Fn::If's two branches can be any JSON shape
+                // (array, object, or scalar) - it just forwards one of them verbatim. Collapsing it
+                // through resolve() like the scalar-only intrinsics would stringify a chosen array or
+                // object instead of preserving it, so a conditional list (e.g. a Tags property) reads
+                // as unresolvable everywhere a caller checks isArray() on the result.
+                JsonNode branch = selectIfBranch(node.get("Fn::If"));
+                return branch == null ? TextNode.valueOf("") : resolveNode(branch);
+            }
+            if (node.has("Fn::Split") || node.has("Fn::GetAZs") || node.has("Fn::Cidr")) {
+                return objectMapper.valueToTree(resolveList(node));
+            }
             if (node.has("Ref") || node.has("Fn::Sub") || node.has("Fn::Join") ||
-                    node.has("Fn::Select") || node.has("Fn::If") || node.has("Fn::Base64") ||
-                    node.has("Fn::GetAtt") || node.has("Fn::ImportValue") || node.has("Fn::Split") ||
-                    node.has("Fn::GetAZs") || node.has("Fn::Cidr") || node.has("Fn::FindInMap")) {
+                    node.has("Fn::Select") || node.has("Fn::Base64") ||
+                    node.has("Fn::GetAtt") || node.has("Fn::ImportValue") || node.has("Fn::FindInMap")) {
                 return TextNode.valueOf(resolve(node));
             }
             // Plain object — resolve each field
-            var resolved = objectMapper.createObjectNode();
+            ObjectNode resolved = objectMapper.createObjectNode();
             Iterator<Map.Entry<String, JsonNode>> fields = node.fields();
             while (fields.hasNext()) {
-                var entry = fields.next();
+                Map.Entry<String, JsonNode> entry = fields.next();
                 resolved.set(entry.getKey(), resolveNode(entry.getValue()));
             }
             return resolved;
         }
         if (node.isArray()) {
-            var arr = objectMapper.createArrayNode();
+            ArrayNode arr = objectMapper.createArrayNode();
             for (JsonNode item : node) {
                 arr.add(resolveNode(item));
             }
             return arr;
         }
         return node;
+    }
+
+    /**
+     * Resolves a value against {@link #dynamicReferenceResolver} when it carries CloudFormation
+     * dynamic reference syntax ({@code {{resolve:ssm:...}}}, {@code {{resolve:secretsmanager:...}}}).
+     * CloudFormation substitutes these for any string property in a template, not only the RDS
+     * master-credential properties that first needed them (see
+     * <a href="https://github.com/floci-io/floci/issues/2213">#2213</a>), so {@link #resolveNode}
+     * applies this to every textual result: a literal string carrying the syntax outright, and the
+     * text an intrinsic function (e.g. {@code Fn::Sub}) produces.
+     */
+    private TextNode resolveDynamicReferences(String value) {
+        if (dynamicReferenceResolver == null || value == null || !value.contains("{{resolve:")) {
+            return TextNode.valueOf(value);
+        }
+        return TextNode.valueOf(dynamicReferenceResolver.apply(value));
     }
 
     /**
@@ -165,6 +267,19 @@ public class CloudFormationTemplateEngine {
         return resolved.isTextual() ? resolved.asText() : resolved.toString();
     }
 
+    public String resolveJsonAttributeStrict(JsonNode node) {
+        int before = unresolvedIntrinsics.size();
+        String resolved = resolveJsonAttribute(node);
+        if (unresolvedIntrinsics.size() > before) {
+            List<String> raised = unresolvedIntrinsics.subList(before, unresolvedIntrinsics.size());
+            throw new AwsException("ValidationError",
+                    "Policy document contains unresolved CloudFormation intrinsics: "
+                            + String.join(", ", raised)
+                            + ". Storing them would silently void the statements that use them.", 400);
+        }
+        return resolved;
+    }
+
     private String resolveRef(String name) {
         // Pseudo-parameters
         return switch (name) {
@@ -172,8 +287,8 @@ public class CloudFormationTemplateEngine {
             case "AWS::Region" -> region;
             case "AWS::StackName" -> stackName;
             case "AWS::StackId" -> stackId;
-            case "AWS::Partition" -> "aws";
-            case "AWS::URLSuffix" -> "amazonaws.com";
+            case "AWS::Partition" -> AwsRegions.partitionFor(region);
+            case "AWS::URLSuffix" -> AwsRegions.dnsSuffixFor(region);
             case "AWS::NoValue" -> "";
             default -> {
                 if (physicalIds.containsKey(name)) {
@@ -183,6 +298,7 @@ public class CloudFormationTemplateEngine {
                     yield parameters.get(name);
                 }
                 LOG.debugv("Unresolved Ref: {0}", name);
+                unresolvedIntrinsics.add("Ref " + name);
                 yield name;
             }
         };
@@ -215,8 +331,13 @@ public class CloudFormationTemplateEngine {
                 String varName = template.substring(i + 2, end);
                 if (vars.containsKey(varName)) {
                     result.append(vars.get(varName));
-                } else if (varName.contains("!")) {
-                    // Fn::GetAtt shorthand: ${LogicalId.Attr}
+                } else if (varName.startsWith("!")) {
+                    // ${!Literal} is Fn::Sub's escape sequence for a literal ${Literal}: emit it
+                    // verbatim with no substitution. It is NOT the Fn::GetAtt shorthand.
+                    result.append("${").append(varName, 1, varName.length()).append('}');
+                } else if (!varName.startsWith("AWS::") && varName.contains(".")) {
+                    // Fn::GetAtt shorthand: ${LogicalId.Attr}. A logical id and a parameter name
+                    // are both alphanumeric, so a dot can only mean an attribute reference.
                     String[] parts = varName.split("\\.", 2);
                     result.append(resolveGetAttParts(parts[0], parts.length > 1 ? parts[1] : ""));
                 } else {
@@ -236,15 +357,11 @@ public class CloudFormationTemplateEngine {
             return "";
         }
         String delimiter = join.get(0).asText("");
-        JsonNode parts = join.get(1);
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < parts.size(); i++) {
-            if (i > 0) {
-                sb.append(delimiter);
-            }
-            sb.append(resolve(parts.get(i)));
-        }
-        return sb.toString();
+        // CDK splices a dynamic reference across fragments, for example
+        // ["{{resolve:secretsmanager:", {"Ref": "Secret"}, ":SecretString:password::}}"], so the
+        // fragments are only intrinsic-resolved here and the caller resolves dynamic references on
+        // the concatenated string. Resolving them per fragment rejects every fragment as unclosed.
+        return String.join(delimiter, resolveList(join.get(1), false));
     }
 
     private String resolveSelect(JsonNode select) {
@@ -261,21 +378,35 @@ public class CloudFormationTemplateEngine {
 
     /**
      * Resolves a node that represents a list — a literal array, a list-producing intrinsic
-     * ({@code Fn::GetAZs}, {@code Fn::Cidr}, {@code Fn::Split}), or a comma-delimited scalar
-     * (e.g. a {@code Ref} to a {@code List<>} parameter).
+     * ({@code Fn::GetAZs}, {@code Fn::Cidr}, {@code Fn::Split}), an {@code Fn::If} choosing between
+     * two such lists, or a comma-delimited scalar (e.g. a {@code Ref} to a {@code List<>} parameter).
      */
     private List<String> resolveList(JsonNode node) {
+        return resolveList(node, true);
+    }
+
+    /**
+     * @param resolveDynamicReferences whether scalar elements pass through the dynamic-reference
+     *                                 stage individually; {@code Fn::Join} passes {@code false}
+     *                                 because a reference may span several fragments.
+     */
+    private List<String> resolveList(JsonNode node, boolean resolveDynamicReferences) {
         List<String> out = new ArrayList<>();
         if (node == null || node.isNull() || node.isMissingNode()) {
             return out;
         }
         if (node.isArray()) {
-            for (JsonNode item : node) {
-                out.add(resolve(item));
-            }
-            return out;
+            return resolveListElements(node, resolveDynamicReferences);
         }
         if (node.isObject()) {
+            if (node.has("Fn::If")) {
+                // Fn::If's branch can itself be any of the shapes this method already handles
+                // (literal array, Fn::Split, ...), so recurse into it rather than falling through
+                // to the scalar branch below, which would stringify a list-shaped branch instead
+                // of splitting it.
+                JsonNode branch = selectIfBranch(node.get("Fn::If"));
+                return branch == null ? out : resolveList(branch, resolveDynamicReferences);
+            }
             if (node.has("Fn::GetAZs")) {
                 return resolveAvailabilityZones(node.get("Fn::GetAZs"));
             }
@@ -286,11 +417,79 @@ public class CloudFormationTemplateEngine {
                 return resolveSplit(node.get("Fn::Split"));
             }
         }
-        String scalar = resolve(node);
+        String scalar = resolveDynamicReferences ? resolve(node) : resolveIntrinsic(node);
         if (!scalar.isEmpty()) {
             out.addAll(Arrays.asList(scalar.split(",", -1)));
         }
         return out;
+    }
+
+    /**
+     * Expands a literal array's elements, recursing into any element that is itself a
+     * list-valued intrinsic ({@code Fn::Split}, {@code Fn::GetAZs}, {@code Fn::Cidr}, or an
+     * {@code Fn::If} evaluating to one) so it contributes its own elements rather than one
+     * comma-joined string. Unlike {@link #resolveStringList}, this keeps blank entries: a
+     * literal array is positional (consumed by {@code Fn::Select} via {@link #resolveList}),
+     * so dropping a blank element ahead of the selected index would shift every later index.
+     */
+    private List<String> resolveListElements(JsonNode node) {
+        return resolveListElements(node, true);
+    }
+
+    private List<String> resolveListElements(JsonNode node, boolean resolveDynamicReferences) {
+        List<String> out = new ArrayList<>();
+        for (JsonNode element : node) {
+            if (isListValuedIntrinsic(element)) {
+                out.addAll(resolveList(element, resolveDynamicReferences));
+            } else {
+                out.add(resolveDynamicReferences ? resolve(element) : resolveIntrinsic(element));
+            }
+        }
+        return out;
+    }
+
+    /**
+     * Resolves a node to a flat list of strings, expanding list-valued intrinsics
+     * ({@code Fn::Split}, {@code Fn::GetAZs}, {@code Fn::Cidr}, or an {@code Fn::If} evaluating
+     * to one) whether the node itself is one or they appear as elements of a literal array,
+     * and dropping blank entries.
+     *
+     * <p>Provisioners read list properties (SubnetIds, VPCZoneIdentifier, …) with this so a
+     * cross-stack {@code Fn::Split} over {@code Fn::ImportValue} — the shape CDK emits when a
+     * VPC exports its subnet ids as one comma-joined value — resolves to the real ids instead
+     * of a single comma-joined string or an empty list (issue #2937).
+     */
+    public List<String> resolveStringList(JsonNode node) {
+        List<String> out = new ArrayList<>();
+        if (node == null || node.isNull() || node.isMissingNode()) {
+            return out;
+        }
+        if (node.isArray()) {
+            out.addAll(resolveListElements(node));
+        } else {
+            out.addAll(resolveList(node));
+        }
+        out.removeIf(value -> value == null || value.isBlank());
+        return out;
+    }
+
+    private boolean isListValuedIntrinsic(JsonNode node) {
+        if (node == null) {
+            return false;
+        }
+        if (node.isArray()) {
+            return true;
+        }
+        if (node.isObject()) {
+            if (node.has("Fn::Split") || node.has("Fn::GetAZs") || node.has("Fn::Cidr")) {
+                return true;
+            }
+            if (node.has("Fn::If")) {
+                JsonNode branch = selectIfBranch(node.get("Fn::If"));
+                return branch != null && isListValuedIntrinsic(branch);
+            }
+        }
+        return false;
     }
 
     private List<String> resolveSplit(JsonNode split) {
@@ -375,12 +574,19 @@ public class CloudFormationTemplateEngine {
     }
 
     private String resolveIf(JsonNode ifNode) {
+        JsonNode branch = selectIfBranch(ifNode);
+        return branch == null ? "" : resolve(branch);
+    }
+
+    /** Picks Fn::If's true/false branch without resolving it further, so the caller decides
+     *  whether to collapse it to a scalar ({@link #resolve}) or preserve its shape ({@link #resolveNode}). */
+    private JsonNode selectIfBranch(JsonNode ifNode) {
         if (!ifNode.isArray() || ifNode.size() < 3) {
-            return "";
+            return null;
         }
         String conditionName = ifNode.get(0).asText();
         boolean condValue = conditions.getOrDefault(conditionName, false);
-        return resolve(condValue ? ifNode.get(1) : ifNode.get(2));
+        return condValue ? ifNode.get(1) : ifNode.get(2);
     }
 
     private String resolveGetAtt(JsonNode getAtt) {
@@ -396,10 +602,12 @@ public class CloudFormationTemplateEngine {
 
     private String resolveGetAttParts(String logicalId, String attrName) {
         Map<String, String> attrs = resourceAttributes.get(logicalId);
-        if (attrs != null && attrs.containsKey(attrName)) {
+        // Provisioners keep private state under __Floci keys; AWS resolves no such attribute.
+        if (attrs != null && attrs.containsKey(attrName) && !attrName.startsWith("__Floci")) {
             return attrs.get(attrName);
         }
-        LOG.debugv("Unresolved GetAtt: {0}.{1}", logicalId, attrName);
+        LOG.warnv("Unresolved GetAtt: {0}.{1}", logicalId, attrName);
+        unresolvedIntrinsics.add("Fn::GetAtt " + logicalId + "." + attrName);
         return logicalId + "." + attrName;
     }
 

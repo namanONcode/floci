@@ -10,13 +10,13 @@ Floci implements the EC2 Auto Scaling API — stored-state management for launch
 - `arn:aws:autoscaling:<region>:<account>:launchConfiguration:<uuid>:launchConfigurationName/<name>`
 - `arn:aws:autoscaling:<region>:<account>:scalingPolicy:<uuid>:autoScalingGroupName/<group>/policyName/<name>`
 
-## Supported Operations (33 total)
+## Supported Operations (45 total)
 
 ### Launch Configurations
 
 | Operation | Notes |
 |---|---|
-| `CreateLaunchConfiguration` | Stores template: `ImageId`, `InstanceType`, `KeyName`, `SecurityGroups`, `UserData`, `IamInstanceProfile` |
+| `CreateLaunchConfiguration` | Stores template: `ImageId`, `InstanceType`, `KeyName`, `SecurityGroups`, `UserData`, `IamInstanceProfile`, `InstanceMonitoring`, `BlockDeviceMappings` |
 | `DescribeLaunchConfigurations` | Filtered by name list; returns all if no filter |
 | `DeleteLaunchConfiguration` | Removes the named launch configuration |
 
@@ -38,6 +38,8 @@ Floci implements the EC2 Auto Scaling API — stored-state management for launch
 | `AttachInstances` | Attaches existing EC2 instances to a group; sets lifecycle state to `InService` |
 | `DetachInstances` | Detaches instances from a group; optionally decrements desired capacity |
 | `TerminateInstanceInAutoScalingGroup` | Terminates a specific instance; optionally decrements desired capacity |
+| `SuspendProcesses` | Records suspended scaling processes (empty list suspends all); reported back by `DescribeAutoScalingGroups` |
+| `ResumeProcesses` | Clears suspended processes (empty list resumes all) |
 
 ### Load Balancer Attachment
 
@@ -49,6 +51,14 @@ Floci implements the EC2 Auto Scaling API — stored-state management for launch
 | `AttachLoadBalancers` | Classic ELB attachment (stored; no ELB v1 routing) |
 | `DetachLoadBalancers` | Classic ELB detachment |
 | `DescribeLoadBalancers` | Lists classic ELBs attached to a group |
+
+### Traffic Sources
+
+| Operation | Notes |
+|---|---|
+| `AttachTrafficSources` | Unified elb/elbv2/vpc-lattice attachment API; stored per identifier with its type |
+| `DetachTrafficSources` | Removes a traffic source by identifier |
+| `DescribeTrafficSources` | Lists attached sources, optionally filtered by type; every source reports `InService` |
 
 ### Lifecycle Hooks
 
@@ -67,6 +77,22 @@ Floci implements the EC2 Auto Scaling API — stored-state management for launch
 | `PutScalingPolicy` | Creates or updates a policy: `SimpleScaling` fields or `TargetTrackingScaling` with predefined metric, target value, and estimated warmup |
 | `DescribePolicies` | Lists policies filtered by group or policy name, including stored target tracking configuration |
 | `DeletePolicy` | Removes a scaling policy |
+
+### Scheduled Actions
+
+| Operation | Notes |
+|---|---|
+| `PutScheduledUpdateGroupAction` | Creates or updates a schedule: recurrence, time zone, start/end time, capacity bounds |
+| `DescribeScheduledActions` | Lists scheduled actions filtered by group or action name |
+| `DeleteScheduledAction` | Removes a scheduled action |
+
+### Warm Pools
+
+| Operation | Notes |
+|---|---|
+| `PutWarmPool` | Full replace per the wire model: omitted fields reset to defaults; `MaxGroupPreparedCapacity=-1` clears the value |
+| `DescribeWarmPool` | Returns the stored configuration; also embedded in `DescribeAutoScalingGroups` per the AutoScalingGroup shape |
+| `DeleteWarmPool` | Removes the configuration; idempotent when none exists |
 
 ### Activities
 
@@ -101,9 +127,36 @@ Auto Scaling groups preserve either a launch configuration, a top-level launch t
 - `LaunchTemplate.LaunchTemplateSpecification.LaunchTemplateName`
 - `LaunchTemplate.LaunchTemplateSpecification.Version`
 - `LaunchTemplate.Overrides.member.N.InstanceType`
+- `LaunchTemplate.Overrides.member.N.InstanceRequirements`
 - `InstancesDistribution.OnDemandBaseCapacity`
 - `InstancesDistribution.OnDemandPercentageAboveBaseCapacity`
 - `InstancesDistribution.SpotAllocationStrategy`
+
+An override selects instance types either by name or by attribute. Setting both `InstanceType` and
+`InstanceRequirements` on the same override raises `ValidationError`, matching AWS. An override that
+specifies `InstanceRequirements` must specify both `VCpuCount` and `MemoryMiB`, the two members the
+AWS model marks required on that shape, and raises `ValidationError` otherwise. Every member of the
+`InstanceRequirements` shape round-trips except `BaselinePerformanceFactors`, which is accepted and
+dropped.
+
+A group uses attribute-based instance type selection when the mixed instances policy left in effect
+by the request carries at least one launch template override with `InstanceRequirements`. On create
+that is the policy the request supplies. On update it is the policy the request supplies, the stored
+policy when the request names no launch source, or none when the request switches the group to a
+launch configuration or a plain launch template.
+
+## Optional Group Fields
+
+`CreateAutoScalingGroup` and `UpdateAutoScalingGroup` both accept the fields below, and
+`DescribeAutoScalingGroups` returns each one only when the group has a value for it. A group that
+never set a field omits it from the response rather than reporting a default.
+
+| Field | Notes |
+|---|---|
+| `DesiredCapacityType` | One of `units`, `vcpu`, `memory-mib`. Any other value raises `ValidationError`. AWS supports it for attribute-based instance type selection only, so `vcpu` and `memory-mib` raise `ValidationError` unless the effective mixed instances policy uses `InstanceRequirements`. `units` is the documented default and is always accepted |
+| `CapacityRebalance` | Stored and echoed as a boolean |
+| `MaxInstanceLifetime` | Seconds. Must be `0` or at least `86400`. `0` means no maximum and is echoed back as `0` |
+| `DefaultInstanceWarmup` | Seconds. Pass `-1` to remove a value already set, after which the field is omitted again |
 
 ## Scaling Policy Compatibility
 

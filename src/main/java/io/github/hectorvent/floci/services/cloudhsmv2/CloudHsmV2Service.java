@@ -4,45 +4,44 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
+import io.github.hectorvent.floci.services.acm.CertificateGenerator;
+import io.github.hectorvent.floci.services.cloudhsmv2.model.Backup;
+import io.github.hectorvent.floci.services.cloudhsmv2.model.BackupRetentionPolicy;
 import io.github.hectorvent.floci.services.cloudhsmv2.model.Certificates;
 import io.github.hectorvent.floci.services.cloudhsmv2.model.Cluster;
 import io.github.hectorvent.floci.services.cloudhsmv2.model.ClusterState;
 import io.github.hectorvent.floci.services.cloudhsmv2.model.Hsm;
+import io.github.hectorvent.floci.services.ec2.Ec2Service;
+import io.github.hectorvent.floci.services.ec2.model.Subnet;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.bouncycastle.asn1.x500.X500Name;
-import org.bouncycastle.cert.X509v3CertificateBuilder;
+import org.bouncycastle.cert.X509CertificateHolder;
 import org.bouncycastle.cert.jcajce.JcaX509CertificateConverter;
-import org.bouncycastle.cert.jcajce.JcaX509v3CertificateBuilder;
-
+import org.bouncycastle.openssl.PEMParser;
 import org.bouncycastle.openssl.jcajce.JcaPEMWriter;
 import org.bouncycastle.operator.ContentSigner;
 import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder;
 import org.bouncycastle.pkcs.PKCS10CertificationRequest;
 import org.bouncycastle.pkcs.PKCS10CertificationRequestBuilder;
 import org.bouncycastle.pkcs.jcajce.JcaPKCS10CertificationRequestBuilder;
-import org.bouncycastle.cert.X509CertificateHolder;
-import org.bouncycastle.openssl.PEMParser;
 import org.jboss.logging.Logger;
 
 import java.io.StringReader;
 import java.io.StringWriter;
-import java.math.BigInteger;
 import java.security.KeyPair;
 import java.security.KeyPairGenerator;
 import java.security.SecureRandom;
 import java.security.cert.X509Certificate;
-import io.github.hectorvent.floci.services.cloudhsmv2.model.Backup;
-import io.github.hectorvent.floci.services.cloudhsmv2.model.BackupRetentionPolicy;
-import java.security.PrivateKey;
-import java.security.PublicKey;
-import java.time.temporal.ChronoUnit;
-import java.util.stream.Collectors;
 import java.time.Instant;
-import java.util.*;
-
-import io.github.hectorvent.floci.services.ec2.Ec2Service;
-import io.github.hectorvent.floci.services.ec2.model.Subnet;
+import java.time.temporal.ChronoUnit;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
 
 /**
  * CloudHSM v2 service implementation for the local emulator.
@@ -64,20 +63,24 @@ public class CloudHsmV2Service {
     private final StorageBackend<String, Cluster> clusters;
     private final StorageBackend<String, Backup> backups;
     private final Ec2Service ec2Service;
+    private final CertificateGenerator certificateGenerator;
 
     @Inject
-    public CloudHsmV2Service(StorageFactory storageFactory, Ec2Service ec2Service) {
-        this.clusters = storageFactory.create("cloudhsmv2", "cloudhsmv2-clusters.json",
-                new TypeReference<Map<String, Cluster>>() {});
-        this.backups = storageFactory.create("cloudhsmv2", "cloudhsmv2-backups.json",
-                new TypeReference<Map<String, Backup>>() {});
-        this.ec2Service = ec2Service;
+    public CloudHsmV2Service(StorageFactory storageFactory, Ec2Service ec2Service,
+                             CertificateGenerator certificateGenerator) {
+        this(storageFactory.create("cloudhsmv2", "cloudhsmv2-clusters.json",
+                        new TypeReference<Map<String, Cluster>>() {}),
+                storageFactory.create("cloudhsmv2", "cloudhsmv2-backups.json",
+                        new TypeReference<Map<String, Backup>>() {}),
+                ec2Service, certificateGenerator);
     }
 
-    CloudHsmV2Service(StorageBackend<String, Cluster> clusters, StorageBackend<String, Backup> backups, Ec2Service ec2Service) {
+    CloudHsmV2Service(StorageBackend<String, Cluster> clusters, StorageBackend<String, Backup> backups,
+                      Ec2Service ec2Service, CertificateGenerator certificateGenerator) {
         this.clusters = clusters;
         this.backups = backups;
         this.ec2Service = ec2Service;
+        this.certificateGenerator = certificateGenerator;
     }
 
     // ──────────────────────────── CreateCluster ────────────────────────────
@@ -141,7 +144,7 @@ public class CloudHsmV2Service {
             }
         }
         cluster.setSubnetMapping(subnetMapping);
-        cluster.setSourceBackupId(sourceBackupId);
+        cluster.setSourceBackupId(sourceBackup != null ? sourceBackup.getBackupId() : null);
         cluster.setSecurityGroup("sg-" + generateShortId());
         cluster.setCreateTimestamp(Instant.now());
         cluster.setBackupPolicy(DEFAULT_BACKUP_POLICY);
@@ -171,21 +174,49 @@ public class CloudHsmV2Service {
         certs.setClusterCsr(generateCsr(clusterId));
 
         try {
-            KeyPair mfrKeyPair = generateKeyPair();
-            X500Name mfrName = new X500Name("CN=HSM Manufacturer CA,O=AWS,C=US");
-            certs.setManufacturerHardwareCertificate(generateCert(mfrName, mfrName, mfrKeyPair.getPublic(), mfrKeyPair.getPrivate()));
+            Instant certificateNotBefore = Instant.now();
+            Instant certificateNotAfter = certificateNotBefore.plus(365, ChronoUnit.DAYS);
+            Instant rootNotAfter = certificateNotBefore.plus(3650, ChronoUnit.DAYS);
 
-            KeyPair awsKeyPair = generateKeyPair();
-            X500Name awsName = new X500Name("CN=AWS CloudHSM Hardware CA,O=AWS,C=US");
-            certs.setAwsHardwareCertificate(generateCert(awsName, mfrName, awsKeyPair.getPublic(), mfrKeyPair.getPrivate()));
+            KeyPair manufacturerRootKeyPair = generateKeyPair();
+            X500Name manufacturerRootName = new X500Name("CN=HSM Manufacturer Root CA,O=AWS,C=US");
+            X509Certificate manufacturerRoot = certificateGenerator.signCertificate(
+                    manufacturerRootName, manufacturerRootKeyPair.getPublic(), manufacturerRootName,
+                    manufacturerRootKeyPair.getPrivate(), List.of(), true, null,
+                    certificateNotBefore, rootNotAfter);
+
+            KeyPair awsRootKeyPair = generateKeyPair();
+            X500Name awsRootName = new X500Name("CN=AWS CloudHSM Root CA,O=AWS,C=US");
+            X509Certificate awsRoot = certificateGenerator.signCertificate(
+                    awsRootName, awsRootKeyPair.getPublic(), awsRootName,
+                    awsRootKeyPair.getPrivate(), List.of(), true, null,
+                    certificateNotBefore, rootNotAfter);
+
+            KeyPair hardwareKeyPair = generateKeyPair();
+            X500Name hardwareName = new X500Name("CN=HSM Hardware " + clusterId + ",O=AWS,C=US");
+            certs.setManufacturerHardwareCertificate(certificateGenerator.toPem(certificateGenerator.signCertificate(
+                    hardwareName, hardwareKeyPair.getPublic(), manufacturerRootName,
+                    manufacturerRootKeyPair.getPrivate(), List.of(), true, null,
+                    certificateNotBefore, certificateNotAfter, manufacturerRoot.getPublicKey())));
+            certs.setAwsHardwareCertificate(certificateGenerator.toPem(certificateGenerator.signCertificate(
+                    hardwareName, hardwareKeyPair.getPublic(), awsRootName,
+                    awsRootKeyPair.getPrivate(), List.of(), true, null,
+                    certificateNotBefore, certificateNotAfter, awsRoot.getPublicKey())));
 
             KeyPair hsmKeyPair = generateKeyPair();
             X500Name hsmName = new X500Name("CN=HSM Instance " + clusterId + ",O=AWS,C=US");
-            certs.setHsmCertificate(generateCert(hsmName, awsName, hsmKeyPair.getPublic(), awsKeyPair.getPrivate()));
+            certs.setHsmCertificate(certificateGenerator.toPem(certificateGenerator.signCertificate(
+                    hsmName, hsmKeyPair.getPublic(), hardwareName, hardwareKeyPair.getPrivate(), List.of(), false, null,
+                    certificateNotBefore, certificateNotAfter, hardwareKeyPair.getPublic())));
         } catch (Exception e) {
             LOG.warnv("Failed to generate emulated hardware certs: {0}", e.getMessage());
         }
 
+        if (sourceBackup != null && sourceBackup.getClusterCertificate() != null) {
+            certs.setClusterCertificate(sourceBackup.getClusterCertificate());
+            certs.setClusterCsr(null);
+            cluster.setState(ClusterState.INITIALIZED);
+        }
         cluster.setCertificates(certs);
 
         String storageKey = regionKey(region, clusterId);
@@ -425,7 +456,7 @@ public class CloudHsmV2Service {
 
     // ──────────────────────────── TagResource ────────────────────────────
 
-    public void tagResource(String resourceId, Map<String, String> tags, String region) {
+    public synchronized void tagResource(String resourceId, Map<String, String> tags, String region) {
         if (resourceId == null || resourceId.isBlank()) {
             throw new AwsException("CloudHsmInvalidRequestException", "ResourceId is required.", 400);
         }
@@ -434,20 +465,28 @@ public class CloudHsmV2Service {
         }
         if (resourceId.startsWith("backup-")) {
             Backup backup = getBackup(resourceId, region);
-            if (tags != null && !tags.isEmpty()) {
-                backup.getTagList().putAll(tags);
+            Map<String, String> merged = new LinkedHashMap<>(backup.getTagList());
+            merged.putAll(tags);
+            if (merged.size() > 50) {
+                throw new AwsException("CloudHsmResourceLimitExceededException",
+                        "The resource cannot have more than 50 tags.", 400);
             }
+            backup.setTagList(merged);
             backups.put(regionKey(region, resourceId), backup);
         } else {
             Cluster cluster = getCluster(resourceId, region);
-            if (tags != null && !tags.isEmpty()) {
-                cluster.getTagList().putAll(tags);
+            Map<String, String> merged = new LinkedHashMap<>(cluster.getTagList());
+            merged.putAll(tags);
+            if (merged.size() > 50) {
+                throw new AwsException("CloudHsmResourceLimitExceededException",
+                        "The resource cannot have more than 50 tags.", 400);
             }
+            cluster.setTagList(merged);
             clusters.put(regionKey(region, resourceId), cluster);
         }
     }
 
-    public void untagResource(String resourceId, List<String> tagKeys, String region) {
+    public synchronized void untagResource(String resourceId, List<String> tagKeys, String region) {
         if (resourceId == null || resourceId.isBlank()) {
             throw new AwsException("CloudHsmInvalidRequestException", "ResourceId is required.", 400);
         }
@@ -534,25 +573,6 @@ public class CloudHsmV2Service {
         return keyGen.generateKeyPair();
     }
 
-    private String generateCert(X500Name subject, X500Name issuer, PublicKey pubKey, PrivateKey signerKey) throws Exception {
-        BigInteger serial = new BigInteger(128, SECURE_RANDOM);
-        Instant now = Instant.now();
-        X509v3CertificateBuilder certBuilder = new JcaX509v3CertificateBuilder(
-                issuer, serial, Date.from(now), Date.from(now.plusSeconds(365L * 24 * 3600)), subject, pubKey);
-
-        ContentSigner signer = new JcaContentSignerBuilder("SHA256WithRSA")
-                .build(signerKey);
-        X509CertificateHolder holder = certBuilder.build(signer);
-        X509Certificate cert = new JcaX509CertificateConverter()
-                .getCertificate(holder);
-
-        StringWriter sw = new StringWriter();
-        try (JcaPEMWriter pemWriter = new JcaPEMWriter(sw)) {
-            pemWriter.writeObject(cert);
-        }
-        return sw.toString();
-    }
-
     private void validatePemCertificate(String pem, String fieldName) {
         if (pem == null || pem.isBlank()) {
             throw new AwsException("CloudHsmInvalidRequestException",
@@ -612,6 +632,9 @@ public class CloudHsmV2Service {
         backup.setNeverExpires("False");
         backup.setMode(cluster.getMode());
         backup.setHsmType(cluster.getHsmType());
+        if (cluster.getCertificates() != null) {
+            backup.setClusterCertificate(cluster.getCertificates().getClusterCertificate());
+        }
         backups.put(regionKey(region, backup.getBackupId()), backup);
     }
 
@@ -678,18 +701,19 @@ public class CloudHsmV2Service {
 
     public Backup copyBackupToRegion(String destinationRegion, String backupId, String sourceRegion) {
         // Source region emulation: we'll just clone the backup locally.
-        Backup source = getBackup(backupId, sourceRegion != null ? sourceRegion : "us-east-1");
+        Backup source = getBackup(backupId, sourceRegion);
         Backup copy = new Backup();
         copy.setBackupId("backup-" + generateShortId());
         copy.setBackupState("READY");
         copy.setClusterId(source.getClusterId());
         copy.setCreateTimestamp(source.getCreateTimestamp());
         copy.setCopyTimestamp(Instant.now());
-        copy.setSourceRegion(sourceRegion != null ? sourceRegion : "us-east-1");
+        copy.setSourceRegion(sourceRegion);
         copy.setSourceBackup(backupId);
         copy.setSourceCluster(source.getClusterId());
         copy.setMode(source.getMode());
         copy.setHsmType(source.getHsmType());
+        copy.setClusterCertificate(source.getClusterCertificate());
         copy.setNeverExpires(source.getNeverExpires());
         backups.put(regionKey(destinationRegion, copy.getBackupId()), copy);
         return copy;
@@ -698,45 +722,40 @@ public class CloudHsmV2Service {
     // ──────────────────────────── Resource Policies ────────────────────────────
 
     public void putResourcePolicy(String resourceArn, String policy, String region) {
-        String id = extractId(resourceArn);
-        if (id.startsWith("backup-")) {
-            Backup backup = getBackup(id, region);
-            if (!"READY".equals(backup.getBackupState())) {
-                throw new AwsException("CloudHsmInvalidRequestException", "Backup must be READY to apply a policy", 400);
-            }
-            backup.setResourcePolicy(policy);
-            backups.put(regionKey(region, id), backup);
-        } else {
-            Cluster cluster = getCluster(id, region);
-            cluster.setResourcePolicy(policy);
-            clusters.put(regionKey(region, id), cluster);
+        if (policy != null && (policy.isEmpty() || policy.length() > 20_000)) {
+            throw new AwsException("CloudHsmInvalidRequestException",
+                    "Policy must be between 1 and 20000 characters.", 400);
         }
+        String id = resourcePolicyBackupId(resourceArn);
+        Backup backup = getBackup(id, region);
+        if (!"READY".equals(backup.getBackupState())) {
+            throw new AwsException("CloudHsmInvalidRequestException",
+                    "Backup must be READY to apply a policy", 400);
+        }
+        backup.setResourcePolicy(policy);
+        backups.put(regionKey(region, id), backup);
     }
 
     public String getResourcePolicy(String resourceArn, String region) {
-        String id = extractId(resourceArn);
-        if (id.startsWith("backup-")) {
-            return getBackup(id, region).getResourcePolicy();
-        } else {
-            return getCluster(id, region).getResourcePolicy();
-        }
+        return getBackup(resourcePolicyBackupId(resourceArn), region).getResourcePolicy();
     }
 
     public String deleteResourcePolicy(String resourceArn, String region) {
-        String id = extractId(resourceArn);
-        String oldPolicy = null;
-        if (id.startsWith("backup-")) {
-            Backup backup = getBackup(id, region);
-            oldPolicy = backup.getResourcePolicy();
-            backup.setResourcePolicy(null);
-            backups.put(regionKey(region, id), backup);
-        } else {
-            Cluster cluster = getCluster(id, region);
-            oldPolicy = cluster.getResourcePolicy();
-            cluster.setResourcePolicy(null);
-            clusters.put(regionKey(region, id), cluster);
-        }
+        String id = resourcePolicyBackupId(resourceArn);
+        Backup backup = getBackup(id, region);
+        String oldPolicy = backup.getResourcePolicy();
+        backup.setResourcePolicy(null);
+        backups.put(regionKey(region, id), backup);
         return oldPolicy;
+    }
+
+    private String resourcePolicyBackupId(String resourceArn) {
+        String id = extractId(resourceArn);
+        if (!id.startsWith("backup-")) {
+            throw new AwsException("CloudHsmInvalidRequestException",
+                    "AWS CloudHSM resource policies are supported only for backups.", 400);
+        }
+        return id;
     }
 
     private String extractId(String arn) {

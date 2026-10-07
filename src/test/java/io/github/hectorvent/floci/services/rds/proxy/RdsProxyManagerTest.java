@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.rds.proxy;
 
+import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.services.rds.model.DatabaseEngine;
 import org.junit.jupiter.api.Test;
 
@@ -10,6 +11,7 @@ import java.net.ServerSocket;
 import java.util.concurrent.ConcurrentHashMap;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -17,12 +19,14 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 class RdsProxyManagerTest {
 
     @Test
     void replacingProxyStopsPreviousListenerAndKeepsReplacementOwned() throws IOException {
-        RdsProxyManager manager = new RdsProxyManager(mock(RdsSigV4Validator.class));
+        RdsProxyManager manager = new RdsProxyManager(
+                mock(RdsSigV4Validator.class), mock(RdsProxyTlsCertificates.class), testConfig());
         int firstPort = availablePort();
         try {
             start(manager, "proxy", firstPort);
@@ -41,7 +45,8 @@ class RdsProxyManagerTest {
 
     @Test
     void registrationFailureAfterBindReleasesCandidateListener() throws IOException {
-        RdsProxyManager manager = new RdsProxyManager(mock(RdsSigV4Validator.class));
+        RdsProxyManager manager = new RdsProxyManager(
+                mock(RdsSigV4Validator.class), mock(RdsProxyTlsCertificates.class), testConfig());
         int proxyPort = availablePort();
         try {
             assertThrows(RuntimeException.class, () -> start(manager, null, proxyPort));
@@ -54,7 +59,8 @@ class RdsProxyManagerTest {
 
     @Test
     void failedReplacementPreservesOriginalRegistryEntry() throws IOException {
-        RdsProxyManager manager = new RdsProxyManager(mock(RdsSigV4Validator.class));
+        RdsProxyManager manager = new RdsProxyManager(
+                mock(RdsSigV4Validator.class), mock(RdsProxyTlsCertificates.class), testConfig());
         int originalPort = availablePort();
         try {
             start(manager, "proxy", originalPort);
@@ -72,8 +78,34 @@ class RdsProxyManagerTest {
     }
 
     @Test
+    void updateMasterPasswordSwapsTheRunningProxySnapshotWithoutARestart() throws Exception {
+        RdsProxyManager manager = new RdsProxyManager(
+                mock(RdsSigV4Validator.class), mock(RdsProxyTlsCertificates.class), testConfig());
+        int proxyPort = availablePort();
+        try {
+            start(manager, "proxy", proxyPort);
+
+            manager.updateMasterPassword("proxy", "rotated");
+
+            assertEquals("rotated", masterPassword(registry(manager).get("proxy")));
+            assertPortUnavailable(proxyPort);
+        } finally {
+            manager.stopAll();
+        }
+    }
+
+    @Test
+    void updateMasterPasswordForUnknownInstanceIsANoOp() {
+        RdsProxyManager manager = new RdsProxyManager(
+                mock(RdsSigV4Validator.class), mock(RdsProxyTlsCertificates.class), testConfig());
+
+        assertDoesNotThrow(() -> manager.updateMasterPassword("missing", "rotated"));
+    }
+
+    @Test
     void stopAllReleasesEveryListenerAndIsIdempotent() throws IOException {
-        RdsProxyManager manager = new RdsProxyManager(mock(RdsSigV4Validator.class));
+        RdsProxyManager manager = new RdsProxyManager(
+                mock(RdsSigV4Validator.class), mock(RdsProxyTlsCertificates.class), testConfig());
         int firstPort = availablePort();
         start(manager, "first", firstPort);
         int secondPort = availablePort();
@@ -88,7 +120,8 @@ class RdsProxyManagerTest {
 
     @Test
     void closeFailurePropagatesAndManagerRetainsOwnership() throws Exception {
-        RdsProxyManager manager = new RdsProxyManager(mock(RdsSigV4Validator.class));
+        RdsProxyManager manager = new RdsProxyManager(
+                mock(RdsSigV4Validator.class), mock(RdsProxyTlsCertificates.class), testConfig());
         RdsAuthProxy proxy = authProxy("proxy");
         ServerSocket serverSocket = mock(ServerSocket.class);
         IOException closeFailure = new IOException("simulated close failure");
@@ -107,7 +140,8 @@ class RdsProxyManagerTest {
 
     @Test
     void failedPreviousStopRestoresMappingAndReleasesCandidate() throws Exception {
-        RdsProxyManager manager = new RdsProxyManager(mock(RdsSigV4Validator.class));
+        RdsProxyManager manager = new RdsProxyManager(
+                mock(RdsSigV4Validator.class), mock(RdsProxyTlsCertificates.class), testConfig());
         RdsAuthProxy previous = mock(RdsAuthProxy.class);
         doThrow(new IllegalStateException("simulated previous stop failure"))
                 .when(previous).stop();
@@ -124,7 +158,8 @@ class RdsProxyManagerTest {
 
     @Test
     void stopAllContinuesAndRetainsOnlyFailedListenerOwnership() throws Exception {
-        RdsProxyManager manager = new RdsProxyManager(mock(RdsSigV4Validator.class));
+        RdsProxyManager manager = new RdsProxyManager(
+                mock(RdsSigV4Validator.class), mock(RdsProxyTlsCertificates.class), testConfig());
         int successfulPort = availablePort();
         start(manager, "successful", successfulPort);
         RdsAuthProxy failed = mock(RdsAuthProxy.class);
@@ -143,13 +178,33 @@ class RdsProxyManagerTest {
 
     private static void start(RdsProxyManager manager, String key, int proxyPort) {
         manager.startProxy(key, DatabaseEngine.POSTGRES, false, proxyPort,
-                "localhost", 1, "admin", "secret", "app", (user, password) -> true);
+                "localhost", 1, "localhost", "admin", "secret", "app", (user, password) -> true,
+                new RdsProxyBinding("localhost", proxyPort, "us-east-1", "123456789012", "db-ABCDEFGHIJKL01234", true));
     }
 
     private static RdsAuthProxy authProxy(String key) {
         return new RdsAuthProxy(key, "localhost", 1, DatabaseEngine.POSTGRES, false,
                 "admin", "secret", "app", mock(RdsSigV4Validator.class),
-                (user, password) -> true);
+                mock(RdsProxyTlsCertificates.class), (user, password) -> true,
+                5000, 5000, 100);
+    }
+
+    private static EmulatorConfig testConfig() {
+        EmulatorConfig.RdsServiceConfig rdsConfig = mock(EmulatorConfig.RdsServiceConfig.class);
+        when(rdsConfig.proxyHandshakeTimeoutMillis()).thenReturn(5000);
+        when(rdsConfig.proxyBackendConnectTimeoutMillis()).thenReturn(5000);
+        when(rdsConfig.proxyMaxConnections()).thenReturn(100);
+        EmulatorConfig.ServicesConfig servicesConfig = mock(EmulatorConfig.ServicesConfig.class);
+        when(servicesConfig.rds()).thenReturn(rdsConfig);
+        EmulatorConfig config = mock(EmulatorConfig.class);
+        when(config.services()).thenReturn(servicesConfig);
+        return config;
+    }
+
+    private static String masterPassword(RdsAuthProxy proxy) throws Exception {
+        Field field = RdsAuthProxy.class.getDeclaredField("masterPassword");
+        field.setAccessible(true);
+        return (String) field.get(proxy);
     }
 
     private static void setServerSocket(RdsAuthProxy proxy, ServerSocket socket) throws Exception {

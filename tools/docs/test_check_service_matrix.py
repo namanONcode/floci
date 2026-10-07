@@ -88,6 +88,48 @@ def test_extract_matrix_slugs_strips_anchor():
     md = "## Service Matrix\n\n| [API Gateway v2](api-gateway.md#v2) | | | 48 |\n\n## Common Setup\n"
     assert c.extract_matrix_slugs(md) == {"api-gateway"}
 
+def test_extract_matrix_action_counts():
+    md = """
+# Services Overview
+
+## Service Matrix
+
+| Service | Endpoint | Protocol | Supported operations |
+|---|---|---|---|
+| [SSM](ssm.md) | ... | JSON 1.1 | 22 |
+| [CloudFormation](cloudformation.md) | ... | Query | 19 |
+| [API Gateway v2](api-gateway.md#v2) | ... | REST JSON | 53 + data-plane |
+
+## Common Setup
+"""
+
+    assert c.extract_matrix_action_counts(md) == {
+        "ssm": 22,
+        "cloudformation": 19,
+    }
+
+
+def test_extract_matrix_action_counts_ignores_links_outside_matrix():
+    md = """
+# Services Overview
+
+A link to [SSM](ssm.md) outside the matrix must not be counted.
+
+## Service Matrix
+
+| Service | Endpoint | Protocol | Supported operations |
+|---|---|---|---|
+| [CloudFormation](cloudformation.md) | ... | Query | 19 |
+
+## Common Setup
+
+Another link to [SQS](sqs.md).
+"""
+
+    assert c.extract_matrix_action_counts(md) == {
+        "cloudformation": 19,
+    }
+
 
 def test_extract_matrix_slugs_raises_on_missing_heading():
     # A renamed/reordered heading must fail loudly rather than silently returning an
@@ -177,3 +219,25 @@ def test_find_undocumented_deferred_entry_already_resolved_is_not_flagged():
     )
     assert undocumented == []
     assert expired == []
+
+
+# --------------------------------------------------------------------------- #
+# Unlinked pages
+# --------------------------------------------------------------------------- #
+def test_find_unlinked_pages_flags_a_page_with_no_row(tmp_path):
+    for name in ("index.md", "ssm.md", "elb.md", "elb-classic.md"):
+        (tmp_path / name).write_text("# page\n")
+    # index.md is the matrix page itself; elb.md is linked; elb-classic.md is not.
+    assert c.find_unlinked_pages(tmp_path, slugs={"ssm", "elb"}, facet_pages=set()) == ["elb-classic"]
+
+
+def test_find_unlinked_pages_honours_facet_exemption(tmp_path):
+    for name in ("index.md", "lambda.md", "lambda-microvms.md"):
+        (tmp_path / name).write_text("# page\n")
+    assert c.find_unlinked_pages(tmp_path, slugs={"lambda"}, facet_pages={"lambda-microvms"}) == []
+
+
+def test_find_unlinked_pages_ignores_non_markdown(tmp_path):
+    (tmp_path / "ssm.md").write_text("# page\n")
+    (tmp_path / "diagram.svg").write_text("<svg/>")
+    assert c.find_unlinked_pages(tmp_path, slugs={"ssm"}, facet_pages=set()) == []

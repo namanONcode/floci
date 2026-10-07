@@ -25,6 +25,7 @@ public class UserPoolClient {
     private List<String> explicitAuthFlows = new ArrayList<>();
     private Integer accessTokenValidity;
     private Integer idTokenValidity;
+    private int authSessionValidity = 3;
     private List<String> logoutURLs = new ArrayList<>();
     private String preventUserExistenceErrors;
     private List<String> readAttributes = new ArrayList<>();
@@ -36,6 +37,9 @@ public class UserPoolClient {
     private Boolean enableTokenRevocation;
     private long creationDate;
     private long lastModifiedDate;
+
+    /** One managed login branding per client, or null when none has been created. */
+    private ManagedLoginBranding managedLoginBranding;
 
     public UserPoolClient() {
         long now = System.currentTimeMillis() / 1000L;
@@ -96,6 +100,9 @@ public class UserPoolClient {
     public Integer getIdTokenValidity() { return idTokenValidity; }
     public void setIdTokenValidity(Integer idTokenValidity) { this.idTokenValidity = idTokenValidity; }
 
+    public int getAuthSessionValidity() { return authSessionValidity; }
+    public void setAuthSessionValidity(int authSessionValidity) { this.authSessionValidity = authSessionValidity; }
+
     public List<String> getLogoutURLs() { return logoutURLs; }
     public void setLogoutURLs(List<String> logoutURLs) { this.logoutURLs = logoutURLs; }
 
@@ -136,4 +143,9 @@ public class UserPoolClient {
 
     public long getLastModifiedDate() { return lastModifiedDate; }
     public void setLastModifiedDate(long lastModifiedDate) { this.lastModifiedDate = lastModifiedDate; }
+
+    public ManagedLoginBranding getManagedLoginBranding() { return managedLoginBranding; }
+    public void setManagedLoginBranding(ManagedLoginBranding managedLoginBranding) {
+        this.managedLoginBranding = managedLoginBranding;
+    }
 }

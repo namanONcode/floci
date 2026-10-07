@@ -27,13 +27,19 @@ public class CodePipelineExecution {
     private Double lastUpdateTime;
     private List<Map<String, Object>> artifactRevisions = new ArrayList<>();
     private List<Map<String, Object>> sourceRevisions = new ArrayList<>();
+    private List<Map<String, Object>> sourceRevisionOverrides = new ArrayList<>();
     private List<Map<String, String>> variables = new ArrayList<>();
     private Map<String, String> trigger = new LinkedHashMap<>();
     private List<ActionExecution> actionExecutions = new ArrayList<>();
+    private Map<String, String> stageExecutionStatuses = new LinkedHashMap<>();
     private String currentStage;
-    private boolean stopRequested;
-    private boolean abandon;
+    private volatile boolean stopRequested;
+    private volatile boolean abandon;
+    private volatile boolean artifactsReleased;
     private String rollbackTargetPipelineExecutionId;
+    private List<Map<String, Object>> ruleExecutions = new ArrayList<>();
+    /** Overridden stage conditions, keyed {@code <stageName>/<conditionType>}. */
+    private Map<String, Boolean> conditionOverrides = new LinkedHashMap<>();
 
     public String getAccountId() {
         return accountId;
@@ -139,6 +145,14 @@ public class CodePipelineExecution {
         this.sourceRevisions = sourceRevisions;
     }
 
+    public List<Map<String, Object>> getSourceRevisionOverrides() {
+        return sourceRevisionOverrides;
+    }
+
+    public void setSourceRevisionOverrides(List<Map<String, Object>> sourceRevisionOverrides) {
+        this.sourceRevisionOverrides = sourceRevisionOverrides == null ? new ArrayList<>() : sourceRevisionOverrides;
+    }
+
     public List<Map<String, String>> getVariables() {
         return variables;
     }
@@ -161,6 +175,15 @@ public class CodePipelineExecution {
 
     public void setActionExecutions(List<ActionExecution> actionExecutions) {
         this.actionExecutions = actionExecutions;
+    }
+
+    public Map<String, String> getStageExecutionStatuses() {
+        return stageExecutionStatuses;
+    }
+
+    public void setStageExecutionStatuses(Map<String, String> stageExecutionStatuses) {
+        this.stageExecutionStatuses = stageExecutionStatuses == null
+                ? new LinkedHashMap<>() : stageExecutionStatuses;
     }
 
     public String getCurrentStage() {
@@ -187,12 +210,36 @@ public class CodePipelineExecution {
         this.abandon = abandon;
     }
 
+    public boolean isArtifactsReleased() {
+        return artifactsReleased;
+    }
+
+    public void setArtifactsReleased(boolean artifactsReleased) {
+        this.artifactsReleased = artifactsReleased;
+    }
+
     public String getRollbackTargetPipelineExecutionId() {
         return rollbackTargetPipelineExecutionId;
     }
 
     public void setRollbackTargetPipelineExecutionId(String rollbackTargetPipelineExecutionId) {
         this.rollbackTargetPipelineExecutionId = rollbackTargetPipelineExecutionId;
+    }
+
+    public List<Map<String, Object>> getRuleExecutions() {
+        return ruleExecutions;
+    }
+
+    public void setRuleExecutions(List<Map<String, Object>> ruleExecutions) {
+        this.ruleExecutions = ruleExecutions;
+    }
+
+    public Map<String, Boolean> getConditionOverrides() {
+        return conditionOverrides;
+    }
+
+    public void setConditionOverrides(Map<String, Boolean> conditionOverrides) {
+        this.conditionOverrides = conditionOverrides;
     }
 
     @RegisterForReflection

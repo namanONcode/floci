@@ -1,8 +1,10 @@
 package io.github.hectorvent.floci.services.appsync;
 
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.AwsEndpoints;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.RequestContext;
@@ -11,20 +13,30 @@ import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.appsync.graphql.SchemaCreationWorker;
 import io.github.hectorvent.floci.services.appsync.graphql.SchemaRegistry;
+import io.github.hectorvent.floci.services.appsync.graphql.auth.LambdaAuthorizerCache;
 import io.github.hectorvent.floci.services.appsync.model.*;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import java.security.SecureRandom;
 import java.time.Clock;
 import java.time.Duration;
 import java.util.*;
 import java.util.Base64;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 @ApplicationScoped
 public class AppSyncService {
     private static final Logger LOG = Logger.getLogger(AppSyncService.class);
+
+    // AWS issues API keys as "da2-" followed by 26 lowercase alphanumerics, and ApiKey.id is
+    // that value: it is what clients send in the x-api-key header.
+    private static final String API_KEY_PREFIX = "da2-";
+    private static final String API_KEY_ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789";
+    private static final int API_KEY_RANDOM_LENGTH = 26;
 
     private final StorageBackend<String, GraphqlApi> apiStore;
     private final AccountAwareStorageBackend<String> schemaStore;
@@ -33,6 +45,8 @@ public class AppSyncService {
     private final StorageBackend<String, Resolver> resolverStore;
     private final StorageBackend<String, FunctionConfiguration> functionStore;
     private final StorageBackend<String, ApiKey> apiKeyStore;
+    // Instance field on purpose: a static SecureRandom would be captured in the native image heap.
+    private final SecureRandom apiKeyRandom = new SecureRandom();
     private final StorageBackend<String, AppSyncType> typeStore;
     private final StorageBackend<String, DomainName> domainStore;
     private final StorageBackend<String, String> associationStore;
@@ -45,6 +59,7 @@ public class AppSyncService {
     private final ObjectMapper objectMapper;
     private final Clock clock;
     private final String baseUrl;
+    private final LambdaAuthorizerCache lambdaAuthorizerCache;
 
     @Inject
     public AppSyncService(StorageFactory storageFactory, EmulatorConfig config, RegionResolver regionResolver,
@@ -52,7 +67,8 @@ public class AppSyncService {
                           Instance<RequestContext> requestContextInstance, ObjectMapper objectMapper,
                           AccountAwareStorageBackend<SchemaCreationStatus> schemaStatusStore,
                           AccountAwareStorageBackend<String> schemaStore,
-                          Clock clock) {
+                          Clock clock,
+                          LambdaAuthorizerCache lambdaAuthorizerCache) {
         this.apiStore = storageFactory.create("appsync", "appsync-apis.json", new TypeReference<>() {});
         this.schemaStore = schemaStore;
         this.schemaStatusStore = schemaStatusStore;
@@ -72,6 +88,7 @@ public class AppSyncService {
         this.objectMapper = objectMapper;
         this.clock = clock;
         this.baseUrl = trimTrailingSlash(config.effectiveBaseUrl());
+        this.lambdaAuthorizerCache = lambdaAuthorizerCache;
     }
 
     // ──────────────────────────── GraphQL API ────────────────────────────
@@ -216,6 +233,7 @@ public class AppSyncService {
         deleteApiKeysForApi(apiId);
         deleteChannelNamespacesForApi(apiId);
         deleteDomainAssociationsForApi(apiId);
+        lambdaAuthorizerCache.evictApi(apiId);
         LOG.infov("Deleted GraphQL API {0}", apiId);
     }
 
@@ -358,6 +376,22 @@ public class AppSyncService {
 
     // ──────────────────────────── Resolvers ────────────────────────────
 
+    /**
+     * The {@code AppSyncRuntime} shape ({@code {name, runtimeVersion}}) AWS accepts on a resolver
+     * and on a pipeline function alike, or null when the request omits it. Shared so the two paths
+     * cannot drift: a pipeline whose function and resolver disagreed on the runtime would not run.
+     */
+    private Resolver.ResolverRuntime parseRuntime(Object runtimeValue) {
+        Map<String, Object> runtime = castMap(runtimeValue);
+        if (runtime == null) {
+            return null;
+        }
+        Resolver.ResolverRuntime rt = new Resolver.ResolverRuntime();
+        rt.setName(parseEnum(ResolverRuntimeName.class, runtime.get("name")));
+        rt.setRuntimeVersion((String) runtime.get("runtimeVersion"));
+        return rt;
+    }
+
     public Resolver createResolver(String apiId, Map<String, Object> request, String region) {
         assertSchemaNotBusy(apiId);
         getGraphqlApi(apiId);
@@ -366,7 +400,17 @@ public class AppSyncService {
             throw new AwsException("BadRequestException", "A resolver field name is required", 400);
         }
         String dataSourceName = (String) request.get("dataSourceName");
-        if (dataSourceName == null || dataSourceName.isBlank()) {
+        ResolverKind kind = parseEnum(ResolverKind.class, request.getOrDefault("kind", "UNIT"));
+        // Only a UNIT resolver names a data source. A PIPELINE resolver reaches its data through the
+        // functions in pipelineConfig, and AWS refuses dataSourceName on one, so requiring it here
+        // made every pipeline resolver unprovisionable: the shape the AppSync JS resolvers that
+        // Serverless and Amplify generate use throughout.
+        if (kind == ResolverKind.PIPELINE) {
+            if (dataSourceName != null && !dataSourceName.isBlank()) {
+                throw new AwsException("BadRequestException",
+                        "A PIPELINE resolver cannot specify a data source name", 400);
+            }
+        } else if (dataSourceName == null || dataSourceName.isBlank()) {
             throw new AwsException("BadRequestException", "A data source name is required for the resolver", 400);
         }
         String typeName = (String) request.get("typeName");
@@ -374,7 +418,9 @@ public class AppSyncService {
             throw new AwsException("BadRequestException", "A type name is required for the resolver", 400);
         }
         // Validate data source exists
-        getDataSource(apiId, dataSourceName);
+        if (dataSourceName != null && !dataSourceName.isBlank()) {
+            getDataSource(apiId, dataSourceName);
+        }
         Resolver resolver = new Resolver();
         resolver.setApiId(apiId);
         resolver.setTypeName(typeName);
@@ -383,7 +429,7 @@ public class AppSyncService {
         resolver.setFunctionId((String) request.get("functionId"));
         resolver.setRequestMappingTemplate((String) request.get("requestMappingTemplate"));
         resolver.setResponseMappingTemplate((String) request.get("responseMappingTemplate"));
-        resolver.setKind(parseEnum(ResolverKind.class, request.getOrDefault("kind", "UNIT")));
+        resolver.setKind(kind);
         resolver.setCode((String) request.get("code"));
         resolver.setCachingConfig(castMap(request.get("cachingConfig")));
         resolver.setMaxBatchSize(castInt(request.get("maxBatchSize")));
@@ -393,13 +439,7 @@ public class AppSyncService {
         resolver.setResolverArn(regionResolver.buildArn("appsync", region,
             "apis/" + apiId + "/types/" + typeName + "/resolvers/" + fieldName));
 
-        Map<String, Object> runtime = castMap(request.get("runtime"));
-        if (runtime != null) {
-            Resolver.ResolverRuntime rt = new Resolver.ResolverRuntime();
-            rt.setName(parseEnum(ResolverRuntimeName.class, runtime.get("name")));
-            rt.setRuntimeVersion((String) runtime.get("runtimeVersion"));
-            resolver.setRuntime(rt);
-        }
+        resolver.setRuntime(parseRuntime(request.get("runtime")));
 
         String key = resolverKey(apiId, resolver.getTypeName(), resolver.getFieldName());
         if (resolverStore.get(key).isPresent()) {
@@ -446,13 +486,7 @@ public class AppSyncService {
         if (request.containsKey("metricsConfig")) existing.setMetricsConfig((String) request.get("metricsConfig"));
         if (request.containsKey("pipelineConfig")) existing.setPipelineConfig((Map<String, Object>) request.get("pipelineConfig"));
         if (request.containsKey("syncConfig")) existing.setSyncConfig((Map<String, Object>) request.get("syncConfig"));
-        if (request.containsKey("runtime")) {
-            Map<String, Object> runtime = (Map<String, Object>) request.get("runtime");
-            Resolver.ResolverRuntime rt = new Resolver.ResolverRuntime();
-            rt.setName(parseEnum(ResolverRuntimeName.class, runtime.get("name")));
-            rt.setRuntimeVersion((String) runtime.get("runtimeVersion"));
-            existing.setRuntime(rt);
-        }
+        if (request.containsKey("runtime")) existing.setRuntime(parseRuntime(request.get("runtime")));
         resolverStore.put(resolverKey(apiId, typeName, fieldName), existing);
         return existing;
     }
@@ -486,6 +520,8 @@ public class AppSyncService {
         fn.setFunctionVersion((String) request.getOrDefault("functionVersion", "2018-05-29"));
         fn.setFunctionArn(buildFunctionArn(apiId, fn.getFunctionId(), region));
         fn.setCode((String) request.get("code"));
+        fn.setRuntime(parseRuntime(request.get("runtime")));
+        fn.setMaxBatchSize(castInt(request.get("maxBatchSize")));
 
         functionStore.put(apiKey(apiId, fn.getFunctionId()), fn);
         return fn;
@@ -504,12 +540,18 @@ public class AppSyncService {
     public FunctionConfiguration updateFunction(String apiId, String functionId, Map<String, Object> request) {
         assertSchemaNotBusy(apiId);
         FunctionConfiguration existing = getFunction(apiId, functionId);
+        // UpdateFunction takes a new name on AWS, and CloudFormation drives FunctionConfiguration
+        // renames through it. Leaving the name alone let a stack complete while GetFunction still
+        // reported the old one.
+        if (request.containsKey("name")) existing.setName((String) request.get("name"));
         if (request.containsKey("description")) existing.setDescription((String) request.get("description"));
         if (request.containsKey("dataSourceName")) existing.setDataSourceName((String) request.get("dataSourceName"));
         if (request.containsKey("requestMappingTemplate")) existing.setRequestMappingTemplate((String) request.get("requestMappingTemplate"));
         if (request.containsKey("responseMappingTemplate")) existing.setResponseMappingTemplate((String) request.get("responseMappingTemplate"));
         if (request.containsKey("functionVersion")) existing.setFunctionVersion((String) request.get("functionVersion"));
         if (request.containsKey("code")) existing.setCode((String) request.get("code"));
+        if (request.containsKey("runtime")) existing.setRuntime(parseRuntime(request.get("runtime")));
+        if (request.containsKey("maxBatchSize")) existing.setMaxBatchSize(castInt(request.get("maxBatchSize")));
         functionStore.put(apiKey(apiId, functionId), existing);
         return existing;
     }
@@ -585,7 +627,7 @@ public class AppSyncService {
                     "The API key exceeded a limit.", 400);
         }
         ApiKey key = new ApiKey();
-        key.setId(generateShortId());
+        key.setId(generateApiKeyId());
         key.setApiId(apiId);
         key.setDescription((String) request.get("description"));
         Object expiresValue = request.get("expires");
@@ -593,8 +635,6 @@ public class AppSyncService {
                 ? clock.instant().getEpochSecond() + Duration.ofDays(7).getSeconds()
                 : parseExpires(expiresValue);
         applyApiKeyExpires(key, expires);
-
-        key.setApiKey("da2-" + generateShortId());
 
         apiKeyStore.put(apiKey(apiId, key.getId()), key);
         return key;
@@ -615,7 +655,9 @@ public class AppSyncService {
         }
         long now = clock.instant().getEpochSecond();
         for (ApiKey key : apiKeyStore.scan(k -> k.startsWith(apiId + "::"))) {
-            if (keyValue.equals(key.getApiKey())) {
+            // Keys persisted by earlier builds have a short id that was never a valid
+            // x-api-key value; keep them listable and deletable but never authenticate them.
+            if (key.getId() != null && key.getId().startsWith(API_KEY_PREFIX) && keyValue.equals(key.getId())) {
                 if (key.getExpires() != null && key.getExpires() <= now) {
                     return Optional.empty();
                 }
@@ -694,9 +736,9 @@ public class AppSyncService {
         dn.setDescription((String) request.get("description"));
         dn.setCertificateArn((String) request.get("certificateArn"));
         String shortId = generateShortId();
-        dn.setAppsyncDomainName(shortId + ".appsync-api.us-east-1.amazonaws.com");
+        dn.setAppsyncDomainName(shortId + "." + AwsEndpoints.host("appsync-api", regionResolver.getRegion()));
         dn.setHostedZoneId("Z" + generateShortId());
-        dn.setDomainNameArn(regionResolver.buildArn("appsync", regionResolver.getDefaultRegion(),
+        dn.setDomainNameArn(regionResolver.buildArn("appsync", regionResolver.getRegion(),
             "domainnames/" + domainName));
 
         Object tagsObj = request.get("tags");
@@ -772,7 +814,7 @@ public class AppSyncService {
 
     public ChannelNamespace createChannelNamespace(String apiId, Map<String, Object> request) {
         assertSchemaNotBusy(apiId);
-        getGraphqlApi(apiId);
+        GraphqlApi api = getGraphqlApi(apiId);
         String name = (String) request.get("name");
         if (name == null || name.isBlank()) {
             throw new AwsException("BadRequestException", "A channel namespace name is required", 400);
@@ -786,7 +828,7 @@ public class AppSyncService {
         ns.setName(name);
         ns.setApiId(apiId);
         ns.setDescription((String) request.get("description"));
-        ns.setChannelNamespaceArn(regionResolver.buildArn("appsync", regionResolver.getDefaultRegion(),
+        ns.setChannelNamespaceArn(regionResolver.buildArn("appsync", apiRegion(api),
             "apis/" + apiId + "/channelNamespaces/" + name));
         ns.setCodeHandlers((String) request.get("codeHandlers"));
         ns.setCreated(System.currentTimeMillis());
@@ -1095,12 +1137,28 @@ public class AppSyncService {
         return UUID.randomUUID().toString().replace("-", "").substring(0, 7);
     }
 
+    private String generateApiKeyId() {
+        StringBuilder sb = new StringBuilder(API_KEY_PREFIX);
+        for (int i = 0; i < API_KEY_RANDOM_LENGTH; i++) {
+            sb.append(API_KEY_ALPHABET.charAt(apiKeyRandom.nextInt(API_KEY_ALPHABET.length())));
+        }
+        return sb.toString();
+    }
+
     private String apiKey(String apiId, String name) {
         return apiId + "::" + name;
     }
 
     private String resolverKey(String apiId, String typeName, String fieldName) {
         return apiId + "::" + typeName + "::" + fieldName;
+    }
+
+    /** The region of an API's ARN, where its child resources live; the request region if it has none. */
+    private String apiRegion(GraphqlApi api) {
+        if (api.getArn() != null && AwsArnUtils.isArn(api.getArn())) {
+            return AwsArnUtils.parse(api.getArn()).region();
+        }
+        return regionResolver.getRegion();
     }
 
     private String buildApiArn(String apiId, String region) {
@@ -1111,11 +1169,36 @@ public class AppSyncService {
         return regionResolver.buildArn("appsync", region, "apis/" + apiId + "/functions/" + functionId);
     }
 
+    /**
+     * The model's own {@code ResourceArn} shape for AppSync tagging. Only an API-level ARN is
+     * taggable: the pattern is anchored to {@code apis/<26 chars>} with nothing after it, so a
+     * data source or function ARN is not a valid ResourceArn at all.
+     *
+     * <p>The partition is the one place this departs from the model, which spells it {@code aws}.
+     * This emulator mints its API ARNs with the region's own partition, so keeping the literal
+     * would mean refusing to tag an API using the exact ARN it had just returned.
+     */
+    private static final Pattern RESOURCE_ARN = Pattern.compile(
+            "^arn:" + AwsArnUtils.PARTITION_REGEX
+                    + ":appsync:[A-Za-z0-9_/.-]{0,63}:\\d{12}:apis/([0-9A-Za-z_-]{26})$");
+
+    /**
+     * API id out of a tagging ResourceArn.
+     *
+     * <p>Splitting on {@code /} and taking the last segment read the sub-resource id as the API
+     * id, so tagging {@code .../apis/<api>/datasources/<ds>} looked up an API called
+     * {@code <ds>} and answered NotFound. AWS rejects that ARN outright, so the shape is
+     * validated instead.
+     */
     private String extractApiIdFromArn(String arn) {
-        if (arn == null) throw new AwsException("BadRequestException", "Invalid ARN", 400);
-        String[] parts = arn.split("/");
-        if (parts.length < 2) throw new AwsException("BadRequestException", "Invalid ARN format", 400);
-        return parts[parts.length - 1];
+        if (arn == null) {
+            throw new AwsException("BadRequestException", "Invalid ARN", 400);
+        }
+        Matcher matcher = RESOURCE_ARN.matcher(arn);
+        if (!matcher.matches()) {
+            throw new AwsException("BadRequestException", "Invalid ARN format", 400);
+        }
+        return matcher.group(1);
     }
 
     private String coerceString(Object value) {
@@ -1190,7 +1273,7 @@ public class AppSyncService {
     private Map<String, String> castStringMap(Object value) {
         if (value instanceof Map) {
             Map<String, String> result = new HashMap<>();
-            for (var entry : ((Map<Object, Object>) value).entrySet()) {
+            for (Map.Entry<Object, Object> entry : ((Map<Object, Object>) value).entrySet()) {
                 result.put(String.valueOf(entry.getKey()), String.valueOf(entry.getValue()));
             }
             return result;

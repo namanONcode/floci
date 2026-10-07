@@ -3,12 +3,11 @@ package io.github.hectorvent.floci.services.cloudformation;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
-import io.github.hectorvent.floci.services.cloudformation.provisioners.CloudFormationResourceRegistry;
+import io.github.hectorvent.floci.services.cloudformation.provisioners.CfnResourceDispatcher;
 import io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
-import java.util.List;
 import java.util.Map;
 import java.util.function.Function;
 
@@ -36,19 +35,18 @@ class CloudFormationLogGroupProvisionerTest {
 
     private final ObjectMapper mapper = new ObjectMapper();
     private CloudWatchLogsService logsService;
-    private CloudFormationResourceProvisioner provisioner;
+    private CfnResourceDispatcher provisioner;
 
     @BeforeEach
     void setUp() {
         logsService = mock(CloudWatchLogsService.class);
-        provisioner = new CloudFormationResourceProvisioner(
-                null, null, null, null, null, null, null, null, null, null,
-                null, null, null, null, null, null,
-                mapper,
-                null, null, null, null, null, null, null,
-                null, null, logsService, null, null, null, null,
-                null, null,
-                new CloudFormationResourceRegistry(List.of()));
+        // Naming the service is enough: the fixture wires LogsCfnProvisioner from it, the way CDI
+        // does. Testing through the dispatcher rather than the provisioner directly also covers the
+        // plumbing that carries existingPhysicalId and existingAttributes into ProvisionContext.
+        provisioner = CfnProvisionerFixture.builder()
+                .objectMapper(mapper)
+                .logs(logsService)
+                .build();
     }
 
     @Test

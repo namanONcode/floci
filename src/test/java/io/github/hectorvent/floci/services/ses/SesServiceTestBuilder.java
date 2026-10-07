@@ -2,9 +2,8 @@ package io.github.hectorvent.floci.services.ses;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
-import io.github.hectorvent.floci.services.ses.model.AccountDetails;
+import io.github.hectorvent.floci.services.acm.AcmService;
 import io.github.hectorvent.floci.services.ses.model.AccountSuppressionAttributes;
-import io.github.hectorvent.floci.services.ses.model.AccountVdmAttributes;
 import io.github.hectorvent.floci.services.ses.model.ConfigurationSet;
 import io.github.hectorvent.floci.services.ses.model.Contact;
 import io.github.hectorvent.floci.services.ses.model.ContactList;
@@ -12,11 +11,14 @@ import io.github.hectorvent.floci.services.ses.model.CustomVerificationEmailTemp
 import io.github.hectorvent.floci.services.ses.model.DedicatedIpPool;
 import io.github.hectorvent.floci.services.ses.model.EmailTemplate;
 import io.github.hectorvent.floci.services.ses.model.Identity;
-import io.github.hectorvent.floci.services.ses.model.ReceiptRuleSet;
+import io.github.hectorvent.floci.services.ses.model.IdentityCertificate;
 import io.github.hectorvent.floci.services.ses.model.SentEmail;
 import io.github.hectorvent.floci.services.ses.model.SuppressedDestination;
+import io.github.hectorvent.floci.services.ses.model.Tenant;
+import io.github.hectorvent.floci.services.ses.model.TenantResourceAssociation;
 import io.github.hectorvent.floci.services.route53.Route53Service;
 
+import java.security.SecureRandom;
 import java.time.Clock;
 
 import static org.mockito.Mockito.mock;
@@ -32,9 +34,6 @@ final class SesServiceTestBuilder {
 
     private final InMemoryStorage<String, Identity> identityStore = new InMemoryStorage<>();
     private final InMemoryStorage<String, SentEmail> emailStore = new InMemoryStorage<>();
-    private final InMemoryStorage<String, Boolean> accountSettingsStore = new InMemoryStorage<>();
-    private final InMemoryStorage<String, AccountVdmAttributes> accountVdmStore = new InMemoryStorage<>();
-    private final InMemoryStorage<String, AccountDetails> accountDetailsStore = new InMemoryStorage<>();
     private final InMemoryStorage<String, EmailTemplate> templateStore = new InMemoryStorage<>();
     private final InMemoryStorage<String, ConfigurationSet> configSetStore = new InMemoryStorage<>();
     private final InMemoryStorage<String, SuppressedDestination> suppressionStore = new InMemoryStorage<>();
@@ -43,16 +42,28 @@ final class SesServiceTestBuilder {
     private final InMemoryStorage<String, ContactList> contactListStore = new InMemoryStorage<>();
     private final InMemoryStorage<String, Contact> contactStore = new InMemoryStorage<>();
     private final InMemoryStorage<String, String> policyStore = new InMemoryStorage<>();
-    private final InMemoryStorage<String, ReceiptRuleSet> receiptRuleStore = new InMemoryStorage<>();
     private final InMemoryStorage<String, CustomVerificationEmailTemplate> cvetStore = new InMemoryStorage<>();
+    private final InMemoryStorage<String, Tenant> tenantStore = new InMemoryStorage<>();
+    private final InMemoryStorage<String, TenantResourceAssociation> tenantAssociationStore =
+            new InMemoryStorage<>();
+    private final InMemoryStorage<String, IdentityCertificate> certificateStore = new InMemoryStorage<>();
 
     private SmtpRelay smtpRelay = mock(SmtpRelay.class);
-    // Default null, matching the production null-Route53 case: SesService treats a null Route53Service
-    // as "DNS lookup disabled" for DKIM record checks. Tests that exercise the lookup opt in via
-    // route53Service(...).
+    // Default null, matching the production null-Route53 case: SesIdentityService treats a null
+    // Route53Service as "DNS lookup disabled" for DKIM record checks. Tests that exercise the lookup
+    // opt in via route53Service(...).
     private Route53Service route53Service = null;
     private ObjectMapper objectMapper = new ObjectMapper();
     private Clock clock = Clock.systemUTC();
+    // Built by build(); exposed so tests can reach the domain services directly now that the facade
+    // no longer forwards their operations.
+    private SesContactService contactService;
+    private SesSuppressionService suppressionService;
+    private SesConfigurationSetService configSetService;
+    private SesIdentityService identityService;
+    private SesCvetService cvetService;
+    private SesSentEmailService sentEmailService;
+    private SesIdentityCertificateService certificateService;
 
     static SesServiceTestBuilder create() {
         return new SesServiceTestBuilder();
@@ -108,22 +119,77 @@ final class SesServiceTestBuilder {
         return contactListStore;
     }
 
+    SesContactService contactService() {
+        if (contactService == null) {
+            throw new IllegalStateException("call build() first");
+        }
+        return contactService;
+    }
+
+    SesSuppressionService suppressionService() {
+        if (suppressionService == null) {
+            throw new IllegalStateException("call build() first");
+        }
+        return suppressionService;
+    }
+
+    SesConfigurationSetService configSetService() {
+        if (configSetService == null) {
+            throw new IllegalStateException("call build() first");
+        }
+        return configSetService;
+    }
+
+    SesSentEmailService sentEmailService() {
+        if (sentEmailService == null) {
+            throw new IllegalStateException("call build() first");
+        }
+        return sentEmailService;
+    }
+
+    SesCvetService cvetService() {
+        if (cvetService == null) {
+            throw new IllegalStateException("call build() first");
+        }
+        return cvetService;
+    }
+
+    SesIdentityService identityService() {
+        if (identityService == null) {
+            throw new IllegalStateException("call build() first");
+        }
+        return identityService;
+    }
+
+    SesIdentityCertificateService certificateService() {
+        if (certificateService == null) {
+            throw new IllegalStateException("call build() first");
+        }
+        return certificateService;
+    }
+
     SesService build() {
+        contactService = new SesContactService(contactListStore, contactStore, clock);
+        suppressionService = new SesSuppressionService(suppressionStore, accountSuppressionStore,
+                new InMemoryStorage<>());
+        configSetService = new SesConfigurationSetService(configSetStore);
+        identityService = new SesIdentityService(identityStore, route53Service, clock);
+        sentEmailService = new SesSentEmailService(emailStore);
+        cvetService = new SesCvetService(cvetStore);
+        certificateService = new SesIdentityCertificateService(certificateStore, identityService,
+                mock(AcmService.class), clock);
         return new SesService(
-                identityStore,
-                new SesSentEmailService(emailStore),
-                new SesAccountService(accountSettingsStore, accountVdmStore, accountDetailsStore),
-                new SesTemplateService(templateStore),
-                configSetStore,
-                new SesSuppressionService(suppressionStore, accountSuppressionStore),
+                identityService,
+                sentEmailService,
+                new SesTemplateService(templateStore, objectMapper, new SecureRandom(), clock),
+                configSetService,
+                suppressionService,
                 new SesDedicatedIpService(dedicatedIpPoolStore),
-                new SesContactService(contactListStore, contactStore, clock),
+                contactService,
                 new SesPolicyService(policyStore, objectMapper),
-                new SesReceiptRuleService(receiptRuleStore, clock),
-                new SesCvetService(cvetStore),
-                smtpRelay,
-                objectMapper,
-                route53Service,
-                clock);
+                cvetService,
+                new SesTenantService(tenantStore, tenantAssociationStore, clock, new SecureRandom()),
+                certificateService,
+                smtpRelay);
     }
 }

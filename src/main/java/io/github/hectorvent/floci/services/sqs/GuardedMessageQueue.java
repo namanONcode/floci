@@ -5,8 +5,11 @@ import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.services.sqs.model.Message;
 
 import java.time.Instant;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Set;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.Predicate;
 import java.util.stream.Collectors;
 
 /**
@@ -20,6 +23,7 @@ class GuardedMessageQueue {
     private final List<Message> messages;
     private final StorageBackend<String, List<Message>> messageStore;
     private final String storageKey;
+    private final String receiptHandleSecret;
     private volatile boolean closed;
 
     @FunctionalInterface
@@ -34,36 +38,56 @@ class GuardedMessageQueue {
     }
 
     GuardedMessageQueue(StorageBackend<String, List<Message>> messageStore, String storageKey) {
-        this(new ArrayList<>(), messageStore, storageKey);
+        this(new ArrayList<>(), messageStore, storageKey, ReceiptHandle.DEFAULT_SECRET);
     }
 
     GuardedMessageQueue(List<Message> initial, StorageBackend<String, List<Message>> messageStore, String storageKey) {
+        this(initial, messageStore, storageKey, ReceiptHandle.DEFAULT_SECRET);
+    }
+
+    GuardedMessageQueue(List<Message> initial, StorageBackend<String, List<Message>> messageStore, String storageKey,
+                        String receiptHandleSecret) {
         this.messages = new ArrayList<>(initial);
         this.messageStore = messageStore;
         this.storageKey = storageKey;
+        this.receiptHandleSecret = receiptHandleSecret;
     }
 
     record ClaimResult(List<Message> claimed, List<Message> dlqCandidates) {
     }
 
     void addMessage(Message message) {
-        try (var _ = hold()) {
+        try (Guard _ = hold()) {
+            int mark = messages.size();
             messages.add(message);
-            persist();
+            try {
+                persist();
+            } catch (RuntimeException e) {
+                messages.remove(mark);
+                throw e;
+            }
         }
     }
 
+    /** If persisting fails the in-memory add is rolled back and the exception propagates, so a
+     *  caller that compensates on the source side does not leave a duplicate here. */
     void addAll(List<Message> toAdd) {
-        try (var _ = hold()) {
+        try (Guard _ = hold()) {
+            int mark = messages.size();
             messages.addAll(toAdd);
-            persist();
+            try {
+                persist();
+            } catch (RuntimeException e) {
+                messages.subList(mark, messages.size()).clear();
+                throw e;
+            }
         }
     }
 
     ClaimResult claimVisibleMessages(int maxMessages, int effectiveTimeout,
                                      boolean fifo, int maxReceiveCount,
                                      String deadLetterTargetArn) {
-        try (var _ = hold()) {
+        try (Guard _ = hold()) {
             List<Message> claimed = new ArrayList<>();
             List<Message> dlqCandidates = new ArrayList<>();
 
@@ -97,7 +121,7 @@ class GuardedMessageQueue {
             return false;
         }
 
-        msg.setReceiptHandle(UUID.randomUUID().toString());
+        msg.setReceiptHandle(ReceiptHandle.issue(storageKey, msg.getMessageId(), receiptHandleSecret).encode());
         msg.setVisibleAt(Instant.now().plusSeconds(effectiveTimeout));
         claimed.add(msg);
         return true;
@@ -140,53 +164,83 @@ class GuardedMessageQueue {
         }
     }
 
-    Optional<Message> removeByReceiptHandle(String receiptHandle) {
-        try (var _ = hold()) {
-            Message removed = null;
-            for (Iterator<Message> it = messages.iterator(); it.hasNext(); ) {
-                Message m = it.next();
-                if (receiptHandle.equals(m.getReceiptHandle())) {
-                    removed = m;
-                    it.remove();
-                    break;
-                }
+    enum HandleResult { APPLIED, MESSAGE_GONE, HANDLE_EXPIRED }
+
+    record Removal(HandleResult result, Message message) {
+    }
+
+    Removal removeByReceiptHandle(ReceiptHandle handle, boolean fifo) {
+        try (Guard _ = hold()) {
+            Message msg = findByMessageId(handle.messageId());
+            HandleResult result = checkHandle(msg, handle, fifo);
+            if (result != HandleResult.APPLIED) {
+                return new Removal(result, null);
             }
-            if (removed != null) {
-                persist();
-            }
-            return Optional.ofNullable(removed);
+            messages.remove(msg);
+            persist();
+            return new Removal(HandleResult.APPLIED, msg);
         }
     }
 
-    boolean changeVisibility(String receiptHandle, int visibilityTimeout) {
-        try (var _ = hold()) {
-            for (Message msg : messages) {
-                if (receiptHandle.equals(msg.getReceiptHandle())) {
-                    msg.setVisibleAt(Instant.now().plusSeconds(visibilityTimeout));
-                    persist();
-                    return true;
-                }
+    HandleResult changeVisibility(ReceiptHandle handle, int visibilityTimeout, boolean fifo) {
+        try (Guard _ = hold()) {
+            Message msg = findByMessageId(handle.messageId());
+            HandleResult result = checkHandle(msg, handle, fifo);
+            if (result == HandleResult.APPLIED) {
+                msg.setVisibleAt(Instant.now().plusSeconds(visibilityTimeout));
+                persist();
             }
-            return false;
+            return result;
         }
+    }
+
+    private Message findByMessageId(String messageId) {
+        for (Message msg : messages) {
+            if (messageId.equals(msg.getMessageId())) {
+                return msg;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * On a standard queue an older handle of the message still works. On a FIFO queue only the
+     * handle of the receive still in flight does.
+     */
+    private static HandleResult checkHandle(Message msg, ReceiptHandle handle, boolean fifo) {
+        if (msg == null) {
+            return HandleResult.MESSAGE_GONE;
+        }
+        if (fifo && (!handle.encode().equals(msg.getReceiptHandle()) || msg.isVisible())) {
+            return HandleResult.HANDLE_EXPIRED;
+        }
+        return HandleResult.APPLIED;
     }
 
     void removeMessages(List<Message> toRemove) {
-        try (var _ = hold()) {
+        try (Guard _ = hold()) {
             messages.removeAll(toRemove);
             persist();
         }
     }
 
+    void removeExpired(Instant cutoff) {
+        try (Guard _ = hold()) {
+            if (messages.removeIf(msg -> msg.isExpired(cutoff))) {
+                persist();
+            }
+        }
+    }
+
     void purge() {
-        try (var _ = hold()) {
+        try (Guard _ = hold()) {
             messages.clear();
             persist();
         }
     }
 
     List<Message> drainAll() {
-        try (var _ = hold()) {
+        try (Guard _ = hold()) {
             List<Message> drained = new ArrayList<>(messages);
             messages.clear();
             persist();
@@ -194,17 +248,26 @@ class GuardedMessageQueue {
         }
     }
 
-    /** Remove and return the first message in insertion order, or null if empty.
-     *  Used by the message-move-task worker so the source queue stays observably
-     *  populated for the duration of a rate-limited move. */
-    Message drainOne() {
-        try (var _ = hold()) {
-            if (messages.isEmpty()) {
+    /** Remove and return the head message if {@code eligible} accepts it; otherwise leave the
+     *  queue untouched and return {@code null}. The check and the removal happen under one lock
+     *  hold so nothing can slip in between. Used by the message-move-task worker so the source
+     *  queue stays observably populated for the duration of a rate-limited move. */
+    Message drainFirstIf(Predicate<Message> eligible) {
+        try (Guard _ = hold()) {
+            if (messages.isEmpty() || !eligible.test(messages.getFirst())) {
                 return null;
             }
-            Message head = messages.remove(0);
+            Message head = messages.removeFirst();
             persist();
             return head;
+        }
+    }
+
+    /** Put a message that could not be delivered back at the head, preserving queue order. */
+    void restoreFirst(Message message) {
+        try (Guard _ = hold()) {
+            messages.addFirst(message);
+            persist();
         }
     }
 
@@ -220,7 +283,7 @@ class GuardedMessageQueue {
      * DelaySeconds, so it counts as delayed rather than in flight.
      */
     MessageCounts messageCounts() {
-        try (var _ = hold()) {
+        try (Guard _ = hold()) {
             long visible = 0;
             long inFlight = 0;
             long delayed = 0;
@@ -238,13 +301,13 @@ class GuardedMessageQueue {
     }
 
     List<Message> peekAll() {
-        try (var _ = hold()) {
+        try (Guard _ = hold()) {
             return new ArrayList<>(messages);
         }
     }
 
     boolean isEmpty() {
-        try (var _ = hold()) {
+        try (Guard _ = hold()) {
             return messages.isEmpty();
         }
     }
@@ -254,7 +317,7 @@ class GuardedMessageQueue {
     }
 
     Message findByDeduplicationId(String dedupId, String messageGroupId) {
-        try (var _ = hold()) {
+        try (Guard _ = hold()) {
             return messages.stream()
                     .filter(msg -> dedupId.equals(msg.getMessageDeduplicationId()))
                     .filter(msg -> messageGroupId == null

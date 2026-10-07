@@ -197,8 +197,8 @@ class SesEventPublishingTest {
         firehoseStreamArn = firehose.createDeliveryStream(CreateDeliveryStreamRequest.builder()
                         .deliveryStreamName(firehoseStreamName)
                         .s3DestinationConfiguration(S3DestinationConfiguration.builder()
-                                .bucketARN("arn:aws:s3:::" + firehoseBucket)
-                                .roleARN("arn:aws:iam::000000000000:role/sdk-evt-fh-role")
+                                .bucketARN(TestFixtures.globalArn("s3", "", firehoseBucket))
+                                .roleARN(TestFixtures.globalArn("iam", "000000000000", "role/sdk-evt-fh-role"))
                                 .prefix(firehoseStreamName + "/")
                                 // Floci does not enforce AWS's 60s minimum interval, which keeps
                                 // the delivery wait short (would need 60+ against real AWS).
@@ -219,7 +219,7 @@ class SesEventPublishingTest {
                         .enabled(true)
                         .matchingEventTypes(EventType.SEND)
                         .kinesisFirehoseDestination(KinesisFirehoseDestination.builder()
-                                .iamRoleArn("arn:aws:iam::000000000000:role/sdk-evt-fh-role")
+                                .iamRoleArn(TestFixtures.globalArn("iam", "000000000000", "role/sdk-evt-fh-role"))
                                 .deliveryStreamArn(firehoseStreamArn)
                                 .build())
                         .build())
@@ -244,7 +244,7 @@ class SesEventPublishingTest {
                 .rule(ebRuleName)
                 .targets(Target.builder().id("1").arn(ebQueueArn).build())
                 .build());
-        ebBusArn = "arn:aws:events:us-east-1:000000000000:event-bus/default";
+        ebBusArn = TestFixtures.arn("events", "000000000000", "event-bus/default");
         ses.createConfigurationSet(CreateConfigurationSetRequest.builder()
                 .configurationSetName(csNameEB)
                 .build());
@@ -673,7 +673,8 @@ class SesEventPublishingTest {
             if (r.messages().isEmpty()) {
                 continue;
             }
-            for (var m : r.messages()) {
+            // Message is imported from sesv2.
+            for (software.amazon.awssdk.services.sqs.model.Message m : r.messages()) {
                 events.add(MAPPER.readTree(m.body()));
             }
             List<DeleteMessageBatchRequestEntry> entries = new ArrayList<>();
@@ -689,6 +690,29 @@ class SesEventPublishingTest {
                     .build());
         }
         return events;
+    }
+
+    @Test
+    @Order(9)
+    @DisplayName("suppressionlist@simulator publishes a General bounce, not a Reject")
+    void sendToSuppressionListSimulator_publishesABounce() throws Exception {
+        drainQueue();
+        sendEmailTo("suppressionlist@simulator.amazonses.com");
+        List<JsonNode> events = receiveEvents(2);
+
+        assertThat(events).hasSize(2);
+        assertThat(events).noneMatch(e -> "Reject".equals(e.path("eventType").asText()));
+        JsonNode bounce = events.stream()
+                .filter(e -> "Bounce".equals(e.path("eventType").asText()))
+                .findFirst().orElseThrow();
+        // Verified against real SES on 2026-09-21: an ordinary hard bounce whose diagnostic names
+        // the suppression.
+        assertThat(bounce.path("bounce").path("bounceType").asText()).isEqualTo("Permanent");
+        assertThat(bounce.path("bounce").path("bounceSubType").asText()).isEqualTo("General");
+        JsonNode recipient = bounce.path("bounce").path("bouncedRecipients").get(0);
+        assertThat(recipient.path("emailAddress").asText()).isEqualTo("suppressionlist@simulator.amazonses.com");
+        assertThat(recipient.path("status").asText()).isEqualTo("5.1.1");
+        assertThat(recipient.path("diagnosticCode").asText()).contains("suppressed address: suppressionlist@");
     }
 
     private void sendEmailTo(String to) {
@@ -742,7 +766,7 @@ class SesEventPublishingTest {
             if (r.messages().isEmpty()) {
                 continue;
             }
-            for (var m : r.messages()) {
+            for (software.amazon.awssdk.services.sqs.model.Message m : r.messages()) {
                 JsonNode wrapper = MAPPER.readTree(m.body());
                 JsonNode event = MAPPER.readTree(wrapper.path("Message").asText());
                 events.add(event);

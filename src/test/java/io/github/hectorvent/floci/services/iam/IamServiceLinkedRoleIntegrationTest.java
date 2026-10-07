@@ -5,6 +5,7 @@ import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.matchesRegex;
 import static org.hamcrest.Matchers.startsWith;
 
+import io.restassured.specification.RequestSpecification;
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
@@ -269,7 +270,7 @@ class IamServiceLinkedRoleIntegrationTest {
         .then()
             .statusCode(200)
             .body("CreateServiceLinkedRoleResponse.CreateServiceLinkedRoleResult.Role.RoleName",
-                    equalTo("AWSServiceRoleForAutoscaling_CustomResource"));
+                    equalTo("AWSServiceRoleForAutoScaling_CustomResource"));
     }
 
     /** AWS constrains AWSServiceName to [\w+=,.@-]{1,128}; anything else must not reach storage. */
@@ -484,7 +485,7 @@ class IamServiceLinkedRoleIntegrationTest {
     }
 
     private static void refusedAsUnmodifiable(String action, String... formParams) {
-        var request = given().header("Authorization", AUTH_HEADER).formParam("Action", action);
+        RequestSpecification request = given().header("Authorization", AUTH_HEADER).formParam("Action", action);
         for (int i = 0; i < formParams.length; i += 2) {
             request = request.formParam(formParams[i], formParams[i + 1]);
         }
@@ -585,5 +586,23 @@ class IamServiceLinkedRoleIntegrationTest {
         .then()
             .statusCode(400)
             .body("ErrorResponse.Error.Code", equalTo("InvalidInput"));
+    }
+
+    @Test
+    @Order(24)
+    void cloud9UsesTheAwsCanonicalRoleName() {
+        given()
+            .formParam("Action", "CreateServiceLinkedRole")
+            .formParam("AWSServiceName", "cloud9.amazonaws.com")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("CreateServiceLinkedRoleResponse.CreateServiceLinkedRoleResult.Role.RoleName",
+                    equalTo("AWSServiceRoleForAWSCloud9"))
+            .body("CreateServiceLinkedRoleResponse.CreateServiceLinkedRoleResult.Role.Arn",
+                    equalTo("arn:aws:iam::000000000000:role/aws-service-role/cloud9.amazonaws.com/"
+                            + "AWSServiceRoleForAWSCloud9"));
     }
 }

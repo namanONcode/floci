@@ -52,7 +52,7 @@ class EcrTest {
 
         Repository repo = resp.repository();
         assertThat(repo.repositoryName()).isEqualTo(REPO_NAME);
-        assertThat(repo.repositoryArn()).startsWith("arn:aws:ecr:");
+        assertThat(repo.repositoryArn()).startsWith("arn:" + TestFixtures.partition() + ":ecr:");
         assertThat(repo.repositoryArn()).contains(":repository/" + REPO_NAME);
         assertThat(repo.repositoryUri()).contains("/" + REPO_NAME);
         // Hostname must resolve to loopback so docker auto-trusts it as insecure.
@@ -115,6 +115,29 @@ class EcrTest {
 
     @Test
     @Order(7)
+    @DisplayName("PutImageScanningConfiguration supports enabling and disabling scan on push")
+    void imageScanningConfigurationCanBeEnabledAndDisabled() {
+        PutImageScanningConfigurationResponse enabled = ecr.putImageScanningConfiguration(builder -> builder
+                .repositoryName(REPO_NAME)
+                .imageScanningConfiguration(ImageScanningConfiguration.builder().scanOnPush(true).build()));
+        assertThat(enabled.imageScanningConfiguration().scanOnPush()).isTrue();
+
+        BatchGetRepositoryScanningConfigurationResponse enabledReadback =
+                ecr.batchGetRepositoryScanningConfiguration(builder -> builder.repositoryNames(REPO_NAME));
+        assertThat(enabledReadback.scanningConfigurations().get(0).scanOnPush()).isTrue();
+
+        PutImageScanningConfigurationResponse disabled = ecr.putImageScanningConfiguration(builder -> builder
+                .repositoryName(REPO_NAME)
+                .imageScanningConfiguration(ImageScanningConfiguration.builder().scanOnPush(false).build()));
+        assertThat(disabled.imageScanningConfiguration().scanOnPush()).isFalse();
+
+        BatchGetRepositoryScanningConfigurationResponse disabledReadback =
+                ecr.batchGetRepositoryScanningConfiguration(builder -> builder.repositoryNames(REPO_NAME));
+        assertThat(disabledReadback.scanningConfigurations().get(0).scanOnPush()).isFalse();
+    }
+
+    @Test
+    @Order(8)
     @DisplayName("PutLifecyclePolicy round-trips the policy text")
     void lifecyclePolicyRoundTrip() {
         String policy = "{\"rules\":[{\"rulePriority\":1,\"selection\":{\"tagStatus\":\"untagged\",\"countType\":\"imageCountMoreThan\",\"countNumber\":5},\"action\":{\"type\":\"expire\"}}]}";
@@ -124,7 +147,7 @@ class EcrTest {
     }
 
     @Test
-    @Order(8)
+    @Order(9)
     @DisplayName("SetRepositoryPolicy round-trips the policy text")
     void repositoryPolicyRoundTrip() {
         String policy = "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Sid\":\"AllowAll\",\"Effect\":\"Allow\",\"Principal\":\"*\",\"Action\":\"ecr:*\"}]}";
@@ -134,7 +157,7 @@ class EcrTest {
     }
 
     @Test
-    @Order(9)
+    @Order(10)
     @DisplayName("DeleteRepository force=true removes the repository")
     void deleteRepositoryForce() {
         ecr.deleteRepository(b -> b.repositoryName(REPO_NAME).force(true));
@@ -144,11 +167,75 @@ class EcrTest {
     }
 
     @Test
-    @Order(10)
+    @Order(11)
     @DisplayName("DescribeRepositories on a missing name returns RepositoryNotFoundException")
     void describeMissing() {
         assertThatThrownBy(() -> ecr.describeRepositories(
                 b -> b.repositoryNames("does-not-exist-" + System.nanoTime())))
                 .isInstanceOf(RepositoryNotFoundException.class);
+    }
+
+    @Test
+    @Order(12)
+    @DisplayName("Pull through cache rules round-trip through the AWS SDK")
+    void pullThroughCacheRuleLifecycle() {
+        String firstPrefix = "sdk-docker-hub";
+        String secondPrefix = "sdk-kubernetes";
+        try {
+            CreatePullThroughCacheRuleResponse created = ecr.createPullThroughCacheRule(builder -> builder
+                    .ecrRepositoryPrefix(firstPrefix)
+                    .upstreamRegistryUrl("registry-1.docker.io"));
+            ecr.createPullThroughCacheRule(builder -> builder
+                    .ecrRepositoryPrefix(secondPrefix)
+                    .upstreamRegistryUrl("registry.k8s.io"));
+
+            assertThat(created.ecrRepositoryPrefix()).isEqualTo(firstPrefix);
+            assertThat(created.upstreamRegistry()).isEqualTo(UpstreamRegistry.DOCKER_HUB);
+            assertThat(created.upstreamRepositoryPrefix()).isEqualTo("ROOT");
+            assertThat(created.createdAt()).isNotNull();
+
+            DescribePullThroughCacheRulesResponse firstPage = ecr.describePullThroughCacheRules(
+                    builder -> builder.maxResults(1));
+            DescribePullThroughCacheRulesResponse secondPage = ecr.describePullThroughCacheRules(
+                    builder -> builder.maxResults(1).nextToken(firstPage.nextToken()));
+            DescribePullThroughCacheRulesResponse filtered = ecr.describePullThroughCacheRules(
+                    builder -> builder.ecrRepositoryPrefixes(firstPrefix));
+
+            assertThat(firstPage.pullThroughCacheRules()).hasSize(1);
+            assertThat(firstPage.nextToken()).isNotBlank();
+            assertThat(secondPage.pullThroughCacheRules()).hasSize(1);
+            assertThat(filtered.pullThroughCacheRules())
+                    .extracting(PullThroughCacheRule::ecrRepositoryPrefix)
+                    .containsExactly(firstPrefix);
+
+            String credentialArn =
+                    TestFixtures.arn("secretsmanager", "000000000000", "secret:ecr-pullthroughcache/sdk");
+            UpdatePullThroughCacheRuleResponse updated = ecr.updatePullThroughCacheRule(builder -> builder
+                    .ecrRepositoryPrefix(firstPrefix)
+                    .credentialArn(credentialArn));
+            ValidatePullThroughCacheRuleResponse validated = ecr.validatePullThroughCacheRule(
+                    builder -> builder.ecrRepositoryPrefix(firstPrefix));
+
+            assertThat(updated.credentialArn()).isEqualTo(credentialArn);
+            assertThat(updated.updatedAt()).isNotNull();
+            assertThat(validated.isValid()).isTrue();
+            assertThat(validated.credentialArn()).isEqualTo(credentialArn);
+            assertThat(validated.upstreamRegistryUrl()).isEqualTo("registry-1.docker.io");
+
+            DeletePullThroughCacheRuleResponse deleted = ecr.deletePullThroughCacheRule(
+                    builder -> builder.ecrRepositoryPrefix(firstPrefix));
+            assertThat(deleted.ecrRepositoryPrefix()).isEqualTo(firstPrefix);
+            assertThatThrownBy(() -> ecr.deletePullThroughCacheRule(
+                    builder -> builder.ecrRepositoryPrefix(firstPrefix)))
+                    .isInstanceOf(PullThroughCacheRuleNotFoundException.class);
+        } finally {
+            for (String prefix : List.of(firstPrefix, secondPrefix)) {
+                try {
+                    ecr.deletePullThroughCacheRule(builder -> builder.ecrRepositoryPrefix(prefix));
+                } catch (PullThroughCacheRuleNotFoundException expected) {
+                    // The rule was already deleted by the lifecycle assertion.
+                }
+            }
+        }
     }
 }

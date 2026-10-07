@@ -8,6 +8,7 @@ import org.junit.jupiter.api.TestMethodOrder;
 
 import java.io.ByteArrayOutputStream;
 import java.util.Base64;
+import java.util.List;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 
@@ -135,6 +136,20 @@ class LambdaIntegrationTest {
     }
 
     @Test
+    @Order(7)
+    void syncInvoke_malformedClientContext_returns400() {
+        given()
+            .header("X-Amz-Client-Context", "not-base64-json!")
+            .contentType("application/json")
+            .body("{}")
+        .when()
+            .post(BASE_PATH + "/functions/hello-world/invocations")
+        .then()
+            .statusCode(400)
+            .body("__type", equalTo("InvalidRequestContentException"));
+    }
+
+    @Test
     @Order(8)
     void createFunctionMissingRole_returns400() {
         given()
@@ -210,6 +225,77 @@ class LambdaIntegrationTest {
             .put(BASE_PATH + "/functions/nonexistent-function/configuration")
         .then()
             .statusCode(404);
+    }
+
+    @Test
+    @Order(12)
+    void invalidMemoryUpdateDoesNotChangeConfiguration() {
+        given()
+            .contentType("application/json")
+            .body("""
+                {"FunctionName":"invalid-memory-update","Runtime":"nodejs20.x",
+                 "Role":"arn:aws:iam::000000000000:role/lambda-role","Handler":"index.handler"}
+                """)
+        .when()
+            .post(BASE_PATH + "/functions")
+        .then()
+            .statusCode(201);
+
+        given()
+            .contentType("application/json")
+            .body("""
+                {"Description":"half-applied","MemorySize":"abc"}
+                """)
+        .when()
+            .put(BASE_PATH + "/functions/invalid-memory-update/configuration")
+        .then()
+            .statusCode(400)
+            .body("__type", containsString("InvalidParameterValueException"));
+
+        given()
+        .when()
+            .get(BASE_PATH + "/functions/invalid-memory-update/configuration")
+        .then()
+            .statusCode(200)
+            .body("Description", anyOf(nullValue(), equalTo("")))
+            .body("MemorySize", equalTo(128));
+    }
+
+    @Test
+    @Order(12)
+    void invalidArnTypesDoNotChangeConfiguration() {
+        given()
+            .contentType("application/json")
+            .body("""
+                {"FunctionName":"invalid-arn-update","Runtime":"nodejs20.x",
+                 "Role":"arn:aws:iam::000000000000:role/lambda-role","Handler":"index.handler"}
+                """)
+        .when()
+            .post(BASE_PATH + "/functions")
+        .then()
+            .statusCode(201);
+
+        for (String request : List.of(
+                "{\"Description\":\"half-applied\",\"KMSKeyArn\":123}",
+                "{\"Description\":\"half-applied\",\"DeadLetterConfig\":{\"TargetArn\":123}}")) {
+            given()
+                .contentType("application/json")
+                .body(request)
+            .when()
+                .put(BASE_PATH + "/functions/invalid-arn-update/configuration")
+            .then()
+                .statusCode(400)
+                .body("__type", containsString("InvalidParameterValueException"));
+
+            given()
+            .when()
+                .get(BASE_PATH + "/functions/invalid-arn-update/configuration")
+            .then()
+                .statusCode(200)
+                .body("Description", anyOf(nullValue(), equalTo("")))
+                .body("KMSKeyArn", anyOf(nullValue(), equalTo("")))
+                .body("DeadLetterConfig.TargetArn", anyOf(nullValue(), equalTo("")));
+        }
     }
 
     @Test
@@ -550,5 +636,73 @@ class LambdaIntegrationTest {
             .get(path)
         .then()
             .statusCode(404);
+    }
+
+    // ── Environment is omitted, not empty, when no variables are set ──
+
+    @Test
+    @Order(41)
+    void environmentMemberIsAbsentUntilVariablesAreSet() {
+        String fn = "env-absent-fn";
+        given()
+            .contentType("application/json")
+            .body("""
+                {
+                    "FunctionName": "env-absent-fn",
+                    "Runtime": "nodejs20.x",
+                    "Role": "arn:aws:iam::000000000000:role/lambda-role",
+                    "Handler": "index.handler"
+                }
+                """)
+        .when()
+            .post(BASE_PATH + "/functions")
+        .then()
+            .statusCode(201)
+            .body("$", not(hasKey("Environment")));
+
+        given()
+            .when()
+            .get(BASE_PATH + "/functions/" + fn + "/configuration")
+        .then()
+            .statusCode(200)
+            .body("$", not(hasKey("Environment")));
+
+        given()
+            .when()
+            .get(BASE_PATH + "/functions/" + fn)
+        .then()
+            .statusCode(200)
+            .body("Configuration", not(hasKey("Environment")));
+
+        // Setting a variable brings the member back...
+        given()
+            .contentType("application/json")
+            .body("""
+                { "Environment": { "Variables": { "FOO": "bar" } } }
+                """)
+        .when()
+            .put(BASE_PATH + "/functions/" + fn + "/configuration")
+        .then()
+            .statusCode(200)
+            .body("Environment.Variables.FOO", equalTo("bar"));
+
+        // ...and clearing it to an empty map removes it again, which is what AWS
+        // answers for a cleared function, not "Environment": {} or an empty Variables map.
+        given()
+            .contentType("application/json")
+            .body("""
+                { "Environment": { "Variables": {} } }
+                """)
+        .when()
+            .put(BASE_PATH + "/functions/" + fn + "/configuration")
+        .then()
+            .statusCode(200)
+            .body("$", not(hasKey("Environment")));
+
+        given()
+            .when()
+            .delete(BASE_PATH + "/functions/" + fn)
+        .then()
+            .statusCode(anyOf(is(200), is(204)));
     }
 }

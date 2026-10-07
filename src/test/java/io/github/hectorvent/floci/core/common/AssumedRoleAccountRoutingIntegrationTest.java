@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.core.common;
 
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
+import io.restassured.response.ValidatableResponse;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
@@ -37,6 +38,17 @@ class AssumedRoleAccountRoutingIntegrationTest {
     @Test
     void assumedRoleCredentialsRouteResourcesToTargetAccount() {
         String tableName = "routing-" + UUID.randomUUID().toString().substring(0, 8);
+
+        given()
+                .formParam("Action", "CreateRole")
+                .formParam("RoleName", "CrossAccountAccess")
+                .formParam("AssumeRolePolicyDocument", "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\","
+                        + "\"Principal\":{\"AWS\":\"arn:aws:iam::" + ACCOUNT_A + ":root\"},\"Action\":\"sts:AssumeRole\"}]}")
+                .header("Authorization", auth(ACCOUNT_B, "iam"))
+            .when()
+                .post("/")
+            .then()
+                .statusCode(200);
 
         // 1. Account A assumes a role in account B and receives temporary credentials.
         String tempAccessKeyId = given()
@@ -89,7 +101,7 @@ class AssumedRoleAccountRoutingIntegrationTest {
         listTables(ACCOUNT_A).body("TableNames", not(hasItem(tableName)));
     }
 
-    private static io.restassured.response.ValidatableResponse listTables(String account) {
+    private static ValidatableResponse listTables(String account) {
         return given()
                 .header("X-Amz-Target", "DynamoDB_20120810.ListTables")
                 .header("Authorization", auth(account, "dynamodb"))

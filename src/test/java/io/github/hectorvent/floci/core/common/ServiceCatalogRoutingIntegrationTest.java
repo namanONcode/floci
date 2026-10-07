@@ -1,5 +1,8 @@
 package io.github.hectorvent.floci.core.common;
 
+import io.github.hectorvent.floci.services.apigateway.ApiGatewayController;
+import io.github.hectorvent.floci.services.s3.S3Controller;
+import io.github.hectorvent.floci.services.securityadmin.SecurityAdminController;
 import io.quarkus.test.junit.QuarkusTest;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.Test;
@@ -51,7 +54,7 @@ class ServiceCatalogRoutingIntegrationTest {
 
     @Test
     void queryProtocolAliasesAreDeclaredOnDescriptors() {
-        assertTrue(catalog.byCredentialScope("sesv2").orElseThrow().supportsProtocol(ServiceProtocol.QUERY));
+        assertTrue(catalog.byCredentialScope("ses").orElseThrow().supportsProtocol(ServiceProtocol.QUERY));
         assertTrue(catalog.byCredentialScope("cognito-idp").orElseThrow().supportsProtocol(ServiceProtocol.QUERY));
     }
 
@@ -72,6 +75,20 @@ class ServiceCatalogRoutingIntegrationTest {
         assertEquals("fis", descriptor.storageKey());
         assertEquals(ServiceProtocol.REST_JSON, descriptor.defaultProtocol());
         assertTrue(descriptor.supportsProtocol(ServiceProtocol.REST_JSON));
+    }
+
+    @Test
+    void sharedSecurityAdminRouteResolvesOnlyBySigningScope() {
+        assertTrue(catalog.byResourceClass(SecurityAdminController.class).isEmpty());
+        assertEquals("macie2", catalog.byCredentialScope("macie2").orElseThrow().externalKey());
+        assertEquals("guardduty", catalog.byCredentialScope("guardduty").orElseThrow().externalKey());
+    }
+
+    @Test
+    void iamEnforcementCanResolveRestServicesFromMatchedRoutes() {
+        assertEquals("s3", catalog.byResourceClass(S3Controller.class).orElseThrow().externalKey());
+        assertEquals("apigateway",
+                catalog.byResourceClass(ApiGatewayController.class).orElseThrow().externalKey());
     }
 
     @Test

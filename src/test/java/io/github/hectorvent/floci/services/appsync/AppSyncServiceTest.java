@@ -10,8 +10,11 @@ import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.appsync.graphql.SchemaCreationWorker;
 import io.github.hectorvent.floci.services.appsync.graphql.SchemaRegistry;
+import io.github.hectorvent.floci.services.appsync.graphql.auth.LambdaAuthorizerCache;
+import io.github.hectorvent.floci.services.appsync.graphql.auth.LambdaAuthorizerResult;
 import io.github.hectorvent.floci.services.appsync.model.ApiKey;
 import io.github.hectorvent.floci.services.appsync.model.AuthenticationType;
+import io.github.hectorvent.floci.services.appsync.model.FunctionConfiguration;
 import io.github.hectorvent.floci.services.appsync.model.GraphqlApi;
 import io.github.hectorvent.floci.services.appsync.model.SchemaCreationStatus;
 import jakarta.enterprise.inject.Instance;
@@ -43,6 +46,7 @@ class AppSyncServiceTest {
 
     private static final Instant NOW = Instant.parse("2026-01-01T00:00:00Z");
     private AppSyncService service;
+    private AccountAwareStorageBackend<ApiKey> apiKeyStoreOverride;
 
     @BeforeEach
     void setUp() {
@@ -50,10 +54,56 @@ class AppSyncServiceTest {
     }
 
     @Test
+    void updateFunctionAppliesANewName() {
+        GraphqlApi api = service.createGraphqlApi(
+                Map.of("name", "rename", "authenticationType", "API_KEY"), "us-east-1");
+        service.createDataSource(api.getApiId(), Map.of("name", "ds", "type", "NONE"), "us-east-1");
+        FunctionConfiguration created = service.createFunction(api.getApiId(),
+                Map.of("name", "Query_getMessages_0", "dataSourceName", "ds"), "us-east-1");
+
+        service.updateFunction(api.getApiId(), created.getFunctionId(),
+                Map.of("name", "Query_getMessages_1"));
+
+        // UpdateFunction takes a new name on AWS, and a CloudFormation rename goes through it:
+        // ignoring the member let a stack complete while GetFunction still reported the old name.
+        assertEquals("Query_getMessages_1",
+                service.getFunction(api.getApiId(), created.getFunctionId()).getName());
+    }
+
+    @Test
     void validateApiKeyLooksUpByValue() {
         GraphqlApi api = service.createGraphqlApi(Map.of("name", "a", "authenticationType", "API_KEY"), "us-east-1");
         ApiKey created = service.createApiKey(api.getApiId(), Map.of());
-        assertTrue(service.validateApiKey(api.getApiId(), created.getApiKey()).isPresent());
+        assertTrue(service.validateApiKey(api.getApiId(), created.getId()).isPresent());
+    }
+
+    @Test
+    void createApiKeyIdIsTheUsableKeyValue() {
+        GraphqlApi api = service.createGraphqlApi(Map.of("name", "fmt", "authenticationType", "API_KEY"), "us-east-1");
+        ApiKey created = service.createApiKey(api.getApiId(), Map.of());
+        assertTrue(created.getId().matches("da2-[a-z0-9]{26}"), created.getId());
+        assertTrue(service.validateApiKey(api.getApiId(), created.getId()).isPresent());
+        assertTrue(service.validateApiKey(api.getApiId(), "da2-" + "x".repeat(26)).isEmpty());
+        assertEquals(created.getId(), service.getApiKey(api.getApiId(), created.getId()).getId());
+    }
+
+    @Test
+    void legacyShortApiKeyIdIsListedButNeverAuthenticates() {
+        // Keys persisted by builds before ApiKey.id became the key value have a 7-character id.
+        AccountAwareStorageBackend<ApiKey> keyStore = AccountAwareStorageBackend.inMemory("000000000000");
+        apiKeyStoreOverride = keyStore;
+        AppSyncService svc = newService(Clock.fixed(NOW, ZoneOffset.UTC));
+        GraphqlApi api = svc.createGraphqlApi(Map.of("name", "legacy", "authenticationType", "API_KEY"), "us-east-1");
+        ApiKey legacy = new ApiKey();
+        legacy.setId("ad6c9b6");
+        legacy.setApiId(api.getApiId());
+        legacy.setExpires(NOW.getEpochSecond() + Duration.ofDays(7).getSeconds());
+        keyStore.put(api.getApiId() + "::ad6c9b6", legacy);
+
+        assertEquals(1, svc.listApiKeys(api.getApiId(), null, null).items().size());
+        assertTrue(svc.validateApiKey(api.getApiId(), "ad6c9b6").isEmpty());
+        svc.deleteApiKey(api.getApiId(), "ad6c9b6");
+        assertEquals(0, svc.listApiKeys(api.getApiId(), null, null).items().size());
     }
 
     @Test
@@ -63,9 +113,9 @@ class AppSyncServiceTest {
         GraphqlApi api = svc.createGraphqlApi(Map.of("name", "b", "authenticationType", "API_KEY"), "us-east-1");
         long expires = NOW.getEpochSecond() + Duration.ofDays(1).getSeconds();
         ApiKey created = svc.createApiKey(api.getApiId(), Map.of("expires", expires));
-        assertTrue(svc.validateApiKey(api.getApiId(), created.getApiKey()).isPresent());
+        assertTrue(svc.validateApiKey(api.getApiId(), created.getId()).isPresent());
         clock.set(NOW.plus(Duration.ofDays(1)));
-        assertTrue(svc.validateApiKey(api.getApiId(), created.getApiKey()).isEmpty());
+        assertTrue(svc.validateApiKey(api.getApiId(), created.getId()).isEmpty());
     }
 
     @Test
@@ -104,7 +154,7 @@ class AppSyncServiceTest {
         GraphqlApi a = service.createGraphqlApi(Map.of("name", "c", "authenticationType", "API_KEY"), "us-east-1");
         GraphqlApi b = service.createGraphqlApi(Map.of("name", "d", "authenticationType", "API_KEY"), "us-east-1");
         ApiKey created = service.createApiKey(a.getApiId(), Map.of());
-        assertTrue(service.validateApiKey(b.getApiId(), created.getApiKey()).isEmpty());
+        assertTrue(service.validateApiKey(b.getApiId(), created.getId()).isEmpty());
     }
 
     @Test
@@ -285,7 +335,24 @@ class AppSyncServiceTest {
         verify(schemaRegistry, never()).register(any(), any());
     }
 
+    @Test
+    void deleteGraphqlApiEvictsItsLambdaAuthorizerCacheEntries() {
+        GraphqlApi api = service.createGraphqlApi(
+                Map.of("name", "authz", "authenticationType", "AWS_LAMBDA"), "us-east-1");
+        GraphqlApi otherApi = service.createGraphqlApi(
+                Map.of("name", "authz-other", "authenticationType", "AWS_LAMBDA"), "us-east-1");
+        LambdaAuthorizerResult result = new LambdaAuthorizerResult(true, List.of(), Map.of(), 300, 10);
+        lambdaAuthorizerCache.put(api.getApiId(), "tok", result, 300);
+        lambdaAuthorizerCache.put(otherApi.getApiId(), "tok", result, 300);
+
+        service.deleteGraphqlApi(api.getApiId());
+
+        assertTrue(lambdaAuthorizerCache.get(api.getApiId(), "tok").isEmpty());
+        assertTrue(lambdaAuthorizerCache.get(otherApi.getApiId(), "tok").isPresent());
+    }
+
     private SchemaRegistry schemaRegistry;
+    private LambdaAuthorizerCache lambdaAuthorizerCache;
 
     @SuppressWarnings("unchecked")
     private AppSyncService newService(Clock clock) {
@@ -307,11 +374,15 @@ class AppSyncServiceTest {
                 if ("appsync-apis.json".equals(fileName)) {
                     return (AccountAwareStorageBackend<V>) apiStore;
                 }
+                if ("appsync-apikeys.json".equals(fileName) && apiKeyStoreOverride != null) {
+                    return (AccountAwareStorageBackend<V>) apiKeyStoreOverride;
+                }
                 return AccountAwareStorageBackend.inMemory("000000000000");
             }
         };
         Instance<RequestContext> requestContext = mock(Instance.class);
         schemaRegistry = mock(SchemaRegistry.class);
+        lambdaAuthorizerCache = new LambdaAuthorizerCache();
         EmulatorConfig config = mock(EmulatorConfig.class);
         when(config.effectiveBaseUrl()).thenReturn(baseUrl);
         return new AppSyncService(
@@ -324,7 +395,8 @@ class AppSyncServiceTest {
                 new ObjectMapper(),
                 AccountAwareStorageBackend.inMemory("000000000000"),
                 AccountAwareStorageBackend.inMemory("000000000000"),
-                clock);
+                clock,
+                lambdaAuthorizerCache);
     }
 
     private static final class MutableClock extends Clock {
@@ -352,5 +424,66 @@ class AppSyncServiceTest {
         public Instant instant() {
             return instant;
         }
+    }
+
+    /**
+     * Tagging takes an API-level ARN. Reading the API id as "the segment after the last slash"
+     * took the sub-resource id instead, so tagging a data source looked up an API by the data
+     * source's id and answered NotFound. Botocore anchors AppSync's ResourceArn to
+     * {@code apis/<26 chars>} with nothing after it, so a sub-resource ARN is not taggable at all
+     * and the answer is a 400, not a 404.
+     */
+    @Test
+    void tagResourceAcceptsAnApiArnAndTagsThatApi() {
+        GraphqlApi api = service.createGraphqlApi(
+                Map.of("name", "taggable", "authenticationType", "API_KEY"), "us-east-1");
+        String apiArn = "arn:aws:appsync:us-east-1:000000000000:apis/" + api.getApiId();
+
+        service.tagResource(apiArn, Map.of("env", "test"));
+
+        assertEquals("test", service.getTags(apiArn).get("env"));
+    }
+
+    /**
+     * The ARN AppSync hands back carries the region's partition, so pinning the tagging pattern to
+     * {@code arn:aws:appsync:} meant refusing to tag an API using the exact ARN just returned.
+     * Botocore spells the literal, but this emulator has to accept its own output.
+     */
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.CsvSource({
+            "us-east-1,      aws",
+            "us-gov-west-1,  aws-us-gov",
+            "cn-north-1,     aws-cn",
+            "us-isob-east-1, aws-iso-b"})
+    void tagResourceAcceptsAnApiArnFromAnyPartition(String region, String partition) {
+        GraphqlApi api = service.createGraphqlApi(
+                Map.of("name", "p-" + region, "authenticationType", "API_KEY"), region);
+        String apiArn = "arn:" + partition + ":appsync:" + region + ":000000000000:apis/" + api.getApiId();
+
+        service.tagResource(apiArn, Map.of("env", "test"));
+
+        assertEquals("test", service.getTags(apiArn).get("env"));
+    }
+
+    @Test
+    void tagResourceRejectsASubResourceArn() {
+        GraphqlApi api = service.createGraphqlApi(
+                Map.of("name", "subresource", "authenticationType", "API_KEY"), "us-east-1");
+        String dataSourceArn = "arn:aws:appsync:us-east-1:000000000000:apis/"
+                + api.getApiId() + "/datasources/myDS";
+
+        AwsException thrown = assertThrows(AwsException.class,
+                () -> service.tagResource(dataSourceArn, Map.of("env", "test")));
+
+        assertEquals(400, thrown.getHttpStatus());
+        assertEquals("BadRequestException", thrown.getErrorCode());
+    }
+
+    @Test
+    void tagResourceRejectsAnArnThatIsNotAppSync() {
+        assertThrows(AwsException.class, () -> service.tagResource(
+                "arn:aws:sqs:us-east-1:000000000000:apis/abcdefghijklmnopqrstuvwxyz", Map.of()));
+        assertThrows(AwsException.class, () -> service.tagResource("apis/abc", Map.of()));
+        assertThrows(AwsException.class, () -> service.tagResource(null, Map.of()));
     }
 }

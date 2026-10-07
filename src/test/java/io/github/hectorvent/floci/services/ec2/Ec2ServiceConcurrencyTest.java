@@ -22,6 +22,7 @@ import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
@@ -200,6 +201,34 @@ class Ec2ServiceConcurrencyTest {
         }
     }
 
+    @Test
+    void concurrentOverlappingCreateSubnetsRecordExactlyOne() throws Exception {
+        for (int trial = 0; trial < TRIALS; trial++) {
+            String region = "race-subnet-" + trial;
+            Ec2Service service = newService();
+            String vpcId = service.createVpc(region, "10.0.0.0/16", false).getVpcId();
+
+            AtomicInteger created = new AtomicInteger();
+            AtomicInteger conflicts = new AtomicInteger();
+            runRaceAllowing(i -> {
+                try {
+                    service.createSubnet(region, vpcId, "10.0.1.0/24", null);
+                    created.incrementAndGet();
+                } catch (AwsException e) {
+                    assertEquals("InvalidSubnet.Conflict", e.getErrorCode());
+                    conflicts.incrementAndGet();
+                }
+            });
+
+            assertEquals(1, created.get(), "trial " + trial + ": exactly one create may win the CIDR");
+            assertEquals(N - 1, conflicts.get(), "trial " + trial + ": losers must see InvalidSubnet.Conflict");
+            long stored = service.describeSubnets(region, List.of(), Map.of()).stream()
+                    .filter(s -> vpcId.equals(s.getVpcId()))
+                    .count();
+            assertEquals(1, stored, "trial " + trial + ": one subnet stored at the CIDR");
+        }
+    }
+
     /** Runs N concurrent invocations of the same op; the op absorbs its own expected failures. */
     private static void runRaceAllowing(java.util.function.IntConsumer op) throws Exception {
         ExecutorService pool = Executors.newFixedThreadPool(THREADS);
@@ -214,7 +243,7 @@ class Ec2ServiceConcurrencyTest {
             }));
         }
         start.countDown();
-        for (var f : futures) {
+        for (Future<?> f : futures) {
             f.get(30, TimeUnit.SECONDS);
         }
         pool.shutdownNow();
@@ -235,7 +264,7 @@ class Ec2ServiceConcurrencyTest {
         }
         start.countDown();
         Set<String> results = new java.util.HashSet<>();
-        for (var f : futures) {
+        for (Future<String> f : futures) {
             results.add(f.get(30, TimeUnit.SECONDS));
         }
         pool.shutdownNow();

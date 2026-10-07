@@ -6,16 +6,18 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 
+import java.util.Map;
+
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
 
 class ImageResolverTest {
 
-    private final EmulatorConfig config = mock(EmulatorConfig.class);
+    private final EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
     private final ImageResolver resolver;
 
     ImageResolverTest() {
-        when(config.ecrBaseUri()).thenReturn("public.ecr.aws");
+        when(config.services().lambda().ecrBaseUri()).thenReturn("public.ecr.aws");
         this.resolver = new ImageResolver(config);
     }
 
@@ -86,8 +88,8 @@ class ImageResolverTest {
             "provided, my.custom.host/lambda/provided:latest"
     })
     void resolvesKnownRuntimesWithHostOverride(String runtime, String expectedImage) {
-        EmulatorConfig customConfig = mock(EmulatorConfig.class);
-        when(customConfig.ecrBaseUri()).thenReturn("my.custom.host");
+        EmulatorConfig customConfig = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(customConfig.services().lambda().ecrBaseUri()).thenReturn("my.custom.host");
         ImageResolver customResolver = new ImageResolver(customConfig);
         assertEquals(expectedImage, customResolver.resolve(runtime));
     }
@@ -124,8 +126,8 @@ class ImageResolverTest {
             "provided, my.custom.host/path/lambda/provided:latest"
     })
     void resolvesKnownRuntimesWithHostAndPathOverride(String runtime, String expectedImage) {
-        EmulatorConfig customConfig = mock(EmulatorConfig.class);
-        when(customConfig.ecrBaseUri()).thenReturn("my.custom.host/path");
+        EmulatorConfig customConfig = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(customConfig.services().lambda().ecrBaseUri()).thenReturn("my.custom.host/path");
         ImageResolver customResolver = new ImageResolver(customConfig);
         assertEquals(expectedImage, customResolver.resolve(runtime));
     }
@@ -140,6 +142,24 @@ class ImageResolverTest {
     void passesThroughCustomImageWithColon() {
         String customImage = "myrepo:latest";
         assertEquals(customImage, resolver.resolve(customImage));
+    }
+
+    @Test
+    void resolvesConfiguredRuntimeImageByDigest() {
+        String digestImage = "public.ecr.aws/lambda/python:3.12@sha256:" + "a".repeat(64);
+        when(config.services().lambda().runtimeImages()).thenReturn(Map.of("python3.12", digestImage));
+        ImageResolver configuredResolver = new ImageResolver(config);
+
+        assertEquals(digestImage, configuredResolver.resolve("python3.12"));
+        assertEquals("public.ecr.aws/lambda/python:3.11", configuredResolver.resolve("python3.11"));
+    }
+
+    @Test
+    void unknownRuntimeCannotBeOverridden() {
+        when(config.services().lambda().runtimeImages()).thenReturn(Map.of("unknown", "example.com/unknown:1"));
+        ImageResolver configuredResolver = new ImageResolver(config);
+
+        assertThrows(AwsException.class, () -> configuredResolver.resolve("unknown"));
     }
 
     @Test

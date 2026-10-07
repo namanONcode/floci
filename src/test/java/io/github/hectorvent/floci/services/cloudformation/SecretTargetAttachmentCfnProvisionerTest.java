@@ -5,7 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
-import io.github.hectorvent.floci.services.cloudformation.provisioners.CloudFormationResourceRegistry;
+import io.github.hectorvent.floci.services.cloudformation.provisioners.CfnResourceDispatcher;
 import io.github.hectorvent.floci.services.docdb.DocDbService;
 import io.github.hectorvent.floci.services.docdb.model.DocDbCluster;
 import io.github.hectorvent.floci.services.docdb.model.DocDbInstance;
@@ -46,16 +46,16 @@ import static org.mockito.Mockito.when;
 
 class SecretTargetAttachmentCfnProvisionerTest {
 
-    private static final String REGION = "us-east-1";
+    private static final String REGION = "eu-west-1";
     private static final String SECRET_ID = "database-secret";
     private static final String SECRET_ARN =
-            "arn:aws:secretsmanager:us-east-1:000000000000:secret:database-secret-a1b2c3";
+            "arn:aws:secretsmanager:eu-west-1:000000000000:secret:database-secret-a1b2c3";
 
     private final ObjectMapper mapper = new ObjectMapper();
     private SecretsManagerService secretsManagerService;
     private RdsService rdsService;
     private DocDbService docDbService;
-    private CloudFormationResourceProvisioner provisioner;
+    private CfnResourceDispatcher provisioner;
 
     @BeforeEach
     void setUp() {
@@ -64,14 +64,12 @@ class SecretTargetAttachmentCfnProvisionerTest {
         docDbService = mock(DocDbService.class);
         when(secretsManagerService.claimTargetAttachment(any(), any(), any())).thenReturn(true);
         when(secretsManagerService.canManageTargetAttachment(any(), any(), any())).thenReturn(true);
-        provisioner = new CloudFormationResourceProvisioner(
-                null, null, null, null, null, null, null, null, secretsManagerService, null,
-                null, null, null, null, null, null,
-                mapper,
-                null, null, null, null, null, null, null,
-                rdsService, null, null, null, null, null, null,
-                docDbService, null,
-                new CloudFormationResourceRegistry(List.of()));
+        provisioner = CfnProvisionerFixture.builder()
+                .secretsManager(secretsManagerService)
+                .objectMapper(mapper)
+                .rds(rdsService)
+                .docDb(docDbService)
+                .build();
     }
 
     @Test
@@ -82,7 +80,7 @@ class SecretTargetAttachmentCfnProvisionerTest {
                 "{\"username\":\"admin\",\"password\":\"secret\",\"custom\":\"keep\","
                         + "\"engine\":\"postgres\",\"host\":\"db.local\",\"port\":5432,"
                         + "\"dbname\":\"app\",\"dbInstanceIdentifier\":\"database\"}");
-        when(rdsService.getDbInstance("database")).thenReturn(dbInstance());
+        when(rdsService.getDbInstance("database", REGION)).thenReturn(dbInstance());
 
         StackResource resource = provision(instanceProperties());
         assertEquals("CREATE_COMPLETE", resource.getStatus());
@@ -130,7 +128,7 @@ class SecretTargetAttachmentCfnProvisionerTest {
         cluster.setEngine(DatabaseEngine.MYSQL);
         cluster.setEndpoint(new DbEndpoint("cluster.local", 3306));
         cluster.setDatabaseName("orders");
-        when(rdsService.getDbCluster("cluster")).thenReturn(cluster);
+        when(rdsService.getDbCluster("cluster", REGION)).thenReturn(cluster);
 
         StackResource resource = provision(properties("AWS::RDS::DBCluster", "cluster"));
 
@@ -154,7 +152,7 @@ class SecretTargetAttachmentCfnProvisionerTest {
         instance.setDbInstanceIdentifier("document-instance");
         instance.setEndpoint("document.local");
         instance.setPort(27017);
-        when(docDbService.getDbInstance("document-instance")).thenReturn(instance);
+        when(docDbService.getDbInstance("document-instance", REGION)).thenReturn(instance);
 
         StackResource resource = provision(
                 properties("AWS::DocDB::DBInstance", "document-instance"));
@@ -179,7 +177,7 @@ class SecretTargetAttachmentCfnProvisionerTest {
         cluster.setDbClusterIdentifier("document-cluster");
         cluster.setEndpoint("document-cluster.local");
         cluster.setPort(27017);
-        when(docDbService.getDbCluster("document-cluster")).thenReturn(cluster);
+        when(docDbService.getDbCluster("document-cluster", REGION)).thenReturn(cluster);
 
         StackResource resource = provision(
                 properties("AWS::DocDB::DBCluster", "document-cluster"));
@@ -214,7 +212,7 @@ class SecretTargetAttachmentCfnProvisionerTest {
 
     @Test
     void missingSecretFailsInsteadOfUsingTheUnresolvedId() {
-        when(rdsService.getDbInstance("database")).thenReturn(dbInstance());
+        when(rdsService.getDbInstance("database", REGION)).thenReturn(dbInstance());
         when(secretsManagerService.describeSecret(SECRET_ID, REGION))
                 .thenThrow(new AwsException("ResourceNotFoundException", "missing", 400));
 
@@ -233,7 +231,7 @@ class SecretTargetAttachmentCfnProvisionerTest {
         stubSecretValues("{\"username\":\"admin\",\"password\":\"secret\","
                 + "\"engine\":\"postgres\",\"host\":\"db.local\",\"port\":5432,"
                 + "\"dbname\":\"app\",\"dbInstanceIdentifier\":\"database\"}");
-        when(rdsService.getDbInstance("database")).thenReturn(dbInstance());
+        when(rdsService.getDbInstance("database", REGION)).thenReturn(dbInstance());
 
         StackResource resource = provision(instanceProperties());
 
@@ -253,7 +251,7 @@ class SecretTargetAttachmentCfnProvisionerTest {
         cluster.setEngine(DatabaseEngine.POSTGRES);
         cluster.setEndpoint(new DbEndpoint("replacement.local", 6432));
         cluster.setDatabaseName("replacement");
-        when(rdsService.getDbCluster("replacement-cluster")).thenReturn(cluster);
+        when(rdsService.getDbCluster("replacement-cluster", REGION)).thenReturn(cluster);
 
         StackResource resource = provision(
                 properties("AWS::RDS::DBCluster", "replacement-cluster"),
@@ -285,7 +283,7 @@ class SecretTargetAttachmentCfnProvisionerTest {
         stubSecretValues("{\"username\":\"admin\",\"password\":\"secret\","
                 + "\"engine\":\"postgres\",\"host\":\"db.local\",\"port\":5432,"
                 + "\"dbname\":\"app\",\"dbInstanceIdentifier\":\"database\"}");
-        when(rdsService.getDbInstance("database")).thenReturn(dbInstance());
+        when(rdsService.getDbInstance("database", REGION)).thenReturn(dbInstance());
 
         StackResource resource = provision(instanceProperties(), SECRET_ID,
                 Map.of("__FlociSecretTargetManagedKeys",
@@ -300,7 +298,7 @@ class SecretTargetAttachmentCfnProvisionerTest {
     @Test
     void failedLegacyUpdateReleasesTheClaimCreatedByThatAttempt() {
         stubSecretValues("not-json");
-        when(rdsService.getDbInstance("database")).thenReturn(dbInstance());
+        when(rdsService.getDbInstance("database", REGION)).thenReturn(dbInstance());
 
         StackResource resource = provision(
                 instanceProperties(),
@@ -316,7 +314,7 @@ class SecretTargetAttachmentCfnProvisionerTest {
 
     @Test
     void missingTargetFailsBeforeReadingTheSecret() {
-        when(rdsService.getDbInstance("database"))
+        when(rdsService.getDbInstance("database", REGION))
                 .thenThrow(new AwsException("DBInstanceNotFound", "database is missing", 404));
 
         StackResource resource = provision(instanceProperties());
@@ -330,7 +328,7 @@ class SecretTargetAttachmentCfnProvisionerTest {
     void incompleteTargetFailsBeforeReadingTheSecret() {
         DbInstance instance = dbInstance();
         instance.setEndpoint(null);
-        when(rdsService.getDbInstance("database")).thenReturn(instance);
+        when(rdsService.getDbInstance("database", REGION)).thenReturn(instance);
 
         StackResource resource = provision(instanceProperties());
 
@@ -341,11 +339,11 @@ class SecretTargetAttachmentCfnProvisionerTest {
 
     @Test
     void replacingTheSecretAttachesTheNewSecretBeforeDetachingTheOldSecret() throws Exception {
-        String oldArn = "arn:aws:secretsmanager:us-east-1:000000000000:secret:old-a1b2c3";
-        String newArn = "arn:aws:secretsmanager:us-east-1:000000000000:secret:new-d4e5f6";
+        String oldArn = "arn:aws:secretsmanager:eu-west-1:000000000000:secret:old-a1b2c3";
+        String newArn = "arn:aws:secretsmanager:eu-west-1:000000000000:secret:new-d4e5f6";
         ObjectNode properties = instanceProperties();
         properties.put("SecretId", "new-secret");
-        when(rdsService.getDbInstance("database")).thenReturn(dbInstance());
+        when(rdsService.getDbInstance("database", REGION)).thenReturn(dbInstance());
         when(secretsManagerService.describeSecret("new-secret", REGION)).thenReturn(secret(newArn));
         when(secretsManagerService.describeSecret(oldArn, REGION)).thenReturn(secret(oldArn));
         when(secretsManagerService.getSecretValue(newArn, null, null, REGION))
@@ -383,11 +381,11 @@ class SecretTargetAttachmentCfnProvisionerTest {
 
     @Test
     void invalidOldSecretIsTreatedAsDetachedDuringReplacement() {
-        String oldArn = "arn:aws:secretsmanager:us-east-1:000000000000:secret:old-a1b2c3";
-        String newArn = "arn:aws:secretsmanager:us-east-1:000000000000:secret:new-d4e5f6";
+        String oldArn = "arn:aws:secretsmanager:eu-west-1:000000000000:secret:old-a1b2c3";
+        String newArn = "arn:aws:secretsmanager:eu-west-1:000000000000:secret:new-d4e5f6";
         ObjectNode properties = instanceProperties();
         properties.put("SecretId", "new-secret");
-        when(rdsService.getDbInstance("database")).thenReturn(dbInstance());
+        when(rdsService.getDbInstance("database", REGION)).thenReturn(dbInstance());
         when(secretsManagerService.describeSecret("new-secret", REGION)).thenReturn(secret(newArn));
         when(secretsManagerService.describeSecret(oldArn, REGION)).thenReturn(secret(oldArn));
         when(secretsManagerService.getSecretValue(newArn, null, null, REGION))
@@ -408,12 +406,12 @@ class SecretTargetAttachmentCfnProvisionerTest {
 
     @Test
     void failedPreviousDetachRestoresTheNewSecretAndReleasesItsClaim() throws Exception {
-        String oldArn = "arn:aws:secretsmanager:us-east-1:000000000000:secret:old-a1b2c3";
-        String newArn = "arn:aws:secretsmanager:us-east-1:000000000000:secret:new-d4e5f6";
+        String oldArn = "arn:aws:secretsmanager:eu-west-1:000000000000:secret:old-a1b2c3";
+        String newArn = "arn:aws:secretsmanager:eu-west-1:000000000000:secret:new-d4e5f6";
         String newOriginal = "{\"username\":\"new-user\",\"password\":\"new-password\"}";
         ObjectNode properties = instanceProperties();
         properties.put("SecretId", "new-secret");
-        when(rdsService.getDbInstance("database")).thenReturn(dbInstance());
+        when(rdsService.getDbInstance("database", REGION)).thenReturn(dbInstance());
         when(secretsManagerService.describeSecret("new-secret", REGION)).thenReturn(secret(newArn));
         when(secretsManagerService.describeSecret(oldArn, REGION)).thenReturn(secret(oldArn));
         when(secretsManagerService.getSecretValue(newArn, null, null, REGION))
@@ -540,7 +538,7 @@ class SecretTargetAttachmentCfnProvisionerTest {
     @ValueSource(strings = {"not-json", "\"plain-text\"", "[]"})
     void secretValueMustBeAJsonObject(String secretString) {
         stubSecretValues(secretString);
-        when(rdsService.getDbInstance("database")).thenReturn(dbInstance());
+        when(rdsService.getDbInstance("database", REGION)).thenReturn(dbInstance());
 
         StackResource resource = provision(instanceProperties());
 
@@ -554,7 +552,7 @@ class SecretTargetAttachmentCfnProvisionerTest {
     void binarySecretStillFailsProvisioning() {
         SecretVersion binary = new SecretVersion();
         binary.setSecretBinary("AQID");
-        when(rdsService.getDbInstance("database")).thenReturn(dbInstance());
+        when(rdsService.getDbInstance("database", REGION)).thenReturn(dbInstance());
         when(secretsManagerService.describeSecret(SECRET_ID, REGION)).thenReturn(secret(SECRET_ARN));
         when(secretsManagerService.getSecretValue(SECRET_ARN, null, null, REGION))
                 .thenReturn(binary);
@@ -586,7 +584,7 @@ class SecretTargetAttachmentCfnProvisionerTest {
 
     @Test
     void aSecondAttachmentToTheSameSecretFailsBeforeReadingOrWritingItsValue() {
-        when(rdsService.getDbInstance("database")).thenReturn(dbInstance());
+        when(rdsService.getDbInstance("database", REGION)).thenReturn(dbInstance());
         when(secretsManagerService.describeSecret(SECRET_ID, REGION)).thenReturn(secret(SECRET_ARN));
         when(secretsManagerService.claimTargetAttachment(
                 SECRET_ARN, "stack/Attachment", REGION))

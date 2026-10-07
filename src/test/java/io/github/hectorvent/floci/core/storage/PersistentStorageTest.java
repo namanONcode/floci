@@ -33,14 +33,30 @@ class PersistentStorageTest {
     @Test
     void persistsAcrossInstances() {
         Path filePath = tempDir.resolve("persist-test.json");
-        var store1 = new PersistentStorage<>(filePath, new TypeReference<Map<String, String>>() {});
+        PersistentStorage<String, String> store1 = new PersistentStorage<>(filePath, new TypeReference<Map<String, String>>() {});
         store1.put("key1", "value1");
         store1.put("key2", "value2");
 
-        var store2 = new PersistentStorage<>(filePath, new TypeReference<Map<String, String>>() {});
+        PersistentStorage<String, String> store2 = new PersistentStorage<>(filePath, new TypeReference<Map<String, String>>() {});
         store2.load();
         assertEquals("value1", store2.get("key1").orElseThrow());
         assertEquals("value2", store2.get("key2").orElseThrow());
+    }
+
+    @Test
+    void putAllPersistsEveryEntry() {
+        Path filePath = tempDir.resolve("batch-persist-test.json");
+        PersistentStorage<String, String> writer = new PersistentStorage<>(
+                filePath, new TypeReference<Map<String, String>>() {});
+        writer.putAll(Map.of("key1", "value1", "key2", "value2", "key3", "value3"));
+
+        PersistentStorage<String, String> reader = new PersistentStorage<>(
+                filePath, new TypeReference<Map<String, String>>() {});
+        reader.load();
+
+        assertEquals("value1", reader.get("key1").orElseThrow());
+        assertEquals("value2", reader.get("key2").orElseThrow());
+        assertEquals("value3", reader.get("key3").orElseThrow());
     }
 
     @Test

@@ -3,12 +3,18 @@ package io.github.hectorvent.floci.services.ecs;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.PersistentStorage;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.ecs.container.EcsContainerManager;
+import io.github.hectorvent.floci.services.ecs.container.HostVolumePolicy;
+import io.github.hectorvent.floci.services.ecs.model.EcsServiceModel;
+import io.github.hectorvent.floci.services.ecs.model.FirelensConfiguration;
+import io.github.hectorvent.floci.services.ecs.model.LaunchType;
+import io.github.hectorvent.floci.services.ecs.model.LogConfiguration;
 import io.github.hectorvent.floci.services.ecs.model.TaskDefinition;
 import jakarta.ws.rs.core.Response;
 import org.junit.jupiter.api.Test;
@@ -16,9 +22,11 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Path;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.mock;
@@ -43,7 +51,13 @@ class EcsJsonHandlerTaskDefinitionPersistenceTest {
         FileStorageFactory storage = new FileStorageFactory(dataDir);
         ObjectMapper objectMapper = new ObjectMapper();
 
-        EcsJsonHandler handler = new EcsJsonHandler(serviceWithStorage(storage), objectMapper);
+        // This test exercises persistence round-tripping, not host-volume safety, so the fixed
+        // literal sourcePath "/host/data" below needs an explicit opt-in under the new
+        // fail-closed default: allow any host path for this handler instance.
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(config.services().ecs().allowUnsafeHostVolumes()).thenReturn(true);
+        EcsJsonHandler handler = new EcsJsonHandler(serviceWithStorage(storage), objectMapper,
+                new HostVolumePolicy(config));
         JsonNode request = objectMapper.readTree("""
                 {
                   "family": "restart-family",
@@ -56,6 +70,10 @@ class EcsJsonHandlerTaskDefinitionPersistenceTest {
                       "logConfiguration": {
                         "logDriver": "awslogs",
                         "options": {"awslogs-group": "/ecs/restart-family"}
+                      },
+                      "firelensConfiguration": {
+                        "type": "fluentbit",
+                        "options": {"enable-ecs-log-metadata": "true"}
                       }
                     }
                   ],
@@ -73,13 +91,48 @@ class EcsJsonHandlerTaskDefinitionPersistenceTest {
         assertEquals("ARM64", td.getRuntimePlatform().cpuArchitecture());
         assertEquals("LINUX", td.getRuntimePlatform().operatingSystemFamily());
 
-        var logConfiguration = td.getContainerDefinitions().getFirst().getLogConfiguration();
+        LogConfiguration logConfiguration = td.getContainerDefinitions().getFirst().getLogConfiguration();
         assertNotNull(logConfiguration, "logConfiguration must survive a restart");
         assertEquals("awslogs", logConfiguration.logDriver());
         assertEquals("/ecs/restart-family", logConfiguration.options().get("awslogs-group"));
 
+        FirelensConfiguration firelens = td.getContainerDefinitions().getFirst().getFirelensConfiguration();
+        assertNotNull(firelens, "firelensConfiguration must survive a restart");
+        assertEquals("fluentbit", firelens.type());
+        assertEquals("true", firelens.options().get("enable-ecs-log-metadata"));
+
         assertEquals(1, td.getVolumes().size(), "task-level volumes must survive a restart");
         assertEquals("/host/data", td.getVolumes().getFirst().hostSourcePath());
+    }
+
+    @Test
+    void updateServiceForceNewDeploymentMintsNewDeploymentId(@TempDir Path dataDir) throws Exception {
+        FileStorageFactory storage = new FileStorageFactory(dataDir);
+        ObjectMapper objectMapper = new ObjectMapper();
+        EcsService service = serviceWithStorage(storage);
+        EcsJsonHandler handler = new EcsJsonHandler(service, objectMapper,
+                new HostVolumePolicy(mock(EmulatorConfig.class, RETURNS_DEEP_STUBS)));
+
+        JsonNode registerReq = objectMapper.readTree("""
+                {
+                  "family": "force-fam",
+                  "containerDefinitions": [{"name": "app", "image": "alpine:latest"}]
+                }
+                """);
+        handler.handle("RegisterTaskDefinition", registerReq, REGION);
+
+        EcsServiceModel created = service.createService(null, "force-svc", "force-fam:1", 0,
+                LaunchType.FARGATE, List.of(), null, REGION);
+        String firstId = created.getDeploymentId();
+
+        ObjectNode req = objectMapper.createObjectNode();
+        req.put("service", "force-svc");
+        req.put("forceNewDeployment", true);
+        Response resp = handler.handle("UpdateService", req, REGION);
+
+        JsonNode svc = objectMapper.readTree(resp.getEntity().toString()).path("service");
+        String newId = svc.path("deployments").path(0).path("id").asText();
+        assertNotEquals(firstId, newId);
     }
 
     private static EcsService serviceWithStorage(StorageFactory storage) {
@@ -92,7 +145,8 @@ class EcsJsonHandlerTaskDefinitionPersistenceTest {
                 mock(EcsContainerManager.class),
                 config,
                 mock(EcsLoadBalancerRegistrar.class),
-                storage);
+                storage,
+                null);
         service.initializeStorage();
         return service;
     }

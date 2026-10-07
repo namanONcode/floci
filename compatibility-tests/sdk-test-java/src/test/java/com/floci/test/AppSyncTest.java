@@ -1,5 +1,6 @@
 package com.floci.test;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.*;
 import software.amazon.awssdk.core.SdkBytes;
@@ -54,7 +55,7 @@ class AppSyncTest {
         assertThat(apiId).isNotBlank();
         assertThat(resp.graphqlApi().name()).isEqualTo("sdk-test-api");
         assertThat(resp.graphqlApi().authenticationType()).isEqualTo(AuthenticationType.API_KEY);
-        assertThat(resp.graphqlApi().arn()).contains("arn:aws:appsync:");
+        assertThat(resp.graphqlApi().arn()).startsWith("arn:" + TestFixtures.partition() + ":appsync:");
     }
 
     @Test
@@ -133,9 +134,9 @@ class AppSyncTest {
         keyId = resp.apiKey().id();
         assertThat(keyId).isNotBlank();
         assertThat(resp.apiKey().description()).isEqualTo("sdk-test-key");
-        // AWS SDK v2 ApiKey has no apiKey() accessor; Floci returns the da2- secret on the wire.
-        apiKeyValue = fetchApiKeyValue(apiId, keyId);
-        assertThat(apiKeyValue).startsWith("da2-");
+        // As on AWS, the id is the key value sent as x-api-key.
+        assertThat(keyId).matches("da2-[a-z0-9]{26}");
+        apiKeyValue = keyId;
     }
 
     @Test
@@ -346,6 +347,79 @@ class AppSyncTest {
     }
 
     @Test
+    @Order(45)
+    void resolverRunsItsVtlTemplate() throws Exception {
+        // One query reaches everything a template calls through reflection: the #return
+        // directive, $ctx and the JDK maps, lists and strings behind it, and each $util helper.
+        updateHelloResolver("""
+                $util.qr($ctx.stash.put("fromRequest", "stashed"))
+                {"version": "2018-05-29", "payload": {}}
+                """, """
+                #set($m = {})
+                $util.qr($m.put("stash", $ctx.stash.fromRequest))
+                $util.qr($m.put("sourceIsNull", $util.isNull($ctx.source)))
+                #set($l = [])
+                $util.qr($l.add("a"))
+                $util.qr($m.put("listSize", $l.size()))
+                #set($s = "abc")
+                $util.qr($m.put("startsWith", $s.startsWith("ab")))
+                $util.qr($m.put("upper", $util.str.toUpper("abc")))
+                $util.qr($m.put("epochIsPositive", $util.time.nowEpochSeconds() > 0))
+                $util.qr($m.put("round", $util.math.roundNum(1.6)))
+                $util.qr($m.put("ddb", $util.dynamodb.toDynamoDB("x")))
+                $util.qr($m.put("filter", $util.transform.toDynamoDBFilterExpression({"a": {"eq": 1}})))
+                $util.qr($m.put("list", $util.list.copyAndRemoveAll([1, 2], [2])))
+                $util.qr($m.put("map", $util.map.copyAndRetainAllKeys({"a": 1, "b": 2}, ["a"])))
+                #return($util.toJson($m))
+                """);
+
+        JsonNode body = queryHello();
+        assertThat(body.path("errors").isMissingNode()).as(body.toString()).isTrue();
+        JsonNode hello = mapper.readTree(body.path("data").path("hello").asText());
+        assertThat(hello.path("stash").asText()).isEqualTo("stashed");
+        assertThat(hello.path("sourceIsNull").asBoolean()).isTrue();
+        assertThat(hello.path("listSize").asInt()).isEqualTo(1);
+        assertThat(hello.path("startsWith").asBoolean()).isTrue();
+        assertThat(hello.path("upper").asText()).isEqualTo("ABC");
+        assertThat(hello.path("epochIsPositive").asBoolean()).isTrue();
+        assertThat(hello.path("round").asInt()).isEqualTo(2);
+        assertThat(hello.path("ddb").path("S").asText()).isEqualTo("x");
+        assertThat(hello.path("filter").isObject()).as(hello.toString()).isTrue();
+        assertThat(hello.path("list").toString()).isEqualTo("[1]");
+        assertThat(hello.path("map").toString()).isEqualTo("{\"a\":1}");
+
+        updateHelloResolver("{\"version\": \"2018-05-29\", \"payload\": {}}",
+                "$util.error(\"boom\", \"CustomError\")");
+
+        JsonNode failed = queryHello();
+        assertThat(failed.path("errors").path(0).path("message").asText()).isEqualTo("boom");
+        assertThat(failed.path("errors").path(0).path("errorType").asText()).isEqualTo("CustomError");
+    }
+
+    private void updateHelloResolver(String requestTemplate, String responseTemplate) {
+        client.updateResolver(UpdateResolverRequest.builder()
+                .apiId(apiId)
+                .typeName("Query")
+                .fieldName("hello")
+                .dataSourceName("none-ds")
+                .requestMappingTemplate(requestTemplate)
+                .responseMappingTemplate(responseTemplate)
+                .build());
+    }
+
+    private JsonNode queryHello() throws Exception {
+        HttpRequest req = HttpRequest.newBuilder()
+                .uri(URI.create(TestFixtures.endpoint() + "/v1/apis/" + apiId + "/graphql"))
+                .header("Content-Type", "application/json")
+                .header("x-api-key", apiKeyValue)
+                .POST(HttpRequest.BodyPublishers.ofString("{\"query\":\"{ hello }\"}"))
+                .build();
+        HttpResponse<String> resp = HttpClient.newHttpClient().send(req, HttpResponse.BodyHandlers.ofString());
+        assertThat(resp.statusCode()).isEqualTo(200);
+        return mapper.readTree(resp.body());
+    }
+
+    @Test
     @Order(44)
     void deleteResolver() {
         client.createResolver(CreateResolverRequest.builder()
@@ -547,7 +621,7 @@ class AppSyncTest {
                 .build());
 
         assertThat(resp.dataSource().dataSourceArn()).isNotNull();
-        assertThat(resp.dataSource().dataSourceArn()).contains("arn:aws:appsync:");
+        assertThat(resp.dataSource().dataSourceArn()).startsWith("arn:" + TestFixtures.partition() + ":appsync:");
         assertThat(resp.dataSource().dataSourceArn()).contains("/datasources/arn-check-ds");
 
         client.deleteDataSource(r -> r.apiId(apiId).name("arn-check-ds"));
@@ -564,7 +638,7 @@ class AppSyncTest {
                 .build());
 
         assertThat(resp.resolver().resolverArn()).isNotNull();
-        assertThat(resp.resolver().resolverArn()).contains("arn:aws:appsync:");
+        assertThat(resp.resolver().resolverArn()).startsWith("arn:" + TestFixtures.partition() + ":appsync:");
         assertThat(resp.resolver().resolverArn()).contains("/types/Query/resolvers/resolverArnCheck");
 
         client.deleteResolver(r -> r.apiId(apiId).typeName("Query").fieldName("resolverArnCheck"));
@@ -580,7 +654,8 @@ class AppSyncTest {
                 .build());
 
         assertThat(resp.functionConfiguration().functionArn()).isNotNull();
-        assertThat(resp.functionConfiguration().functionArn()).contains("arn:aws:appsync:");
+        assertThat(resp.functionConfiguration().functionArn())
+                .startsWith("arn:" + TestFixtures.partition() + ":appsync:");
 
         client.deleteFunction(r -> r.apiId(apiId).functionId(resp.functionConfiguration().functionId()));
     }
@@ -1314,25 +1389,5 @@ class AppSyncTest {
         assertThat(location.get("line")).isNotNull();
         assertThat(location.get("column")).isNotNull();
         assertThat(location.get("span")).isEqualTo(-1);
-    }
-
-    @SuppressWarnings("unchecked")
-    private static String fetchApiKeyValue(String apiId, String keyId) throws Exception {
-        String url = TestFixtures.endpoint() + "/v1/apis/" + apiId + "/apikeys";
-        HttpRequest req = HttpRequest.newBuilder()
-                .uri(URI.create(url))
-                .header("Authorization", "AWS4-HMAC-SHA256 Credential=test/20260205/us-east-1/appsync/aws4_request")
-                .GET()
-                .build();
-        HttpResponse<String> resp = HttpClient.newHttpClient().send(req, HttpResponse.BodyHandlers.ofString());
-        Map<String, Object> body = mapper.readValue(resp.body(), Map.class);
-        List<Map<String, Object>> keys = (List<Map<String, Object>>) body.get("apiKeys");
-        assertThat(keys).isNotEmpty();
-        for (Map<String, Object> key : keys) {
-            if (keyId.equals(key.get("id"))) {
-                return String.valueOf(key.get("apiKey"));
-            }
-        }
-        throw new IllegalStateException("API key not listed for id " + keyId);
     }
 }

@@ -23,6 +23,7 @@ import com.github.dockerjava.api.command.ExecCreateCmdResponse;
 import com.github.dockerjava.api.command.ExecStartCmd;
 import com.github.dockerjava.api.command.CopyArchiveFromContainerCmd;
 import com.github.dockerjava.api.exception.NotFoundException;
+import com.github.dockerjava.api.model.AccessMode;
 import com.github.dockerjava.api.model.Frame;
 import com.github.dockerjava.api.model.StreamType;
 import com.github.dockerjava.api.model.Mount;
@@ -33,6 +34,8 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.mockito.ArgumentCaptor;
 import org.mockito.InOrder;
 import org.mockito.Mock;
@@ -40,28 +43,31 @@ import org.mockito.junit.jupiter.MockitoExtension;
 
 import io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsService;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.OptionalInt;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
-import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.*;
 
 @ExtendWith(MockitoExtension.class)
@@ -103,9 +109,6 @@ class ContainerLauncherTest {
         when(docker.logMaxSize()).thenReturn("10m");
         when(docker.logMaxFile()).thenReturn("3");
         when(config.baseUrl()).thenReturn("http://localhost:4566");
-        EmulatorConfig.TlsConfig tls = mock(EmulatorConfig.TlsConfig.class);
-        when(config.tls()).thenReturn(tls);
-        lenient().when(tls.enabled()).thenReturn(false);
         lenient().when(config.defaultRegion()).thenReturn("us-east-1");
         lenient().when(config.defaultAccountId()).thenReturn("000000000000");
         lenient().when(config.hostname()).thenReturn(Optional.empty());
@@ -121,6 +124,10 @@ class ContainerLauncherTest {
         lenient().when(efs.mountGroupAdd()).thenReturn(OptionalInt.empty());
 
         when(embeddedDnsServer.getServerIp()).thenReturn(Optional.empty());
+        // Default: pass images through unchanged, matching the real EcrRegistryManager's
+        // behavior for non-ECR-shaped images. Individual ECR-rewrite tests override this.
+        lenient().when(ecrRegistryManager.rewriteImageUri(any()))
+                .thenAnswer(inv -> inv.getArgument(0));
 
         ContainerBuilder containerBuilder = new ContainerBuilder(config, dockerHostResolver, embeddedDnsServer);
         ContainerReachableEndpoint reachableEndpoint =
@@ -142,6 +149,7 @@ class ContainerLauncherTest {
         // lenient: the failure-path test (populate fails before any container is created) never
         // reaches these, but every success-path test does — they must not trip strict-stubs.
         lenient().when(lifecycleManager.create(any())).thenReturn("container-123");
+        lenient().when(lifecycleManager.create(any(), anyString())).thenReturn("container-123");
         ContainerLifecycleManager.ContainerInfo info =
                 new ContainerLifecycleManager.ContainerInfo("container-123", Map.of());
         lenient().when(lifecycleManager.startCreated(eq("container-123"), any())).thenReturn(info);
@@ -200,6 +208,13 @@ class ContainerLauncherTest {
                 .orElseGet(() -> specs.get(specs.size() - 1));
     }
 
+    private String captureRealContainerPlatform() {
+        ArgumentCaptor<String> platformCaptor = ArgumentCaptor.forClass(String.class);
+        verify(lifecycleManager, atLeastOnce()).create(any(ContainerSpec.class), platformCaptor.capture());
+        List<String> platforms = platformCaptor.getAllValues();
+        return platforms.get(platforms.size() - 1);
+    }
+
     /** Returns the read-only {@code /var/task} volume mount on the spec, or null if absent. */
     private static Mount varTaskVolumeMount(ContainerSpec spec) {
         if (spec.mounts() == null) {
@@ -209,6 +224,156 @@ class ContainerLauncherTest {
                 .filter(m -> m.getType() == MountType.VOLUME && "/var/task".equals(m.getTarget()))
                 .findFirst()
                 .orElse(null);
+    }
+
+    @Test
+    void launchFunction_hotReloadMountsTheHostDirectoryReadOnlyAtVarTask() {
+        LambdaFunction fn = new LambdaFunction();
+        fn.setFunctionName("hot-reload-fn");
+        fn.setRuntime("nodejs20.x");
+        fn.setHandler("index.handler");
+        fn.setHotReloadHostPath("/home/ci/code");
+
+        launcher.launch(fn);
+
+        ContainerSpec spec = captureRealContainerSpec();
+        assertEquals(1, spec.binds().stream()
+                .filter(b -> "/home/ci/code".equals(b.getPath()) && "/var/task".equals(b.getVolume().getPath()))
+                .count());
+        assertEquals(AccessMode.ro, spec.binds().stream()
+                .filter(b -> "/var/task".equals(b.getVolume().getPath()))
+                .findFirst().orElseThrow().getAccessMode());
+    }
+
+    @Test
+    void launchFunction_usesArm64DockerPlatformWhenArchitectureHonouringIsEnabled() throws Exception {
+        EmulatorConfig.LambdaServiceConfig lambda = config.services().lambda();
+        when(lambda.honourArchitectures()).thenReturn(true);
+        Path codePath = Files.createDirectory(tempDir.resolve("arm64-code"));
+
+        LambdaFunction fn = new LambdaFunction();
+        fn.setFunctionName("arm64-fn");
+        fn.setRuntime("nodejs20.x");
+        fn.setHandler("index.handler");
+        fn.setCodeLocalPath(codePath.toString());
+        fn.setArchitectures(List.of("arm64"));
+
+        launcher.launch(fn);
+
+        assertEquals("linux/arm64", captureRealContainerPlatform());
+    }
+
+    @Test
+    void launchFunction_usesAmd64DockerPlatformForX86Architecture() throws Exception {
+        EmulatorConfig.LambdaServiceConfig lambda = config.services().lambda();
+        when(lambda.honourArchitectures()).thenReturn(true);
+        Path codePath = Files.createDirectory(tempDir.resolve("x86-code"));
+
+        LambdaFunction fn = new LambdaFunction();
+        fn.setFunctionName("x86-fn");
+        fn.setRuntime("nodejs20.x");
+        fn.setHandler("index.handler");
+        fn.setCodeLocalPath(codePath.toString());
+        fn.setArchitectures(List.of("x86_64"));
+
+        launcher.launch(fn);
+
+        assertEquals("linux/amd64", captureRealContainerPlatform());
+    }
+
+    @Test
+    void launchFunction_usesAmd64DockerPlatformWhenArchitectureIsOmitted() throws Exception {
+        EmulatorConfig.LambdaServiceConfig lambda = config.services().lambda();
+        when(lambda.honourArchitectures()).thenReturn(true);
+        Path codePath = Files.createDirectory(tempDir.resolve("default-architecture-code"));
+
+        LambdaFunction fn = new LambdaFunction();
+        fn.setFunctionName("default-architecture-fn");
+        fn.setRuntime("nodejs20.x");
+        fn.setHandler("index.handler");
+        fn.setCodeLocalPath(codePath.toString());
+
+        launcher.launch(fn);
+
+        assertEquals("linux/amd64", captureRealContainerPlatform());
+    }
+
+    @Test
+    void launchFunction_keepsDaemonDefaultPlatformWhenArchitectureHonouringIsDisabled() throws Exception {
+        Path codePath = Files.createDirectory(tempDir.resolve("native-platform-code"));
+
+        LambdaFunction fn = new LambdaFunction();
+        fn.setFunctionName("native-platform-fn");
+        fn.setRuntime("nodejs20.x");
+        fn.setHandler("index.handler");
+        fn.setCodeLocalPath(codePath.toString());
+        fn.setArchitectures(List.of("arm64"));
+
+        launcher.launch(fn);
+
+        captureRealContainerSpec();
+        verify(lifecycleManager, never()).create(any(ContainerSpec.class), anyString());
+    }
+
+    @ParameterizedTest
+    @MethodSource("invalidPersistedArchitectures")
+    void launchFunction_rejectsInvalidPersistedArchitecturesBeforeCreatingContainer(
+            List<String> architectures) throws Exception {
+        EmulatorConfig.LambdaServiceConfig lambda = config.services().lambda();
+        when(lambda.honourArchitectures()).thenReturn(true);
+        Path codePath = Files.createDirectory(tempDir.resolve("legacy-invalid-architecture-code"));
+
+        LambdaFunction fn = new LambdaFunction();
+        fn.setFunctionName("legacy-invalid-architecture-fn");
+        fn.setRuntime("nodejs20.x");
+        fn.setHandler("index.handler");
+        fn.setCodeLocalPath(codePath.toString());
+        fn.setArchitectures(architectures);
+
+        IllegalStateException exception = assertThrows(IllegalStateException.class,
+                () -> launcher.launch(fn));
+
+        assertEquals("Invalid persisted architectures " + architectures
+                + " for function 'legacy-invalid-architecture-fn'", exception.getMessage());
+        verify(lifecycleManager, never()).create(any(ContainerSpec.class));
+        verify(lifecycleManager, never()).create(any(ContainerSpec.class), anyString());
+        assertSame(architectures, fn.getArchitectures());
+    }
+
+    private static Stream<List<String>> invalidPersistedArchitectures() {
+        return Stream.of(
+                List.of(),
+                List.of("riscv64"),
+                List.of("arm64", "x86_64"));
+    }
+
+    @Test
+    void launchFunction_usesArm64DockerPlatformForCodeVolumeHelper() throws Exception {
+        EmulatorConfig.LambdaServiceConfig lambda = config.services().lambda();
+        when(lambda.honourArchitectures()).thenReturn(true);
+        Path codePath = Files.createDirectory(tempDir.resolve("large-arm64-code"));
+        Files.write(codePath.resolve("bundle.bin"), new byte[8 * 1024]);
+
+        LambdaFunction fn = new LambdaFunction();
+        fn.setFunctionName("large-arm64-fn");
+        fn.setRuntime("nodejs20.x");
+        fn.setHandler("index.handler");
+        fn.setCodeLocalPath(codePath.toString());
+        fn.setCodeSha256("large-arm64-code-sha");
+        fn.setArchitectures(List.of("arm64"));
+
+        long originalThreshold = ContainerLauncher.CODE_VOLUME_MIN_BYTES;
+        try {
+            ContainerLauncher.CODE_VOLUME_MIN_BYTES = 4 * 1024;
+            launcher.launch(fn);
+        } finally {
+            ContainerLauncher.CODE_VOLUME_MIN_BYTES = originalThreshold;
+        }
+
+        ArgumentCaptor<String> platformCaptor = ArgumentCaptor.forClass(String.class);
+        verify(lifecycleManager, times(2)).create(any(ContainerSpec.class), platformCaptor.capture());
+        assertTrue(platformCaptor.getAllValues().stream()
+                .allMatch("linux/arm64"::equals));
     }
 
     @Test
@@ -257,6 +422,55 @@ class ContainerLauncherTest {
     }
 
     @Test
+    void launchFunction_appliesConfiguredDockerFlagsToRealContainer() throws Exception {
+        when(config.services().lambda().dockerFlags()).thenReturn(Optional.of(
+                "--env NODE_EXTRA_CA_CERTS=/opt/certs/root.pem "
+                        + "--volume /tmp/certs:/opt/certs:ro --add-host api.local:host-gateway "
+                        + "--dns 1.1.1.1 --label purpose=debug --network lambda-net "
+                        + "--user 1000:1000 --privileged --publish 127.0.0.1:5050:5050"));
+        Path codePath = Files.createDirectory(tempDir.resolve("flags-code"));
+
+        LambdaFunction fn = new LambdaFunction();
+        fn.setFunctionName("flags-fn");
+        fn.setRuntime("nodejs20.x");
+        fn.setHandler("index.handler");
+        fn.setCodeLocalPath(codePath.toString());
+
+        launcher.launch(fn);
+
+        ContainerSpec spec = captureRealContainerSpec();
+        assertTrue(spec.env().contains("NODE_EXTRA_CA_CERTS=/opt/certs/root.pem"));
+        assertEquals("lambda-net", spec.networkMode());
+        assertEquals("1000:1000", spec.user());
+        assertTrue(spec.privileged());
+        assertEquals(Map.of(5050, 5050), spec.portBindings());
+        assertEquals(List.of(5050), spec.loopbackPortBindings());
+        assertTrue(spec.extraHosts().contains("api.local:host-gateway"));
+        assertTrue(spec.dnsServers().contains("1.1.1.1"));
+        assertEquals("debug", spec.labels().get("purpose"));
+        assertEquals("/opt/certs", spec.binds().getFirst().getVolume().getPath());
+        assertEquals("/tmp/certs", spec.binds().getFirst().getPath());
+    }
+
+    @Test
+    void launchFunction_rejectsPublishedPortBoundToUnsupportedHostAddress() throws Exception {
+        when(config.services().lambda().dockerFlags()).thenReturn(Optional.of(
+                "--publish 192.0.2.10:5050:5050"));
+        Path codePath = Files.createDirectory(tempDir.resolve("unsupported-publish-address-code"));
+
+        LambdaFunction fn = new LambdaFunction();
+        fn.setFunctionName("unsupported-publish-address-fn");
+        fn.setRuntime("nodejs20.x");
+        fn.setHandler("index.handler");
+        fn.setCodeLocalPath(codePath.toString());
+
+        IllegalArgumentException exception = assertThrows(IllegalArgumentException.class,
+                () -> launcher.launch(fn));
+
+        assertTrue(exception.getMessage().contains("127.0.0.1"));
+    }
+
+    @Test
     void launchFunction_mountsConfiguredFileSystemVolume() throws Exception {
         Path codePath = Files.createDirectory(tempDir.resolve("efs-code"));
 
@@ -272,7 +486,7 @@ class ContainerLauncherTest {
 
         launcher.launch(fn);
 
-        String expectedVolumeName = "floci-efs-fsap-0123456789abcdef0-"
+        String expectedVolumeName = "floci-aws-efs-fsap-0123456789abcdef0-"
                 + "9d6eafd2aec94d4518a004f005725b4b3c673c1506436bb7368cfd5450fc0810";
         verify(lifecycleManager).ensureSharedVolume(expectedVolumeName,
                 OptionalInt.empty(), OptionalInt.empty(), Optional.empty(), "busybox:stable");
@@ -341,10 +555,12 @@ class ContainerLauncherTest {
     }
 
     @Test
-    void launchFunction_fallsBackToTestCredentialsWhenEnvUnset() throws Exception {
-        // When System.getenv returns null for AWS vars, credentials should be test/test/test.
-        // Since we can't control System.getenv in unit tests, we verify the values are either
-        // from the environment or the "test" fallback — both are valid.
+    void launchFunction_injectsOwningAccountAsAccessKeyAndFallsBackForTheRest() throws Exception {
+        // The access key identifies the container's owning account to AccountResolver, so it is
+        // the function's resolved account (here the configured default, since this function has
+        // no ARN to derive one from) rather than the literal "test" placeholder. The secret and
+        // session token carry no account identity, so they still come from the host env or fall
+        // back to "test"; System.getenv can't be controlled here, so both are accepted.
         Path codePath = Files.createDirectory(tempDir.resolve("creds-fallback"));
 
         LambdaFunction fn = new LambdaFunction();
@@ -360,14 +576,43 @@ class ContainerLauncherTest {
         String secretKey = env.stream().filter(e -> e.startsWith("AWS_SECRET_ACCESS_KEY=")).findFirst().orElse("");
         String sessionToken = env.stream().filter(e -> e.startsWith("AWS_SESSION_TOKEN=")).findFirst().orElse("");
 
-        // Value should be either the host env var or "test" fallback
-        String expectedAk = System.getenv("AWS_ACCESS_KEY_ID") != null ? System.getenv("AWS_ACCESS_KEY_ID") : "test";
+        // The owning account wins outright — including over a host env var, which describes the
+        // Floci server process and not the container it launched.
         String expectedSk = System.getenv("AWS_SECRET_ACCESS_KEY") != null ? System.getenv("AWS_SECRET_ACCESS_KEY") : "test";
         String expectedSt = System.getenv("AWS_SESSION_TOKEN") != null ? System.getenv("AWS_SESSION_TOKEN") : "test";
 
-        assertEquals("AWS_ACCESS_KEY_ID=" + expectedAk, accessKey);
+        assertEquals("AWS_ACCESS_KEY_ID=000000000000", accessKey);
         assertEquals("AWS_SECRET_ACCESS_KEY=" + expectedSk, secretKey);
         assertEquals("AWS_SESSION_TOKEN=" + expectedSt, sessionToken);
+    }
+
+    @Test
+    void launchFunction_partialUserCredentialEnvironmentDoesNotSplitOwnerAccountTuple() throws Exception {
+        // A Lambda with no execution role falls onto the owner-account placeholder tuple. If the
+        // function's own Environment config defines only AWS_ACCESS_KEY_ID (no matching secret or
+        // session token), that partial value must not leak in and override just the access key —
+        // it would pair the user's key with the owner-account's "test" secret/token, a tuple
+        // nothing can verify. The injection must be all-or-nothing: since the function does not
+        // define the full triad, none of its credential vars should reach the container.
+        Path codePath = Files.createDirectory(tempDir.resolve("creds-partial"));
+
+        LambdaFunction fn = new LambdaFunction();
+        fn.setFunctionName("partial-creds-fn");
+        fn.setRuntime("nodejs20.x");
+        fn.setHandler("index.handler");
+        fn.setCodeLocalPath(codePath.toString());
+        fn.setFunctionArn("arn:aws:lambda:us-east-1:111122223333:function:partial-creds-fn");
+        fn.setEnvironment(Map.of("AWS_ACCESS_KEY_ID", "user-partial-key"));
+
+        launcher.launch(fn);
+
+        List<String> env = captureRealContainerSpec().env();
+        assertEquals(1, env.stream().filter(e -> e.startsWith("AWS_ACCESS_KEY_ID=")).count(),
+                "the owner-account access key must not be joined by a second, user-supplied one");
+        assertTrue(env.contains("AWS_ACCESS_KEY_ID=111122223333"),
+                "the owner-account access key must win when the function's own triad is incomplete");
+        assertTrue(env.stream().noneMatch("AWS_ACCESS_KEY_ID=user-partial-key"::equals),
+                "a partial user-supplied access key must never override the owner-account baseline");
     }
 
     @Test
@@ -404,8 +649,9 @@ class ContainerLauncherTest {
         List<String> env = captureRealContainerSpec().env();
         assertTrue(env.contains("AWS_DEFAULT_REGION=eu-west-2"));
         assertTrue(env.contains("AWS_REGION=eu-west-2"));
-        verify(logStreamer).attach(
-                eq("container-123"), any(), any(), eq("eu-west-2"), eq("lambda:region-arn-fn"));
+        verify(logStreamer).attachForAccount(
+                eq("000000000000"), eq("container-123"), any(), any(),
+                eq("eu-west-2"), eq("lambda:region-arn-fn"));
     }
 
     @Test
@@ -447,15 +693,14 @@ class ContainerLauncherTest {
         fn.setPackageType("Image");
         fn.setImageUri("123456789012.dkr.ecr.us-east-1.amazonaws.com/backend-user:1");
 
-        when(ecrRegistryManager.getRepositoryUri("123456789012", "us-east-1", "backend-user:1"))
-                .thenReturn("123456789012.dkr.ecr.us-east-1.localhost:5100/backend-user:1");
+        when(ecrRegistryManager.rewriteImageUri("123456789012.dkr.ecr.us-east-1.amazonaws.com/backend-user:1"))
+                .thenReturn("123456789012.dkr.ecr.us-east-1.localhost:4566/backend-user:1");
 
         launcher.launch(fn);
 
         ContainerSpec spec = captureRealContainerSpec();
-        verify(ecrRegistryManager).ensureStarted();
-        verify(ecrRegistryManager).getRepositoryUri("123456789012", "us-east-1", "backend-user:1");
-        assertEquals("123456789012.dkr.ecr.us-east-1.localhost:5100/backend-user:1",
+        verify(ecrRegistryManager).rewriteImageUri("123456789012.dkr.ecr.us-east-1.amazonaws.com/backend-user:1");
+        assertEquals("123456789012.dkr.ecr.us-east-1.localhost:4566/backend-user:1",
                 spec.image());
     }
 
@@ -466,15 +711,14 @@ class ContainerLauncherTest {
         fn.setPackageType("Image");
         fn.setImageUri("123456789012.dkr.ecr.us-east-1.amazonaws.com/backend-user:1");
 
-        when(ecrRegistryManager.getRepositoryUri("123456789012", "us-east-1", "backend-user:1"))
-                .thenReturn("localhost:5100/123456789012/us-east-1/backend-user:1");
+        when(ecrRegistryManager.rewriteImageUri("123456789012.dkr.ecr.us-east-1.amazonaws.com/backend-user:1"))
+                .thenReturn("localhost:4566/123456789012/us-east-1/backend-user:1");
 
         launcher.launch(fn);
 
         ContainerSpec spec = captureRealContainerSpec();
-        verify(ecrRegistryManager).ensureStarted();
-        verify(ecrRegistryManager).getRepositoryUri("123456789012", "us-east-1", "backend-user:1");
-        assertEquals("localhost:5100/123456789012/us-east-1/backend-user:1",
+        verify(ecrRegistryManager).rewriteImageUri("123456789012.dkr.ecr.us-east-1.amazonaws.com/backend-user:1");
+        assertEquals("localhost:4566/123456789012/us-east-1/backend-user:1",
                 spec.image());
     }
 
@@ -911,6 +1155,49 @@ class ContainerLauncherTest {
         }
     }
 
+    /**
+     * The sweep works from this process's own map of names, so a name it tracked can belong to
+     * another resource namespace sharing the daemon: that volume is left alone, not requeued.
+     */
+    @Test
+    void cleanupSupersededVolumes_leavesAVolumeOfAnotherResourceNamespaceAlone() throws Exception {
+        Path codePath = Files.createDirectory(tempDir.resolve("cleanup-ns-code"));
+        Files.write(codePath.resolve("bundle.bin"), new byte[8 * 1024]);
+        LambdaFunction v1 = new LambdaFunction();
+        v1.setFunctionName("cleanup-ns-fn");
+        v1.setRuntime("nodejs20.x");
+        v1.setHandler("index.handler");
+        v1.setCodeLocalPath(codePath.toString());
+        v1.setCodeSha256("cleanup-ns-fn-sha-v1");
+        String volumeV1 = ContainerLauncher.codeVolumeName(v1);
+        LambdaFunction v2 = new LambdaFunction();
+        v2.setFunctionName("cleanup-ns-fn");
+        v2.setRuntime("nodejs20.x");
+        v2.setHandler("index.handler");
+        v2.setCodeLocalPath(codePath.toString());
+        v2.setCodeSha256("cleanup-ns-fn-sha-v2");
+        when(lifecycleManager.tryVolumeLabels(volumeV1))
+                .thenReturn(Optional.of(Map.of("floci_namespace", "someone-else")));
+
+        long originalBytes = ContainerLauncher.CODE_VOLUME_MIN_BYTES;
+        long originalGrace = ContainerLauncher.VOLUME_CLEANUP_GRACE_MS;
+        try {
+            ContainerLauncher.CODE_VOLUME_MIN_BYTES = 4 * 1024;
+            ContainerLauncher.VOLUME_CLEANUP_GRACE_MS = -1;
+            launcher.launch(v1);
+            launcher.launch(v2);
+
+            launcher.cleanupSupersededVolumes();
+            launcher.cleanupSupersededVolumes();
+
+            verify(lifecycleManager, never()).removeVolume(volumeV1);
+            verify(lifecycleManager, times(1)).tryVolumeLabels(volumeV1);
+        } finally {
+            ContainerLauncher.CODE_VOLUME_MIN_BYTES = originalBytes;
+            ContainerLauncher.VOLUME_CLEANUP_GRACE_MS = originalGrace;
+        }
+    }
+
     @Test
     void cleanupSupersededVolumes_retriesOnALaterSweep_whenTheVolumeIsStillInUse() throws Exception {
         // Regression: removeVolume() silently no-ops when Docker refuses because the volume is
@@ -1242,7 +1529,7 @@ class ContainerLauncherTest {
      *  returns for a directory: the directory itself as a leading entry, then each name as a direct
      *  child, executable. */
     private static byte[] tarOf(String... binaryNames) throws IOException {
-        var entries = new java.util.LinkedHashMap<String, Boolean>();
+        LinkedHashMap<String, Boolean> entries = new LinkedHashMap<>();
         for (String name : binaryNames) {
             entries.put(name, true);
         }
@@ -1254,12 +1541,12 @@ class ContainerLauncherTest {
      *  exercised. Names containing "/" are written as-is (not prefixed), to model entries nested
      *  more than one level below the extensions directory. */
     private static byte[] tarOfRaw(java.util.Map<String, Boolean> nameToExecutable) throws IOException {
-        var bos = new java.io.ByteArrayOutputStream();
+        ByteArrayOutputStream bos = new ByteArrayOutputStream();
         try (TarArchiveOutputStream tar = new TarArchiveOutputStream(bos)) {
             TarArchiveEntry dir = new TarArchiveEntry("extensions/");
             tar.putArchiveEntry(dir);
             tar.closeArchiveEntry();
-            for (var e : nameToExecutable.entrySet()) {
+            for (Map.Entry<String, Boolean> e : nameToExecutable.entrySet()) {
                 TarArchiveEntry entry = new TarArchiveEntry("extensions/" + e.getKey());
                 entry.setMode(e.getValue() ? 0100755 : 0100644); // executable vs. non-executable regular file
                 entry.setSize(0);
@@ -1398,16 +1685,17 @@ class ContainerLauncherTest {
         LambdaFunction fn = new LambdaFunction();
         fn.setFunctionName("observability-fn");
         fn.setPackageType("Image");
+        fn.setFunctionArn("arn:aws:lambda:us-east-1:555555555555:function:observability-fn");
         fn.setImageUri("123456789012.dkr.ecr.us-east-1.amazonaws.com/repo:latest");
 
         launcherWithRealStreamer.launch(fn);
 
-        // The frame became a CloudWatch log event in the function's own log group. Forwarding goes
-        // through the account-aware overload with a null account id: exec streams have no owning
-        // account of their own, so they land in the default account's copy of the log group.
+        // The frame became a CloudWatch log event in the function owner's log group even though
+        // the launcher is not running inside an HTTP request scope.
         ArgumentCaptor<List<Map<String, Object>>> events = ArgumentCaptor.forClass(List.class);
         verify(cloudWatchLogs, atLeastOnce()).putLogEventsForAccount(
-                isNull(), eq("/aws/lambda/observability-fn"), anyString(), events.capture(), anyString());
+                eq("555555555555"), eq("/aws/lambda/observability-fn"), anyString(),
+                events.capture(), anyString());
         assertTrue(events.getAllValues().stream()
                         .flatMap(List::stream)
                         .anyMatch(e -> "extension started on :8080".equals(e.get("message"))),
@@ -1431,8 +1719,8 @@ class ContainerLauncherTest {
         launcher.launch(fn);
 
         InOrder inOrder = inOrder(logStreamer, dockerClient);
-        inOrder.verify(logStreamer).ensureLogGroupAndStream(
-                eq("/aws/lambda/ordering-fn"), anyString(), anyString());
+        inOrder.verify(logStreamer).ensureLogGroupAndStreamForAccount(
+                eq("000000000000"), eq("/aws/lambda/ordering-fn"), anyString(), anyString());
         inOrder.verify(dockerClient, atLeastOnce()).execCreateCmd("container-123");
     }
 
@@ -1539,7 +1827,7 @@ class ContainerLauncherTest {
 
     @Test
     void launchFunction_extensionDiscovery_filtersNonExecutableAndNestedEntries() throws Exception {
-        var entries = new java.util.LinkedHashMap<String, Boolean>();
+        LinkedHashMap<String, Boolean> entries = new LinkedHashMap<>();
         entries.put("lambda-adapter", true);           // direct child, executable: launched
         entries.put("README.md", false);                // direct child, not executable: skipped
         entries.put("nested/inner-binary", true);        // nested (not a direct child): skipped

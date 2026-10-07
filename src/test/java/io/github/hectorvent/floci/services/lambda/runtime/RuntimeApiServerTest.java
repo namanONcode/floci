@@ -109,6 +109,54 @@ class RuntimeApiServerTest {
         assertTrue(response.body().contains("key"));
     }
 
+    @Test
+    @Timeout(10)
+    void nextEndpoint_emitsClientContextHeaderOnlyWhenPresent() throws Exception {
+        String clientContext = "{\"custom\":{\"traceparent\":\"00-abc-def-01\"}}";
+        PendingInvocation withContext = new PendingInvocation(
+                "req-ctx", "{}".getBytes(), System.currentTimeMillis() + 60_000,
+                "arn:aws:lambda:us-east-1:000000000000:function:test",
+                new CompletableFuture<>());
+        withContext.setClientContext(clientContext);
+        server.enqueue(withContext);
+
+        HttpRequest next = HttpRequest.newBuilder()
+                .uri(URI.create("http://localhost:" + port + "/2018-06-01/runtime/invocation/next"))
+                .GET().build();
+        HttpResponse<String> first = httpClient.send(next, HttpResponse.BodyHandlers.ofString());
+        assertEquals(clientContext, first.headers().firstValue("Lambda-Runtime-Client-Context").orElse(null));
+
+        server.enqueue(new PendingInvocation(
+                "req-noctx", "{}".getBytes(), System.currentTimeMillis() + 60_000,
+                "arn:aws:lambda:us-east-1:000000000000:function:test",
+                new CompletableFuture<>()));
+        HttpResponse<String> second = httpClient.send(next, HttpResponse.BodyHandlers.ofString());
+        assertTrue(second.headers().firstValue("Lambda-Runtime-Client-Context").isEmpty());
+    }
+
+    @Test
+    @Timeout(10)
+    void nextEndpoint_startsDeadlineWhenInvocationIsDispatched() throws Exception {
+        long queuedDeadline = System.currentTimeMillis() + 1_000;
+        PendingInvocation invocation = new PendingInvocation(
+                "req-deadline", "{}".getBytes(), queuedDeadline,
+                "arn:aws:lambda:us-east-1:000000000000:function:test",
+                new CompletableFuture<>());
+        server.enqueue(invocation);
+
+        Thread.sleep(300);
+        HttpResponse<String> response = httpClient.send(HttpRequest.newBuilder()
+                        .uri(URI.create("http://localhost:" + port
+                                + "/2018-06-01/runtime/invocation/next"))
+                        .GET().build(),
+                HttpResponse.BodyHandlers.ofString());
+
+        long advertisedDeadline = Long.parseLong(response.headers()
+                .firstValue("Lambda-Runtime-Deadline-Ms").orElseThrow());
+        assertTrue(advertisedDeadline >= queuedDeadline + 200,
+                "queueing and cold-start time must not consume the handler timeout");
+    }
+
     /**
      * Regression: an Invoke with no body (e.g. {@code aws lambda invoke} without
      * {@code --payload}) reaches the /next handler as a {@code byte[0]}, not
@@ -231,6 +279,227 @@ class RuntimeApiServerTest {
         assertEquals("application/json",
                 response.headers().firstValue("Content-Type").orElse(""));
         assertEquals("OK", new JsonObject(response.body()).getString("status"));
+    }
+
+    /**
+     * Regression for #3314: the Python and Node.js runtime interface clients never send
+     * {@code Lambda-Runtime-Function-Error-Type} on {@code /invocation/{id}/error} at all, so
+     * FunctionError must not depend on that header being present or on its value - it is
+     * always {@code Unhandled}, matching AWS for every runtime.
+     */
+    @Test
+    @Timeout(15)
+    void errorEndpoint_reportsUnhandledEvenWithoutTheErrorTypeHeader() throws Exception {
+        assertErrorEndpointReportsUnhandled("req-no-header", null);
+    }
+
+    /**
+     * The Java RIC does send the header, with its own vocabulary ({@code
+     * Runtime.UserException}); an earlier, narrower {@code contains("Runtime")} heuristic
+     * happened to key on exactly that value. Must still be {@code Unhandled}.
+     */
+    @Test
+    @Timeout(15)
+    void errorEndpoint_reportsUnhandledWithARuntimeVocabularyHeader() throws Exception {
+        assertErrorEndpointReportsUnhandled("req-runtime-header", "Runtime.UserException");
+    }
+
+    /**
+     * A plain error type with no "Runtime" substring (e.g. a Python {@code ValueError}) used to
+     * fall through the old heuristic to the legacy {@code Handled} value. AWS reports
+     * {@code Unhandled} regardless.
+     */
+    @Test
+    @Timeout(15)
+    void errorEndpoint_reportsUnhandledWithAPlainErrorTypeHeader() throws Exception {
+        assertErrorEndpointReportsUnhandled("req-plain-header", "ValueError");
+    }
+
+    private void assertErrorEndpointReportsUnhandled(String requestId, String errorTypeHeader) throws Exception {
+        CompletableFuture<InvokeResult> resultFuture = new CompletableFuture<>();
+        PendingInvocation invocation = new PendingInvocation(
+                requestId, "{}".getBytes(), System.currentTimeMillis() + 60_000,
+                "arn:aws:lambda:us-east-1:000000000000:function:test", resultFuture);
+        server.enqueue(invocation);
+        httpClient.send(HttpRequest.newBuilder()
+                        .uri(URI.create("http://localhost:" + port + "/2018-06-01/runtime/invocation/next"))
+                        .GET().build(),
+                HttpResponse.BodyHandlers.ofString());
+
+        HttpRequest.Builder errorRequest = HttpRequest.newBuilder()
+                .uri(URI.create("http://localhost:" + port
+                        + "/2018-06-01/runtime/invocation/" + requestId + "/error"))
+                .POST(HttpRequest.BodyPublishers.ofString("{\"errorMessage\":\"boom\",\"errorType\":\"X\"}"));
+        if (errorTypeHeader != null) {
+            errorRequest.header("Lambda-Runtime-Function-Error-Type", errorTypeHeader);
+        }
+        httpClient.send(errorRequest.build(), HttpResponse.BodyHandlers.ofString());
+
+        InvokeResult result = resultFuture.get(2, TimeUnit.SECONDS);
+        assertEquals("Unhandled", result.getFunctionError());
+        assertTrue(new String(result.getPayload()).contains("boom"));
+    }
+
+    /**
+     * Regression for #3314: a runtime that reports a failed initialization (module not
+     * importable, handler missing, a syntax error, ...) via {@code /runtime/init/error} never
+     * calls {@code /next} - it exits immediately. The invocation that triggered this cold
+     * start must fail with the runtime's own reported payload and {@code Unhandled}, not sit
+     * until the function timeout to be told {@code Function.TimedOut}.
+     */
+    @Test
+    @Timeout(15)
+    void initErrorEndpoint_failsThePendingInvocationAndCondemnsTheEnvironment() throws Exception {
+        CompletableFuture<InvokeResult> resultFuture = new CompletableFuture<>();
+        PendingInvocation invocation = new PendingInvocation(
+                "req-init-error", "{}".getBytes(), System.currentTimeMillis() + 60_000,
+                "arn:aws:lambda:us-east-1:000000000000:function:test", resultFuture);
+        server.enqueue(invocation);
+
+        assertFalse(resultFuture.isDone(), "invocation must still be queued, waiting for a /next poller");
+
+        HttpResponse<String> initErrorResponse = httpClient.send(HttpRequest.newBuilder()
+                        .uri(URI.create("http://localhost:" + port + "/2018-06-01/runtime/init/error"))
+                        .header("Lambda-Runtime-Function-Error-Type", "Runtime.ImportModuleError")
+                        .POST(HttpRequest.BodyPublishers.ofString(
+                                "{\"errorMessage\":\"Unable to import module\","
+                                        + "\"errorType\":\"Runtime.ImportModuleError\"}"))
+                        .build(),
+                HttpResponse.BodyHandlers.ofString());
+        assertEquals(202, initErrorResponse.statusCode());
+
+        InvokeResult result = resultFuture.get(2, TimeUnit.SECONDS);
+        assertEquals("Unhandled", result.getFunctionError());
+        assertTrue(new String(result.getPayload()).contains("Unable to import module"));
+        assertTrue(server.isFaulted(), "a condemned environment must never be pooled or reused");
+
+        CompletableFuture<InvokeResult> secondFuture = new CompletableFuture<>();
+        server.enqueue(new PendingInvocation(
+                "req-after-init-error", "{}".getBytes(), System.currentTimeMillis() + 60_000,
+                "arn:aws:lambda:us-east-1:000000000000:function:test", secondFuture));
+        assertEquals("Unhandled", secondFuture.get(2, TimeUnit.SECONDS).getFunctionError(),
+                "a condemned environment must fail new work immediately, not queue it to a dead runtime");
+    }
+
+    /**
+     * Regression: production enqueues in the opposite order used above. {@code
+     * LambdaExecutorService.executeSync()} calls {@code warmPool.acquire(fn)} first, which
+     * launches the container, and only creates/enqueues the {@code PendingInvocation} once
+     * that returns - so a cold-start init error can fault this server before any invocation
+     * exists for {@code handleInitError} to strand. A later {@code enqueue()} on the now-faulted
+     * server must still return the runtime's own reported error, not the generic
+     * {@code ContainerStopped} fallback.
+     */
+    @Test
+    @Timeout(15)
+    void initErrorBeforeEnqueue_completesTheLaterInvocationWithTheOriginalInitError() throws Exception {
+        HttpResponse<String> initErrorResponse = httpClient.send(HttpRequest.newBuilder()
+                        .uri(URI.create("http://localhost:" + port + "/2018-06-01/runtime/init/error"))
+                        .header("Lambda-Runtime-Function-Error-Type", "Runtime.ImportModuleError")
+                        .POST(HttpRequest.BodyPublishers.ofString(
+                                "{\"errorMessage\":\"Unable to import module\","
+                                        + "\"errorType\":\"Runtime.ImportModuleError\"}"))
+                        .build(),
+                HttpResponse.BodyHandlers.ofString());
+        assertEquals(202, initErrorResponse.statusCode());
+        assertTrue(server.isFaulted(), "a condemned environment must never be pooled or reused");
+
+        CompletableFuture<InvokeResult> resultFuture = new CompletableFuture<>();
+        server.enqueue(new PendingInvocation(
+                "req-init-error-cold-start", "{}".getBytes(), System.currentTimeMillis() + 60_000,
+                "arn:aws:lambda:us-east-1:000000000000:function:test", resultFuture));
+
+        InvokeResult result = resultFuture.get(2, TimeUnit.SECONDS);
+        assertEquals("Unhandled", result.getFunctionError());
+        String payload = new String(result.getPayload());
+        assertTrue(payload.contains("Runtime.ImportModuleError"), payload);
+        assertTrue(payload.contains("Unable to import module"), payload);
+        assertFalse(payload.contains("ContainerStopped"), payload);
+    }
+
+    /**
+     * Regression for #3314: nothing inside the runtime can report its own process dying (a
+     * stray {@code sys.exit}/{@code process.exit}/{@code System.exit} in the handler, or any
+     * other crash), so {@code ContainerLauncher}'s Docker exit watcher calls this directly.
+     * The in-flight invocation must fail immediately with {@code Runtime.ExitError}, not wait
+     * out the full function timeout for {@code Function.TimedOut}.
+     */
+    @Test
+    @Timeout(15)
+    void handleRuntimeProcessExited_failsInFlightInvocationWithRuntimeExitError() throws Exception {
+        CompletableFuture<InvokeResult> resultFuture = new CompletableFuture<>();
+        PendingInvocation invocation = new PendingInvocation(
+                "req-exit", "{}".getBytes(), System.currentTimeMillis() + 60_000,
+                "arn:aws:lambda:us-east-1:000000000000:function:test", resultFuture);
+        server.enqueue(invocation);
+        httpClient.send(HttpRequest.newBuilder()
+                        .uri(URI.create("http://localhost:" + port + "/2018-06-01/runtime/invocation/next"))
+                        .GET().build(),
+                HttpResponse.BodyHandlers.ofString());
+        assertEquals(1, server.inFlightSize(), "invocation must be in flight before the process exits");
+
+        server.handleRuntimeProcessExited(1);
+
+        InvokeResult result = resultFuture.get(2, TimeUnit.SECONDS);
+        assertEquals("Unhandled", result.getFunctionError());
+        String payload = new String(result.getPayload());
+        assertTrue(payload.contains("Runtime.ExitError"), payload);
+        assertTrue(payload.contains("req-exit"), payload);
+        assertTrue(payload.contains("exit status 1"), payload);
+        assertTrue(server.isFaulted());
+    }
+
+    /**
+     * Regression: mirrors {@code initErrorBeforeEnqueue_completesTheLaterInvocationWithTheOriginal
+     * InitError} for the process-exit path. {@code warmPool.acquire(fn)} arms {@code
+     * ContainerLauncher}'s Docker exit watcher while it launches the container, before {@code
+     * LambdaExecutorService.executeSync()} creates and enqueues the {@code PendingInvocation} -
+     * so an immediate crash can fault this server with nothing yet in {@code pendingQueue}/{@code
+     * inFlight} for {@code handleRuntimeProcessExited} to strand. The invocation enqueued
+     * afterward must still surface {@code Runtime.ExitError}, not {@code ContainerStopped}.
+     */
+    @Test
+    @Timeout(15)
+    void processExitBeforeEnqueue_completesTheLaterInvocationWithRuntimeExitError() throws Exception {
+        server.handleRuntimeProcessExited(1);
+        assertTrue(server.isFaulted(), "a condemned environment must never be pooled or reused");
+
+        CompletableFuture<InvokeResult> resultFuture = new CompletableFuture<>();
+        server.enqueue(new PendingInvocation(
+                "req-exit-cold-start", "{}".getBytes(), System.currentTimeMillis() + 60_000,
+                "arn:aws:lambda:us-east-1:000000000000:function:test", resultFuture));
+
+        InvokeResult result = resultFuture.get(2, TimeUnit.SECONDS);
+        assertEquals("Unhandled", result.getFunctionError());
+        String payload = new String(result.getPayload());
+        assertTrue(payload.contains("Runtime.ExitError"), payload);
+        assertTrue(payload.contains("exit status 1"), payload);
+        assertFalse(payload.contains("ContainerStopped"), payload);
+    }
+
+    /**
+     * An intentional teardown ({@code quiesce()}, which sets {@code stopped}) always runs
+     * before {@code ContainerLauncher} actually stops the container - so the exit event that
+     * same teardown causes must not be reinterpreted as a crash and re-fail an invocation
+     * {@code quiesce()} already completed with {@code ContainerStopped}.
+     */
+    @Test
+    @Timeout(15)
+    void handleRuntimeProcessExited_isANoOpAfterIntentionalTeardown() throws Exception {
+        CompletableFuture<InvokeResult> resultFuture = new CompletableFuture<>();
+        PendingInvocation invocation = new PendingInvocation(
+                "req-teardown", "{}".getBytes(), System.currentTimeMillis() + 60_000,
+                "arn:aws:lambda:us-east-1:000000000000:function:test", resultFuture);
+        server.enqueue(invocation);
+
+        server.quiesce();
+        InvokeResult quiesceResult = resultFuture.get(2, TimeUnit.SECONDS);
+
+        server.handleRuntimeProcessExited(0);
+
+        assertEquals(quiesceResult.getFunctionError(), resultFuture.get().getFunctionError());
+        assertTrue(new String(resultFuture.get().getPayload()).contains("ContainerStopped"),
+                "must keep quiesce()'s ContainerStopped result, not overwrite it with Runtime.ExitError");
     }
 
     @Test
@@ -870,6 +1139,18 @@ class RuntimeApiServerTest {
         assertEquals(403, response.statusCode());
     }
 
+    /**
+     * Regression pin for #2573: the extension INVOKE fan-out fires when the runtime actually
+     * receives the invocation via /next, not at enqueue() time. Before the fix, enqueue() built
+     * and dispatched the event synchronously to whatever was in {@code extensions} at that exact
+     * moment, regardless of whether the runtime had polled yet; an internal extension (no
+     * {@code /opt/extensions} footprint, so nothing ever waits for its registration) commonly
+     * registers concurrently with or after that call and misses the event entirely, with nothing
+     * later reconsidering it. The distinguishing assertion is the one right after enqueue():
+     * on unfixed code the event is already delivered by that point (enqueue() dispatched it
+     * inline), so the test fails there; on fixed code nothing is delivered until /next is
+     * actually polled below.
+     */
     @Test
     @Timeout(15)
     void extensionEventNext_receivesInvokeEventWhenRuntimeInvocationEnqueued() throws Exception {
@@ -889,6 +1170,20 @@ class RuntimeApiServerTest {
                 "arn:aws:lambda:us-east-1:000000000000:function:test",
                 new CompletableFuture<>());
         server.enqueue(invocation);
+
+        // The #2573 regression check: enqueue() alone must not deliver the INVOKE. Pre-fix,
+        // this is exactly where the event arrived (dispatched inline inside enqueue()).
+        Thread.sleep(300);
+        assertFalse(asyncNext.isDone(),
+                "enqueue() alone must not deliver INVOKE; delivery must wait for the runtime's own /next poll");
+
+        // The INVOKE fan-out now happens at sendInvocation() time, so nothing is delivered until
+        // the runtime itself polls for the next invocation.
+        HttpResponse<String> nextResponse = httpClient.send(HttpRequest.newBuilder()
+                        .uri(URI.create("http://localhost:" + port + "/2018-06-01/runtime/invocation/next"))
+                        .GET().build(),
+                HttpResponse.BodyHandlers.ofString());
+        assertEquals(200, nextResponse.statusCode());
 
         HttpResponse<String> response = asyncNext.get(2, TimeUnit.SECONDS);
         assertEquals(200, response.statusCode());
@@ -916,9 +1211,282 @@ class RuntimeApiServerTest {
                 "arn:aws:lambda:us-east-1:000000000000:function:test",
                 new CompletableFuture<>()));
 
+        // Drive the invocation through to the runtime, same as a real dispatch would, so this
+        // exercises the actual fan-out point rather than a poller that never arrives.
+        httpClient.send(HttpRequest.newBuilder()
+                        .uri(URI.create("http://localhost:" + port + "/2018-06-01/runtime/invocation/next"))
+                        .GET().build(),
+                HttpResponse.BodyHandlers.ofString());
+
         Thread.sleep(500);
         assertFalse(asyncNext.isDone(),
                 "extension not subscribed to INVOKE must not be woken by an invocation");
+    }
+
+    /**
+     * Case 3 of the #2573 fix: an extension that has registered but not yet issued its first
+     * /event/next when the invocation dispatches must still receive it. notifyExtensionsOfInvoke()
+     * offers the event into the extension's pendingEvents queue rather than dropping it when
+     * there is no parked context to write to directly.
+     */
+    @Test
+    @Timeout(15)
+    void notifyExtensionsOfInvoke_extensionRegisteredButNotYetPolling_queuesEventForLaterPoll()
+            throws Exception {
+        String extensionId = registerExtension("lambda-adapter", "INVOKE");
+
+        PendingInvocation invocation = new PendingInvocation(
+                "req-not-yet-polling", "{}".getBytes(), System.currentTimeMillis() + 60_000,
+                "arn:aws:lambda:us-east-1:000000000000:function:test",
+                new CompletableFuture<>());
+        server.enqueue(invocation);
+
+        HttpResponse<String> next = httpClient.send(HttpRequest.newBuilder()
+                        .uri(URI.create("http://localhost:" + port + "/2018-06-01/runtime/invocation/next"))
+                        .GET().build(),
+                HttpResponse.BodyHandlers.ofString());
+        assertEquals(200, next.statusCode());
+
+        // The extension's first poll arrives after the dispatch already happened, so it must find
+        // the event waiting rather than parking forever.
+        HttpResponse<String> eventResponse = httpClient.send(HttpRequest.newBuilder()
+                        .uri(URI.create("http://localhost:" + port + "/2020-01-01/extension/event/next"))
+                        .header("Lambda-Extension-Identifier", extensionId)
+                        .GET().build(),
+                HttpResponse.BodyHandlers.ofString());
+        assertEquals(200, eventResponse.statusCode());
+        JsonObject body = new JsonObject(eventResponse.body());
+        assertEquals("INVOKE", body.getString("eventType"));
+        assertEquals("req-not-yet-polling", body.getString("requestId"));
+    }
+
+    /**
+     * Case 4 of the #2573 fix: the common warm-container path, where the runtime is already
+     * parked on /next and the extension already parked on /event/next when enqueue() runs.
+     * Exercises the deferred-dispatch branch (enqueue()'s vertx.runOnContext callback) rather
+     * than the synchronous NEXT_PATH handler, and confirms relocating the fan-out to
+     * sendInvocation() did not regress this case.
+     */
+    @Test
+    @Timeout(15)
+    void notifyExtensionsOfInvoke_warmPath_runtimeAndExtensionBothParked_deliversBoth()
+            throws Exception {
+        CompletableFuture<HttpResponse<String>> asyncNext = httpClient.sendAsync(HttpRequest.newBuilder()
+                        .uri(URI.create("http://localhost:" + port + "/2018-06-01/runtime/invocation/next"))
+                        .GET().build(),
+                HttpResponse.BodyHandlers.ofString());
+        awaitWaitingContexts(1);
+
+        String extensionId = registerExtension("lambda-adapter", "INVOKE");
+        CompletableFuture<HttpResponse<String>> asyncExtensionNext = pollExtensionEventNext(extensionId);
+
+        PendingInvocation invocation = new PendingInvocation(
+                "req-warm-path", "{\"warm\":true}".getBytes(), System.currentTimeMillis() + 60_000,
+                "arn:aws:lambda:us-east-1:000000000000:function:test",
+                new CompletableFuture<>());
+        server.enqueue(invocation);
+
+        HttpResponse<String> runtimeResponse = asyncNext.get(2, TimeUnit.SECONDS);
+        assertEquals(200, runtimeResponse.statusCode());
+        assertEquals("req-warm-path",
+                runtimeResponse.headers().firstValue("Lambda-Runtime-Aws-Request-Id").orElse(""));
+
+        HttpResponse<String> extensionResponse = asyncExtensionNext.get(2, TimeUnit.SECONDS);
+        assertEquals(200, extensionResponse.statusCode());
+        JsonObject body = new JsonObject(extensionResponse.body());
+        assertEquals("INVOKE", body.getString("eventType"));
+        assertEquals("req-warm-path", body.getString("requestId"));
+    }
+
+    /**
+     * Case 2 of the #2573 fix, and the maintainer's stated requirement: sendInvocation()'s
+     * onFailure requeues the invocation for redelivery to a second /next poller. Since
+     * notifyExtensionsOfInvoke() is gated on the write's onSuccess, the failed first attempt must
+     * not have fired it. Only the second, successful write should, so the extension sees exactly
+     * one INVOKE for the requestId, never two. Forces the first write to fail the same way
+     * {@link #sendInvocation_writeFails_requeuesAndClearsInFlight} does, then counts
+     * beforeSendInvocationWrite calls to prove the redelivery actually happened rather than the
+     * assertions passing by coincidence.
+     */
+    @Test
+    @Timeout(15)
+    void notifyExtensionsOfInvoke_requeuedOnWriteFailure_deliversInvokeExactlyOnce() throws Exception {
+        java.util.concurrent.atomic.AtomicInteger sendInvocationCalls =
+                new java.util.concurrent.atomic.AtomicInteger();
+        java.util.concurrent.atomic.AtomicReference<io.vertx.ext.web.RoutingContext> parkedCtx =
+                new java.util.concurrent.atomic.AtomicReference<>();
+        server.stop().get(5, TimeUnit.SECONDS);
+        port = findFreePort();
+        server = new RuntimeApiServer(vertx, port) {
+            @Override protected void afterEnqueueDispatchLockReleased(io.vertx.ext.web.RoutingContext waitingCtx) {
+                parkedCtx.set(waitingCtx);
+            }
+            @Override protected void beforeSendInvocationWrite(String requestId) {
+                if (sendInvocationCalls.incrementAndGet() == 1) {
+                    // Simulate the client disconnecting between dispatch commitment and the
+                    // write landing, forcing sendInvocation()'s write to fail.
+                    io.vertx.ext.web.RoutingContext ctx = parkedCtx.get();
+                    if (ctx != null && !ctx.response().ended()) {
+                        ctx.response().setStatusCode(500).end();
+                    }
+                }
+            }
+        };
+        server.start().get(5, TimeUnit.SECONDS);
+
+        String extensionId = registerExtension("lambda-adapter", "INVOKE");
+        CompletableFuture<HttpResponse<String>> asyncExtensionNext = pollExtensionEventNext(extensionId);
+
+        httpClient.sendAsync(HttpRequest.newBuilder()
+                        .uri(URI.create("http://localhost:" + port + "/2018-06-01/runtime/invocation/next"))
+                        .GET().build(),
+                HttpResponse.BodyHandlers.ofString());
+        awaitWaitingContexts(1);
+
+        PendingInvocation invocation = new PendingInvocation(
+                "req-no-duplicate", "{}".getBytes(), System.currentTimeMillis() + 60_000,
+                "arn:aws:lambda:us-east-1:000000000000:function:test",
+                new CompletableFuture<>());
+        server.enqueue(invocation);
+
+        // Wait for the forced-failed dispatch to requeue.
+        long deadline = System.currentTimeMillis() + 5000;
+        while (System.currentTimeMillis() < deadline && server.pendingQueueSize() == 0) {
+            Thread.sleep(10);
+        }
+        assertEquals(1, server.pendingQueueSize(),
+                "invocation must be requeued after the forced write failure");
+
+        // A second poller picks up the requeued invocation; this write succeeds.
+        HttpResponse<String> secondNext = httpClient.send(HttpRequest.newBuilder()
+                        .uri(URI.create("http://localhost:" + port + "/2018-06-01/runtime/invocation/next"))
+                        .GET().build(),
+                HttpResponse.BodyHandlers.ofString());
+        assertEquals(200, secondNext.statusCode());
+
+        assertEquals(2, sendInvocationCalls.get(),
+                "sendInvocation must have been attempted twice: the failed original, and the redelivery");
+
+        HttpResponse<String> extensionResponse = asyncExtensionNext.get(2, TimeUnit.SECONDS);
+        assertEquals(200, extensionResponse.statusCode());
+        assertEquals("req-no-duplicate", new JsonObject(extensionResponse.body()).getString("requestId"));
+
+        // No second INVOKE should be waiting behind the one just delivered.
+        CompletableFuture<HttpResponse<String>> secondExtensionPoll = httpClient.sendAsync(
+                HttpRequest.newBuilder()
+                        .uri(URI.create("http://localhost:" + port + "/2020-01-01/extension/event/next"))
+                        .header("Lambda-Extension-Identifier", extensionId)
+                        .GET().build(),
+                HttpResponse.BodyHandlers.ofString());
+        Thread.sleep(300);
+        assertFalse(secondExtensionPoll.isDone(),
+                "no duplicate INVOKE should be queued for the same requestId after redelivery");
+    }
+
+    /**
+     * Case 5 of the #2573 fix: notifyExtensionsOfInvoke()'s own {@code stopped} check, read under
+     * the same lock as quiesce()'s sweep. sendInvocation()'s write is asynchronous, so quiesce()
+     * can run to completion (setting stopped=true and, since this extension is never parked,
+     * queuing its SHUTDOWN straight into pendingEvents) while the runtime write is still in
+     * flight. When that write's onSuccess finally fires, notifyExtensionsOfInvoke() must see
+     * stopped=true and skip, or the extension would receive an INVOKE queued behind the SHUTDOWN
+     * for a container that has already been told to stop. Freezes both sides on the seams the
+     * other quiesce-race tests in this class use, so the write completes only after quiesce's
+     * lock section has already committed stopped=true and the SHUTDOWN offer.
+     */
+    @Test
+    @Timeout(15)
+    void notifyExtensionsOfInvoke_racedByQuiesce_doesNotQueueInvokeBehindShutdown() throws Exception {
+        CountDownLatch writeEntered = new CountDownLatch(1);
+        CountDownLatch releaseWrite = new CountDownLatch(1);
+        CountDownLatch quiesceReachedHook = new CountDownLatch(1);
+        CountDownLatch releaseQuiesce = new CountDownLatch(1);
+
+        server.stop().get(5, TimeUnit.SECONDS);
+        port = findFreePort();
+        server = new RuntimeApiServer(vertx, port) {
+            @Override protected void beforeSendInvocationWrite(String requestId) {
+                writeEntered.countDown();
+                try { releaseWrite.await(5, TimeUnit.SECONDS); } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+            @Override protected void afterQuiesceStoppedFlagSet() {
+                quiesceReachedHook.countDown();
+                try { releaseQuiesce.await(5, TimeUnit.SECONDS); } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        };
+        server.start().get(5, TimeUnit.SECONDS);
+
+        // Registered but never polls /event/next, so quiesce() offers SHUTDOWN straight into
+        // pendingEvents (inside its own lock) rather than dispatching to a parked context.
+        String extensionId = registerExtension("adapter", "INVOKE", "SHUTDOWN");
+
+        httpClient.sendAsync(HttpRequest.newBuilder()
+                        .uri(URI.create("http://localhost:" + port + "/2018-06-01/runtime/invocation/next"))
+                        .GET().build(),
+                HttpResponse.BodyHandlers.ofString());
+        awaitWaitingContexts(1);
+
+        PendingInvocation invocation = new PendingInvocation(
+                "req-race-shutdown", "{}".getBytes(), System.currentTimeMillis() + 60_000,
+                "arn:aws:lambda:us-east-1:000000000000:function:test",
+                new CompletableFuture<>());
+        server.enqueue(invocation);
+        assertTrue(writeEntered.await(5, TimeUnit.SECONDS),
+                "sendInvocation should have reached the write hook");
+
+        CompletableFuture<Void> quiesceDone = CompletableFuture.runAsync(server::quiesce);
+        assertTrue(quiesceReachedHook.await(5, TimeUnit.SECONDS),
+                "quiesce should have set stopped=true and queued SHUTDOWN before releasing its lock");
+
+        // Let the runtime write finish now: its onSuccess fires notifyExtensionsOfInvoke() while
+        // quiesce is still frozen just past committing stopped=true.
+        releaseWrite.countDown();
+        Thread.sleep(200);
+        releaseQuiesce.countDown();
+        quiesceDone.get(5, TimeUnit.SECONDS);
+
+        // Only the SHUTDOWN quiesce queued should be there, no INVOKE snuck in behind it.
+        HttpResponse<String> first = httpClient.send(HttpRequest.newBuilder()
+                        .uri(URI.create("http://localhost:" + port + "/2020-01-01/extension/event/next"))
+                        .header("Lambda-Extension-Identifier", extensionId)
+                        .GET().build(),
+                HttpResponse.BodyHandlers.ofString());
+        assertEquals(200, first.statusCode());
+        assertEquals("SHUTDOWN", new JsonObject(first.body()).getString("eventType"));
+
+        HttpResponse<String> second = httpClient.send(HttpRequest.newBuilder()
+                        .uri(URI.create("http://localhost:" + port + "/2020-01-01/extension/event/next"))
+                        .header("Lambda-Extension-Identifier", extensionId)
+                        .GET().build(),
+                HttpResponse.BodyHandlers.ofString());
+        assertEquals(204, second.statusCode(),
+                "no INVOKE should have been queued behind the SHUTDOWN once the environment stopped");
+    }
+
+    /**
+     * Case 6 of the #2573 fix: pins the one intentional behavior change as deliberate. If the
+     * runtime never polls /next, the extension must never see an INVOKE, matching real AWS, where
+     * delivery is tied to the runtime signaling readiness for the next invocation.
+     */
+    @Test
+    @Timeout(15)
+    void notifyExtensionsOfInvoke_neverFiresIfRuntimeNeverPolls() throws Exception {
+        String extensionId = registerExtension("lambda-adapter", "INVOKE");
+
+        CompletableFuture<HttpResponse<String>> asyncNext = pollExtensionEventNext(extensionId);
+
+        server.enqueue(new PendingInvocation(
+                "req-runtime-never-polls", "{}".getBytes(), System.currentTimeMillis() + 60_000,
+                "arn:aws:lambda:us-east-1:000000000000:function:test",
+                new CompletableFuture<>()));
+
+        Thread.sleep(500);
+        assertFalse(asyncNext.isDone(),
+                "extension must not receive INVOKE until the runtime actually polls /next");
     }
 
     @Test

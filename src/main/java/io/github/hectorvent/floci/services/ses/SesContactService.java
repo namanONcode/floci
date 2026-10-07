@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.ses;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.ses.model.Contact;
@@ -12,15 +13,19 @@ import io.github.hectorvent.floci.services.ses.model.TopicPreference;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
+import io.github.hectorvent.floci.services.ses.model.ListManagementOptions;
 
 import java.time.Clock;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Comparator;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
+import java.util.function.UnaryOperator;
 import java.util.Set;
 import java.util.regex.Pattern;
 
@@ -31,9 +36,9 @@ import java.util.regex.Pattern;
  * <p>New facet: a multi-store domain — one service owns both stores and the locks that serialize
  * them (contact create/update against contact-list deletion), collapsing two SesService constructor
  * arguments into one. It also owns the list-management contact behaviour used during a send
- * ({@link #getOrAutoCreateContact}, {@link #isListManagementOptedOut}, {@link #unsubscribeContact});
- * the facade's send orchestration ({@code collectListManagementOptOuts}) stays in {@link SesService}
- * and calls into this service, keeping the shared {@code extractEmailAddress} send helper there.
+ * ({@link #getOrAutoCreateContact}, {@link #isListManagementOptedOut}, {@link #unsubscribeContact}),
+ * including {@link #collectListManagementOptOuts}, which resolves a send's opted-out recipients
+ * with the facade's address extractor injected as a callback.
  */
 @ApplicationScoped
 public class SesContactService {
@@ -103,6 +108,54 @@ public class SesContactService {
     public ContactList getContactList(String name, String region) {
         return contactListStore.get(contactListKey(region, name))
                 .orElseThrow(() -> contactListNotFound(name));
+    }
+
+    public List<Tag> listTags(String name, String region) {
+        ContactList list = contactListStore.get(contactListKey(region, name))
+                .orElseThrow(() -> tagTargetNotFound(name));
+        return new ArrayList<>(list.getTags());
+    }
+
+    /**
+     * Merges the incoming tags into the stored list. The lookup and write share the mutation lock
+     * used by deletion, so tagging can't resurrect a concurrently deleted list or overwrite a
+     * concurrent mutation with a stale object.
+     */
+    public void tag(String name, String region, List<Tag> newTags) {
+        String key = contactListKey(region, name);
+        synchronized (contactMutationLock) {
+            ContactList list = contactListStore.get(key).orElseThrow(() -> tagTargetNotFound(name));
+            list.setTags(SesTags.merge(list.getTags(), newTags));
+            contactListStore.put(key, list);
+        }
+        LOG.infov("Tagged SES contact list: {0} in region {1} (+{2} tags)", name, region, newTags.size());
+    }
+
+    public void untag(String name, String region, List<String> tagKeys) {
+        String key = contactListKey(region, name);
+        synchronized (contactMutationLock) {
+            ContactList list = contactListStore.get(key).orElseThrow(() -> tagTargetNotFound(name));
+            Set<String> toRemove = new HashSet<>(tagKeys);
+            // Copy-on-write: the stored list may be immutable, and unlocked readers iterate it.
+            List<Tag> remaining = new ArrayList<>(list.getTags());
+            remaining.removeIf(t -> toRemove.contains(t.key()));
+            list.setTags(remaining);
+            contactListStore.put(key, list);
+        }
+        LOG.infov("Untagged SES contact list: {0} in region {1} (-{2} keys)", name, region, tagKeys.size());
+    }
+
+    private static AwsException tagTargetNotFound(String name) {
+        // The tag endpoints use AWS's "No ContactList present with name" wording
+        // (probe-confirmed), unlike the CRUD "List with name: X doesn't exist."
+        return new AwsException("NotFoundException",
+                "No ContactList present with name: " + name, 404);
+    }
+
+    public PaginatedResult<ContactList> listContactLists(String region, SesListPaging paging, Integer pageSize,
+                                                         String nextToken) {
+        return paging.page(region, listContactLists(region), ContactList::getContactListName, pageSize,
+                nextToken);
     }
 
     public List<ContactList> listContactLists(String region) {
@@ -305,14 +358,90 @@ public class SesContactService {
         return new ContactWithList(contact, list);
     }
 
+    public record ContactPage(PaginatedResult<Contact> contacts, ContactList list) {
+    }
+
+    /** A ListContacts {@code Filter}; {@code topicFilter} is null when the request has none. */
+    public record ContactFilter(String filteredStatus, TopicFilter topicFilter) {
+    }
+
+    public record TopicFilter(String topicName, boolean useDefaultIfPreferenceUnavailable) {
+    }
+
+    /**
+     * SES checks the status enum, then the page size, then the filter's shape, then the token, the
+     * list and last the topic. SES cuts the page before it filters, so its filtered pages come back
+     * short or empty; Floci filters first and returns exact pages. The token is a position in the
+     * list, not bound to the filter, so SES and Floci both take one across filters.
+     */
+    public ContactPage listContacts(String listName, String region, SesListPaging paging, Integer pageSize,
+                                    String nextToken, ContactFilter filter) {
+        if (filter != null && filter.filteredStatus() != null
+                && !SUBSCRIPTION_STATUSES.contains(filter.filteredStatus())) {
+            throw validationError("filter.filteredStatus",
+                    "Member must satisfy enum value set: [OPT_OUT, OPT_IN]");
+        }
+        // Validated here as well as in page() so the size error wins over the filter's shape.
+        paging.pageSize(pageSize);
+        if (filter != null) {
+            if (filter.filteredStatus() == null) {
+                throw new AwsException("BadRequestException", "Invalid FilteredStatus <null>", 400);
+            }
+            if (filter.topicFilter() != null && (filter.topicFilter().topicName() == null
+                    || filter.topicFilter().topicName().isBlank())) {
+                throw new AwsException("BadRequestException", "TopicName can't be blank in TopicFilter.", 400);
+            }
+        }
+        ContactList list = contactListStore.get(contactListKey(region, listName)).orElse(null);
+        String topicName = filter == null || filter.topicFilter() == null ? null : filter.topicFilter().topicName();
+        boolean topicFound = topicName == null || (list != null && defaultTopicStatus(list, topicName) != null);
+        List<Contact> contacts = list == null || !topicFound ? List.of()
+                : contactsOf(listName, region).stream().filter(c -> matchesFilter(c, list, filter)).toList();
+        PaginatedResult<Contact> page = paging.page(region, contacts, Contact::getEmailAddress, pageSize,
+                nextToken);
+        if (list == null) {
+            throw contactListNotFound(listName);
+        }
+        if (!topicFound) {
+            throw new AwsException("NotFoundException",
+                    "List: " + listName + " doesn't contain Topic: " + topicName, 404);
+        }
+        return new ContactPage(page, list);
+    }
+
+    // UnsubscribeAll is OPT_OUT for every topic. Without a topic it is the only thing a status
+    // matches; with one, an explicit preference decides, and the topic default only when asked for.
+    private boolean matchesFilter(Contact contact, ContactList list, ContactFilter filter) {
+        if (filter == null) {
+            return true;
+        }
+        TopicFilter topicFilter = filter.topicFilter();
+        String status;
+        if (contact.isUnsubscribeAll()) {
+            status = "OPT_OUT";
+        } else if (topicFilter == null) {
+            status = "OPT_IN";
+        } else if (explicitTopicStatus(contact, topicFilter.topicName()) != null) {
+            status = explicitTopicStatus(contact, topicFilter.topicName());
+        } else if (topicFilter.useDefaultIfPreferenceUnavailable()) {
+            status = defaultTopicStatus(list, topicFilter.topicName());
+        } else {
+            return false;
+        }
+        return filter.filteredStatus().equals(status);
+    }
+
     public ContactsWithList listContacts(String listName, String region) {
         ContactList list = getContactList(listName, region);
+        return new ContactsWithList(contactsOf(listName, region), list);
+    }
+
+    private List<Contact> contactsOf(String listName, String region) {
         String prefix = "contact::" + region + "::" + listName + "::";
-        List<Contact> contacts = contactStore.scan(k -> k.startsWith(prefix)).stream()
+        return contactStore.scan(k -> k.startsWith(prefix)).stream()
                 .sorted(Comparator.comparing(Contact::getEmailAddress,
                         Comparator.nullsFirst(Comparator.naturalOrder())))
                 .toList();
-        return new ContactsWithList(contacts, list);
     }
 
     public Contact updateContact(String listName, String emailAddress, List<TopicPreference> topicPreferences,
@@ -337,6 +466,32 @@ public class SesContactService {
             contactStore.put(key, existing);
         }
         LOG.infov("Updated SES contact {0} in list {1}", emailAddress, listName);
+        return existing;
+    }
+
+    /**
+     * Replaces a contact outright, as a contact-list import job's {@code PUT} action does. Probed
+     * against real AWS: an imported record is the whole contact, so preferences, attributes, and
+     * the unsubscribe flag it omits are cleared rather than merged, unlike
+     * {@link #updateContact}, whose topic preferences merge by name.
+     */
+    public Contact replaceContact(String listName, String emailAddress, List<TopicPreference> topicPreferences,
+                                  Boolean unsubscribeAll, String attributesData, String region) {
+        validateContactInput(listName, emailAddress, topicPreferences, region);
+        String key = contactKey(region, listName, emailAddress);
+        Contact existing;
+        // Same lock as create/update: a concurrent deleteContactList must not slip between the
+        // validation and the write.
+        synchronized (contactMutationLock) {
+            getContactList(listName, region);
+            existing = contactStore.get(key).orElseThrow(() -> contactNotFound(emailAddress));
+            existing.setTopicPreferences(topicPreferences);
+            existing.setUnsubscribeAll(unsubscribeAll != null && unsubscribeAll);
+            existing.setAttributesData(attributesData);
+            existing.setLastUpdatedTimestamp(Instant.now(clock));
+            contactStore.put(key, existing);
+        }
+        LOG.infov("Replaced SES contact {0} in list {1}", emailAddress, listName);
         return existing;
     }
 
@@ -580,5 +735,53 @@ public class SesContactService {
             prefs.add(new TopicPreference(topicName, status));
         }
         contact.setTopicPreferences(prefs);
+    }
+
+    /**
+     * Resolves the recipients suppressed by SES V2 {@code SendEmail} {@code ListManagementOptions}:
+     * for each envelope recipient that is opted out of the named contact list (or the given topic),
+     * marks the recipient with {@link SesRecipientEvents#REASON_LIST_OPT_OUT} so the shared send
+     * path drops it from the relay and the event classifier publishes a Bounce event, matching AWS
+     * ("SES will issue a bounce event for a message that is sent to an unsubscribed contact"). Returns an empty map when no
+     * {@code ListManagementOptions} was supplied. The display-name stripping is the facade's shared
+     * send helper, injected as {@code addressExtractor} so this service stays free of facade
+     * dependencies. Throws when the contact list does not exist, so a
+     * bad reference fails the whole send. A recipient that is not yet a contact is created
+     * automatically (matching AWS), then evaluated like any other contact.
+     */
+    public Map<String, String> collectListManagementOptOuts(Collection<String> addresses,
+                                                            ListManagementOptions listManagement, String region,
+                                                            UnaryOperator<String> addressExtractor) {
+        Objects.requireNonNull(addressExtractor, "addressExtractor is required");
+        if (listManagement == null || listManagement.contactListName() == null
+                || listManagement.contactListName().isBlank() || addresses == null || addresses.isEmpty()) {
+            return Map.of();
+        }
+        ContactList list = getContactList(listManagement.contactListName(), region);
+        String topicName = listManagement.topicName();
+        String effectiveTopic = (topicName == null || topicName.isBlank()) ? null : topicName;
+        // Fail fast on a topic that isn't defined on the list rather than silently skipping
+        // suppression (a typo would otherwise send to everyone). AWS does not document this, so the
+        // exact error is best-effort.
+        if (effectiveTopic != null && defaultTopicStatus(list, effectiveTopic) == null) {
+            throw new AwsException("BadRequestException",
+                    "Topic " + effectiveTopic + " does not exist in contact list "
+                            + list.getContactListName() + ".", 400);
+        }
+        Map<String, String> optOuts = new LinkedHashMap<>();
+        for (String address : addresses) {
+            if (address == null || address.isBlank() || optOuts.containsKey(address)) {
+                continue;
+            }
+            String email = addressExtractor.apply(address);
+            if (email == null || email.isBlank()) {
+                continue;
+            }
+            Contact contact = getOrAutoCreateContact(list, email, region);
+            if (isListManagementOptedOut(contact, list, effectiveTopic)) {
+                optOuts.put(address, SesRecipientEvents.REASON_LIST_OPT_OUT);
+            }
+        }
+        return optOuts;
     }
 }

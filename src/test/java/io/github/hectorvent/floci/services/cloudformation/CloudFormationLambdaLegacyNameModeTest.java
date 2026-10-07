@@ -3,7 +3,8 @@ package io.github.hectorvent.floci.services.cloudformation;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
-import io.github.hectorvent.floci.services.cloudformation.provisioners.CloudFormationResourceRegistry;
+import io.github.hectorvent.floci.services.cloudformation.provisioners.CfnResourceDispatcher;
+import io.github.hectorvent.floci.services.cloudformation.provisioners.LambdaCfnProvisioner;
 import io.github.hectorvent.floci.services.lambda.LambdaService;
 import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
 import org.junit.jupiter.api.BeforeEach;
@@ -39,7 +40,7 @@ class CloudFormationLambdaLegacyNameModeTest {
 
     private final ObjectMapper mapper = new ObjectMapper();
     private LambdaService lambdaService;
-    private CloudFormationResourceProvisioner provisioner;
+    private CfnResourceDispatcher provisioner;
 
     @BeforeEach
     void setUp() {
@@ -48,14 +49,10 @@ class CloudFormationLambdaLegacyNameModeTest {
                 .thenAnswer(inv -> lambdaFunction(inv.getArgument(1)));
         when(lambdaService.updateFunctionCode(anyString(), anyString(), anyMap()))
                 .thenAnswer(inv -> lambdaFunction(inv.getArgument(1)));
-        provisioner = new CloudFormationResourceProvisioner(
-                null, null, null, null, lambdaService, null, null, null, null, null,
-                null, null, null, null, null, null,
-                mapper,
-                null, null, null, null, null, null, null,
-                null, null, null, null, null, null, null,
-                null, null,
-                new CloudFormationResourceRegistry(List.of()));
+        provisioner = CfnProvisionerFixture.builder()
+                .lambda(lambdaService)
+                .objectMapper(mapper)
+                .build();
     }
 
     @Test
@@ -145,10 +142,10 @@ class CloudFormationLambdaLegacyNameModeTest {
                 "did not expect a warning for the unambiguous explicit-name case, got: " + messages);
     }
 
-    /** Collects the messages CloudFormationResourceProvisioner logs while {@code action} runs. */
+    /** Collects the messages LambdaCfnProvisioner logs while {@code action} runs. */
     private List<String> provisionerLogMessages(Runnable action) {
         java.util.logging.Logger logger =
-                java.util.logging.Logger.getLogger(CloudFormationResourceProvisioner.class.getName());
+                java.util.logging.Logger.getLogger(LambdaCfnProvisioner.class.getName());
         List<String> messages = new CopyOnWriteArrayList<>();
         java.util.logging.Handler handler = new java.util.logging.Handler() {
             @Override

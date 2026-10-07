@@ -26,11 +26,11 @@ class JwtClaimsWireFormatTest {
     @BeforeEach
     void setUp() {
         controller = new ApiGatewayExecuteController(
-                null, null, null,
+                null, null, null, null,
                 null, new ObjectMapper(), null,
                 null, null, null, null, new ApiGatewayExecuteRouteContext(), null,
-                null
-        );
+                null, null
+        , null, null);
     }
 
     private static String unsignedToken(String claimsJson) {

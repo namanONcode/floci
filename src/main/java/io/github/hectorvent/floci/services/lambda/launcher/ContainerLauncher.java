@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.lambda.launcher;
 
+import com.github.dockerjava.api.command.ExecCreateCmd;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
@@ -8,6 +9,7 @@ import io.github.hectorvent.floci.core.common.docker.ContainerLogStreamer;
 import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
 import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
 import io.github.hectorvent.floci.core.common.docker.DockerHostResolver;
+import io.github.hectorvent.floci.core.common.docker.RetryingTarCopier;
 import io.github.hectorvent.floci.core.common.docker.LaunchedContainerAwsEnv;
 import io.github.hectorvent.floci.services.ecr.registry.EcrRegistryManager;
 import io.github.hectorvent.floci.services.iam.model.SessionCreds;
@@ -19,6 +21,8 @@ import io.github.hectorvent.floci.services.lambda.runtime.RuntimeApiServer;
 import io.github.hectorvent.floci.services.lambda.runtime.RuntimeApiServerFactory;
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.exception.NotFoundException;
+import com.github.dockerjava.api.model.WaitResponse;
+import com.github.dockerjava.core.command.WaitContainerResultCallback;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -41,19 +45,19 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
-import java.security.cert.CertificateFactory;
-import java.security.cert.X509Certificate;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.HexFormat;
 import java.util.List;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Stream;
 
 /**
  * Starts and stops Docker containers for Lambda function execution.
@@ -71,8 +75,12 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
     private static final String TASK_DIR = "/var/task";
     private static final String RUNTIME_DIR = "/var/runtime";
 
-    /** Default base prefix for the containers and code volumes Lambda spawns. */
-    static final String DEFAULT_NAME_PREFIX = "floci";
+    /**
+     * Default base prefix for the containers and code volumes Lambda spawns: the prefix this
+     * emulator owns, so it cannot collide with a sibling Floci emulator on the same daemon.
+     * A user-configured prefix still replaces it wholesale.
+     */
+    static final String DEFAULT_NAME_PREFIX = ContainerStorageHelper.NAME_PREFIX;
     /** A prefix must be a legal Docker name on its own: names must start alphanumeric. */
     private static final java.util.regex.Pattern SAFE_NAME_PREFIX =
             java.util.regex.Pattern.compile("^[A-Za-z0-9][A-Za-z0-9_.-]*$");
@@ -80,7 +88,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
     /**
      * The base name prefix for Lambda containers and code volumes:
      * {@code floci.services.lambda.container-name-prefix} when set and Docker-safe,
-     * otherwise the default {@code floci}.
+     * otherwise {@link #DEFAULT_NAME_PREFIX}.
      */
     static String resolveContainerNamePrefix(EmulatorConfig config) {
         String configured = config.services().lambda().containerNamePrefix()
@@ -97,18 +105,6 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         return configured;
     }
 
-    /**
-     * In-container location of Floci's CA certificate, injected when TLS is enabled so the
-     * container trusts Floci's self-signed HTTPS endpoint. {@code /etc} exists in every Lambda
-     * base image, so no directory needs to be created.
-     */
-    private static final String FLOCI_CA_DIR = "/etc";
-    private static final String FLOCI_CA_FILE_NAME = "floci-ca.crt";
-    /** Shared with the kubernetes executor, which mounts the CA ConfigMap at the same path. */
-    public static final String FLOCI_CA_CONTAINER_PATH = FLOCI_CA_DIR + "/" + FLOCI_CA_FILE_NAME;
-    /** Self-signed cert filename produced by {@code TlsConfigSource} under {persistent-path}/tls/. */
-    private static final String SELF_SIGNED_CERT_NAME = "floci-selfsigned.crt";
-
     private static final DateTimeFormatter LOG_STREAM_DATE_FMT = DateTimeFormatter.ofPattern("yyyy/MM/dd");
 
     private final ContainerBuilder containerBuilder;
@@ -122,10 +118,6 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
     private final LambdaLayerService layerService;
     private final LaunchedContainerAwsEnv awsEnv;
     private final LambdaExecutionRoleCredentials executionRoleCredentials;
-
-    /** Matches an AWS-shaped ECR image URI: {@code <account>.dkr.ecr.<region>.amazonaws.com/<repo>[:tag]}. */
-    private static final java.util.regex.Pattern AWS_ECR_URI =
-            java.util.regex.Pattern.compile("^([0-9]{12})\\.dkr\\.ecr\\.([a-z0-9-]+)\\.amazonaws\\.com/(.+)$");
 
     @Inject
     public ContainerLauncher(ContainerBuilder containerBuilder,
@@ -150,6 +142,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         this.layerService = layerService;
         this.awsEnv = awsEnv;
         this.executionRoleCredentials = executionRoleCredentials;
+        this.populateSemaphore = new java.util.concurrent.Semaphore(resolvePopulateConcurrency(config));
     }
 
     @PostConstruct
@@ -161,28 +154,6 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
     @PreDestroy
     void shutdown() {
         volumeCleanupScheduler.shutdownNow();
-    }
-
-    /**
-     * Rewrites real-AWS-shaped ECR image URIs to point at Floci's loopback registry.
-     * Stored ImageUri is preserved (so describe-function returns the original);
-     * the rewrite is only applied immediately before the docker pull.
-     */
-    private String rewriteForEmulatedRegistry(String image) {
-        if (image == null) {
-            return null;
-        }
-        java.util.regex.Matcher m = AWS_ECR_URI.matcher(image);
-        if (!m.matches()) {
-            return image;
-        }
-        String account = m.group(1);
-        String region = m.group(2);
-        String repoAndTag = m.group(3);
-        ecrRegistryManager.ensureStarted();
-        String rewritten = ecrRegistryManager.getRepositoryUri(account, region, repoAndTag);
-        LOG.infov("Rewriting ECR image URI {0} -> {1}", image, rewritten);
-        return rewritten;
     }
 
     public ContainerHandle launch(LambdaFunction fn) {
@@ -236,7 +207,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                 : imageResolver.resolve(fn.getRuntime());
 
         // If this is an AWS-shaped ECR URI, rewrite it to Floci's loopback registry
-        image = rewriteForEmulatedRegistry(image);
+        image = ecrRegistryManager.rewriteImageUri(image);
 
         // Determine host address reachable from container
         String hostAddress = dockerHostResolver.resolve();
@@ -252,13 +223,6 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         String cwLogStream = LOG_STREAM_DATE_FMT.format(LocalDate.now()) + "/[$LATEST]" + shortId;
         String lambdaRegion = extractRegionFromArn(fn.getFunctionArn(), config.defaultRegion());
         String lambdaAccountId = AwsArnUtils.accountOrDefault(fn.getFunctionArn(), config.defaultAccountId());
-
-        // When TLS is on, the container must trust Floci's self-signed cert so HTTPS callbacks
-        // to Floci succeed (e.g. a CDK custom resource's cfn-response, which hardcodes https://).
-        // Short-circuit when TLS is off so cert-path/storage config isn't read needlessly.
-        Optional<Path> flociCaCert = config.tls().enabled()
-                ? resolveFlociCaCertPath(true, config.tls().certPath(), config.storage().persistentPath())
-                : Optional.empty();
 
         // Build env vars
         List<String> env = new ArrayList<>();
@@ -282,12 +246,22 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         }
         env.addAll(awsEnv.sdkBaselineEnv(lambdaRegion,
                 awsConfigPath.isPresent() ? Optional.of("/opt/aws-config") : Optional.empty(),
-                roleCredentials));
-        env.addAll(flociCaEnv(flociCaCert));
+                roleCredentials, lambdaAccountId));
         if (fn.getEnvironment() != null) {
             boolean hasExecutionRoleCredentials = roleCredentials.isPresent();
+            boolean userDefinesFullCredentialTriad = definesFullCredentialTriad(fn.getEnvironment());
             fn.getEnvironment().forEach((k, v) -> {
-                if (!hasExecutionRoleCredentials || !isAwsCredentialVariable(k)) {
+                if (isAwsCredentialVariable(k)) {
+                    // Credential injection is all-or-nothing: a partial override (e.g. only
+                    // AWS_ACCESS_KEY_ID set) must never join the baseline's other two values —
+                    // that pairs a user-chosen key with the owner-account/execution-role secret
+                    // and session token, a tuple nothing can verify. Only let the user's triad
+                    // through when it is complete, and only when there is no execution role
+                    // (which is already the authoritative credential source).
+                    if (!hasExecutionRoleCredentials && userDefinesFullCredentialTriad) {
+                        env.add(k + "=" + v);
+                    }
+                } else {
                     env.add(k + "=" + v);
                 }
             });
@@ -302,6 +276,9 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                 .withLogRotation()
                 .withLabels(ContainerStorageHelper.resourceIdentityLabels(
                         "lambda", fn.getFunctionName(), lambdaAccountId, lambdaRegion));
+
+        LambdaDockerFlags dockerFlags = configuredDockerFlags();
+        applyDockerFlags(specBuilder, dockerFlags);
 
         specBuilder.withEmbeddedDns();
 
@@ -322,7 +299,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         // and the create->start copy block agree.
         boolean useCodeVolume = false;
         if (fn.isHotReload()) {
-            specBuilder.withBind(fn.getHotReloadHostPath(), TASK_DIR);
+            specBuilder.withReadOnlyBind(fn.getHotReloadHostPath(), TASK_DIR);
         } else if (fn.getCodeLocalPath() != null) {
             useCodeVolume = shouldUseCodeVolume(Path.of(fn.getCodeLocalPath()));
             if (useCodeVolume) {
@@ -340,7 +317,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         }
 
         if (fn.getFileSystemConfigs() != null && !fn.getFileSystemConfigs().isEmpty()) {
-            var efsCfg = config.storage().efs();
+            EmulatorConfig.EfsSharingConfig efsCfg = config.storage().efs();
             fn.getFileSystemConfigs().forEach(fileSystem -> {
                 String volumeName = efsVolumeName(fileSystem.getArn());
                 lifecycleManager.ensureSharedVolume(volumeName,
@@ -386,7 +363,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
 
         // Create container without starting — provided.* runtimes exec
         // /var/runtime/bootstrap on start, so code must be copied first.
-        containerId = lifecycleManager.create(spec);
+        containerId = createContainer(spec, fn, dockerFlags);
         LOG.infov("Created container {0} for function {1}", containerId, fn.getFunctionName());
         // Docker now holds the real container-to-volume reference, which removeVolume's own in-use
         // check protects from here on - release the in-flight marker that stood in for it before
@@ -438,23 +415,17 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
             }
         }
 
-        // 4. Copy Floci's CA cert so the container trusts Floci's HTTPS endpoint (TLS mode).
-        //    Placed before start so NODE_EXTRA_CA_CERTS et al. resolve at runtime init.
-        //    An if-block rather than ifPresent(...) because containerId is assigned along the
-        //    code-volume path and so is not effectively final for a lambda capture.
-        if (flociCaCert.isPresent()) {
-            copyFileToContainer(dockerClient, containerId, flociCaCert.get(),
-                    FLOCI_CA_DIR, FLOCI_CA_FILE_NAME, fn.getFunctionName());
-        }
-
         // Now start the container with code in place
         lifecycleManager.startCreated(containerId, spec);
+        watchForUnexpectedExit(dockerClient, containerId, runtimeApiServer);
 
         // Extensions can log as soon as they start, which is before the container's own log stream
         // is attached below. Create the group/stream up front so those early lines are not dropped
         // by CloudWatch; the call is idempotent, so attach() repeating it is harmless.
-        LogDestination logDestination = new LogDestination(cwLogGroup, cwLogStream, lambdaRegion);
-        logStreamer.ensureLogGroupAndStream(cwLogGroup, cwLogStream, lambdaRegion);
+        LogDestination logDestination = new LogDestination(
+                lambdaAccountId, cwLogGroup, cwLogStream, lambdaRegion);
+        logStreamer.ensureLogGroupAndStreamForAccount(
+                lambdaAccountId, cwLogGroup, cwLogStream, lambdaRegion);
 
         // Real AWS's runtime interface client discovers and launches every binary under
         // /opt/extensions/ as a sibling process to the main entrypoint before the runtime is
@@ -479,8 +450,9 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                 LambdaExecutionRoleCredentials.sessionAccountId(fn));
 
         // Attach log streaming
-        Closeable logHandle = logStreamer.attach(
-                containerId, cwLogGroup, cwLogStream, lambdaRegion, "lambda:" + fn.getFunctionName());
+        Closeable logHandle = logStreamer.attachForAccount(
+                lambdaAccountId, containerId, cwLogGroup, cwLogStream,
+                lambdaRegion, "lambda:" + fn.getFunctionName());
         handle.setLogStream(logHandle);
 
         return handle;
@@ -527,6 +499,98 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
             }
             throw e;
         }
+    }
+
+    private static Optional<String> dockerPlatform(LambdaFunction fn) {
+        List<String> architectures = fn.getArchitectures();
+        if (architectures == null) {
+            return Optional.of("linux/amd64");
+        }
+        if (architectures.size() != 1) {
+            return Optional.empty();
+        }
+        return switch (architectures.getFirst()) {
+            case "arm64" -> Optional.of("linux/arm64");
+            case "x86_64" -> Optional.of("linux/amd64");
+            default -> Optional.empty();
+        };
+    }
+
+    private String createContainer(ContainerSpec spec, LambdaFunction fn, LambdaDockerFlags dockerFlags) {
+        if (dockerFlags.platform() != null) {
+            return lifecycleManager.create(spec, dockerFlags.platform());
+        }
+        if (!config.services().lambda().honourArchitectures()) {
+            return lifecycleManager.create(spec);
+        }
+        Optional<String> platform = dockerPlatform(fn);
+        if (platform.isEmpty()) {
+            throw new IllegalStateException("Invalid persisted architectures "
+                    + fn.getArchitectures() + " for function '" + fn.getFunctionName() + "'");
+        }
+        return lifecycleManager.create(spec, platform.get());
+    }
+
+    private LambdaDockerFlags configuredDockerFlags() {
+        Optional<String> configured = Optional.ofNullable(config.services().lambda().dockerFlags())
+                .orElse(Optional.empty());
+        return configured.filter(value -> !value.isBlank())
+                .map(LambdaDockerFlags::parse)
+                .orElseGet(() -> LambdaDockerFlags.parse(null));
+    }
+
+    private static void applyDockerFlags(ContainerBuilder.Builder builder, LambdaDockerFlags flags) {
+        builder.withEnv(flags.environment());
+        for (String volume : flags.volumes()) {
+            String[] parts = volume.split(":", -1);
+            if (parts.length < 2 || parts.length > 3 || parts[0].isBlank() || parts[1].isBlank()) {
+                throw new IllegalArgumentException("Invalid Lambda Docker volume: " + volume);
+            }
+            if (parts.length == 3 && "ro".equals(parts[2])) {
+                builder.withReadOnlyBind(parts[0], parts[1]);
+            } else if (parts.length == 2 || "rw".equals(parts[2])) {
+                builder.withBind(parts[0], parts[1]);
+            } else {
+                throw new IllegalArgumentException("Invalid Lambda Docker volume mode: " + volume);
+            }
+        }
+        for (String publishedPort : flags.publishedPorts()) {
+            String[] parts = publishedPort.split(":", -1);
+            String hostIp = parts.length == 3 ? parts[0] : null;
+            String hostPort = parts.length == 2 ? parts[0] : parts.length == 3 ? parts[1] : "";
+            String containerPort = parts.length == 2 ? parts[1] : parts.length == 3 ? parts[2] : "";
+            if (hostPort.isBlank() || containerPort.isBlank()) {
+                throw new IllegalArgumentException("Invalid Lambda Docker published port: " + publishedPort);
+            }
+            int parsedHostPort = Integer.parseInt(hostPort);
+            int parsedContainerPort = Integer.parseInt(containerPort);
+            if (hostIp == null) {
+                builder.withPortBinding(parsedContainerPort, parsedHostPort);
+            } else if ("127.0.0.1".equals(hostIp)) {
+                builder.withLoopbackPortBinding(parsedContainerPort, parsedHostPort);
+            } else {
+                throw new IllegalArgumentException("Lambda Docker published ports only support "
+                        + "127.0.0.1 as an explicit host address: " + publishedPort);
+            }
+        }
+        for (String extraHost : flags.extraHosts()) {
+            int separator = extraHost.indexOf(':');
+            if (separator <= 0 || separator == extraHost.length() - 1) {
+                throw new IllegalArgumentException("Invalid Lambda Docker extra host: " + extraHost);
+            }
+            builder.withExtraHost(extraHost.substring(0, separator), extraHost.substring(separator + 1));
+        }
+        for (String dnsServer : flags.dnsServers()) {
+            builder.withDnsServer(dnsServer);
+        }
+        builder.withLabels(flags.labels());
+        if (flags.network() != null) {
+            builder.withNetworkMode(flags.network());
+        }
+        if (flags.user() != null) {
+            builder.withUser(flags.user());
+        }
+        builder.withPrivileged(flags.privileged());
     }
 
     public void stop(ContainerHandle handle) {
@@ -583,10 +647,23 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         }
     }
 
-    private static boolean isAwsCredentialVariable(String name) {
+    public static boolean isAwsCredentialVariable(String name) {
         return "AWS_ACCESS_KEY_ID".equals(name)
                 || "AWS_SECRET_ACCESS_KEY".equals(name)
                 || "AWS_SESSION_TOKEN".equals(name);
+    }
+
+    /**
+     * Whether a Lambda's own Environment config defines all three AWS credential variables,
+     * the only condition under which any of them may override the baseline env — a partial
+     * set must never leak through and split the baseline's credential tuple. Public: both the
+     * Docker and Kubernetes launchers append the function's Environment after the same baseline
+     * and must apply this rule identically.
+     */
+    public static boolean definesFullCredentialTriad(java.util.Map<String, String> environment) {
+        return environment.containsKey("AWS_ACCESS_KEY_ID")
+                && environment.containsKey("AWS_SECRET_ACCESS_KEY")
+                && environment.containsKey("AWS_SESSION_TOKEN");
     }
 
     /**
@@ -605,12 +682,40 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
     // overwhelmed the Docker daemon, so copies hung/failed and left half-built "Created" containers.
     // This gates ONLY the heavy populate — not every launch — so ordinary cold starts (volume mounts
     // for already-populated large code, or the small-code direct copy) are never serialized.
-    private static final java.util.concurrent.Semaphore POPULATE_SEMAPHORE =
-            new java.util.concurrent.Semaphore(Math.max(2, Runtime.getRuntime().availableProcessors() / 2));
+    //
+    // Per-instance rather than static so the permit count can come from configuration; Floci runs a
+    // single @ApplicationScoped launcher, so this is still one gate for the whole emulator.
+    private final java.util.concurrent.Semaphore populateSemaphore;
 
-    private static void acquirePopulatePermit(String functionName) {
+    /**
+     * Permits for {@link #populateSemaphore}: the configured value when set and positive,
+     * otherwise {@code max(2, availableProcessors() / 2)}.
+     *
+     * <p>The derived default reads the JVM's view of the cgroup CPU quota, so a CPU-constrained
+     * Floci container collapses it to 2 and concurrent cold starts of distinct functions
+     * serialize into pairs. The populate itself is IO-bound (streaming a tar into a helper
+     * container), so CPU count is a weak proxy for how many the daemon can take — hence the
+     * override. The default is unchanged, since the daemon overload the cap exists to prevent is
+     * real and its safe ceiling is host-specific.
+     */
+    static int resolvePopulateConcurrency(EmulatorConfig config) {
+        int derived = Math.max(2, Runtime.getRuntime().availableProcessors() / 2);
+        Optional<Integer> configured = config.services().lambda().codeVolumePopulateConcurrency();
+        if (configured.isEmpty()) {
+            return derived;
+        }
+        int permits = configured.get();
+        if (permits < 1) {
+            LOG.warnv("Ignoring floci.services.lambda.code-volume-populate-concurrency {0}: must be "
+                    + "at least 1; using {1}", permits, derived);
+            return derived;
+        }
+        return permits;
+    }
+
+    private void acquirePopulatePermit(String functionName) {
         try {
-            POPULATE_SEMAPHORE.acquire();
+            populateSemaphore.acquire();
         } catch (InterruptedException ie) {
             Thread.currentThread().interrupt();
             throw new RuntimeException("Interrupted while waiting to populate code volume for " + functionName, ie);
@@ -629,6 +734,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
     // nothing under that name, silently mounting an empty /var/task into the next container.
     // ensureCodeVolume re-checks lifecycleManager.volumeExists() rather than trusting this alone.
     private static final String CODE_VOLUME_MARKER_DIR = "lambda-codevol-markers";
+    private static final String NAMESPACE_LABEL = "floci_namespace";
     private final java.util.Set<String> populatedCodeVolumes = java.util.concurrent.ConcurrentHashMap.newKeySet();
     // Deliberately never pruned: removing an entry while a caller elsewhere still held a reference
     // to its lock object let a third caller's computeIfAbsent create a replacement lock for the same
@@ -697,7 +803,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
      * just mounts the volume read-only, turning a ~95s per-container copy into a ~0.2s mount.
      */
     String ensureCodeVolume(LambdaFunction fn, String image) {
-        String volName = codeVolumeName(resolveContainerNamePrefix(config), fn);
+        String volName = codeVolumeName(config, fn);
         // Held for the whole resolve-and-reconcile, not just the populate branch: this is the same
         // lock cleanupSupersededVolumes acquires before claiming a volume for deletion, so a launch
         // that resolves a volume can never race a sweep that's about to delete that exact volume out
@@ -773,6 +879,19 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
     }
 
     /**
+     * Whether a code volume carries this process's {@code floci_namespace} label (none when no
+     * namespace is set). The superseded sweep works from this process's own map of names, so it
+     * checks the label before deleting rather than trusting that a name it tracked is still its
+     * own. A volume whose labels cannot be read is left to {@code removeVolume}'s own checks.
+     */
+    private boolean inThisResourceNamespace(String volName) {
+        return lifecycleManager.tryVolumeLabels(volName)
+                .map(labels -> Objects.equals(labels.get(NAMESPACE_LABEL),
+                        ContainerStorageHelper.defaultLabels(config).get(NAMESPACE_LABEL)))
+                .orElse(true);
+    }
+
+    /**
      * Removes superseded code volumes whose grace period has elapsed. Scheduled at the same
      * interval as the grace period itself, so a volume is deleted within roughly one to two
      * intervals of becoming superseded. Not a hard deadline, since this is best-effort cleanup,
@@ -808,6 +927,11 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                     continue;
                 }
                 volumesPendingCleanup.remove(volName, stillQueuedAt);
+                if (!inThisResourceNamespace(volName)) {
+                    LOG.debugv("Left superseded code volume {0} alone: it belongs to another resource namespace",
+                            volName);
+                    continue;
+                }
                 if (lifecycleManager.removeVolume(volName)) {
                     populatedCodeVolumes.remove(volName);
                     LOG.debugv("Removed superseded code volume {0}", volName);
@@ -849,19 +973,20 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         String shortId = java.util.UUID.randomUUID().toString().replace("-", "").substring(0, 8);
         // A minimal helper container (sleep) with the volume mounted read-write at /var/task; we
         // tar-copy the code into it, then discard it — the data persists in the volume.
-        ContainerSpec helperSpec = containerBuilder.newContainer(image)
-                .withName(resolveContainerNamePrefix(config) + "-codevol-" + fn.getFunctionName() + "-" + shortId)
+        ContainerBuilder.Builder helperBuilder = containerBuilder.newContainer(image)
+                .withName(ContainerStorageHelper.prefixedDockerName(config, resolveContainerNamePrefix(config),
+                        "codevol-" + fn.getFunctionName() + "-" + shortId))
                 .withEnv(java.util.List.of())
                 .withEntrypoint(java.util.List.of("sleep"))
                 .withCmd(java.util.List.of("3600"))
-                .withNamedVolume(volName, TASK_DIR, false)
-                .build();
+                .withNamedVolume(volName, TASK_DIR, false);
+        ContainerSpec helperSpec = helperBuilder.build();
         // Gate the heavy work (helper create + ~90MB tar copy) so a burst of first-time populates
         // doesn't thrash the Docker daemon. Only populates are serialized — plain cold starts aren't.
         acquirePopulatePermit(fn.getFunctionName());
         String helperId = null;
         try {
-            helperId = lifecycleManager.create(helperSpec);
+            helperId = createContainer(helperSpec, fn, LambdaDockerFlags.parse(null));
             lifecycleManager.startCreated(helperId, helperSpec);
             copyDirToContainerStrict(lifecycleManager.getDockerClient(), helperId,
                     Path.of(fn.getCodeLocalPath()), TASK_DIR, fn.getFunctionName());
@@ -873,7 +998,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                     LOG.warnv("Could not remove code-volume helper {0}: {1}", helperId, e.getMessage());
                 }
             }
-            POPULATE_SEMAPHORE.release();
+            populateSemaphore.release();
         }
     }
 
@@ -953,10 +1078,11 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
             return;
         }
         // Markers are named after their volume, so the prune filter must track the configured
-        // name prefix. Markers written under a previously configured prefix are left alone —
-        // an orphaned marker file is harmless, and pruning only what this configuration could
-        // have written can never delete a concurrent process's live markers.
-        String markerPrefix = resolveContainerNamePrefix(config) + "-code-";
+        // name prefix and resource namespace. Markers written under a previously configured
+        // prefix or namespace are left alone: an orphaned marker file is harmless, and pruning
+        // only what this configuration could have written can never delete a concurrent
+        // process's live markers.
+        String markerPrefix = codeVolumeNamePrefix(config);
         try (java.util.stream.Stream<Path> markers = Files.list(markerDir)) {
             markers.filter(path -> Files.isRegularFile(path, java.nio.file.LinkOption.NOFOLLOW_LINKS))
                     .filter(path -> path.getFileName().toString().startsWith(markerPrefix))
@@ -995,7 +1121,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
     static boolean shouldUseCodeVolume(Path codeDir) {
         final long threshold = CODE_VOLUME_MIN_BYTES;
         final long[] total = {0L};
-        try (var stream = Files.walk(codeDir)) {
+        try (Stream<Path> stream = Files.walk(codeDir)) {
             for (Path path : (Iterable<Path>) stream::iterator) {
                 if (Files.isRegularFile(path)) {
                     total[0] += Files.size(path);
@@ -1021,6 +1147,37 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
 
     /** {@link #codeVolumeName(LambdaFunction)} with a configured base prefix in place of {@code floci}. */
     static String codeVolumeName(String namePrefix, LambdaFunction fn) {
+        return namePrefix + "-code-" + codeVolumeSuffix(fn);
+    }
+
+    /**
+     * The code volume name this configuration uses: the configured base prefix plus the resource
+     * namespace when one is set ({@code <prefix>-<namespace>-code-<function>-<hash>-<namespace hash>}),
+     * matching the Lambda container names. Without a namespace it equals
+     * {@link #codeVolumeName(String, LambdaFunction)} with the resolved prefix.
+     */
+    static String codeVolumeName(EmulatorConfig config, LambdaFunction fn) {
+        return codeVolumeNamePrefix(config) + codeVolumeSuffix(fn) + namespaceDisambiguator(config);
+    }
+
+    /**
+     * A namespace and a function name may both contain dashes, so namespace {@code ci} with function
+     * {@code foo-code-bar} and namespace {@code ci-code-foo} with function {@code bar} would spell
+     * the same volume name for the same code. A short hash of the namespace keeps their volumes
+     * apart. Empty without a namespace, so those names are unchanged.
+     */
+    private static String namespaceDisambiguator(EmulatorConfig config) {
+        String namespace = config.docker() == null || config.docker().resourceNamespace() == null
+                ? "" : config.docker().resourceNamespace().orElse("").trim();
+        return namespace.isEmpty() ? "" : "-" + sha256Hex(namespace).substring(0, 12);
+    }
+
+    /** Leading part shared by every code volume (and completion marker) this configuration names. */
+    static String codeVolumeNamePrefix(EmulatorConfig config) {
+        return ContainerStorageHelper.prefixedDockerName(config, resolveContainerNamePrefix(config), "code-");
+    }
+
+    private static String codeVolumeSuffix(LambdaFunction fn) {
         String key = fn.getCodeSha256();
         if (key == null || key.isBlank()) {
             key = Long.toString(fn.getLastModified());
@@ -1033,16 +1190,36 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
             h = "0";
         }
         String fname = fn.getFunctionName().replaceAll("[^a-zA-Z0-9_.-]", "-");
-        return namePrefix + "-code-" + fname + "-" + h;
+        return fname + "-" + h;
     }
 
-    static String efsVolumeName(String accessPointArn) {
+    /**
+     * The unprefixed name token for an access point's volume. Includes a hash of the whole ARN so
+     * two access points sharing a resource id in different accounts or Regions stay distinct.
+     */
+    static String efsVolumeToken(String accessPointArn) {
         int separator = Math.max(accessPointArn.lastIndexOf('/'), accessPointArn.lastIndexOf(':'));
         String resourceId = separator >= 0 ? accessPointArn.substring(separator + 1) : accessPointArn;
         if (resourceId.isBlank()) {
             throw new IllegalArgumentException("File system access point ARN must include a resource id");
         }
-        return "floci-efs-" + resourceId + "-" + sha256Hex(accessPointArn);
+        return "efs-" + resourceId + "-" + sha256Hex(accessPointArn);
+    }
+
+    /**
+     * The Docker volume backing an access point. EFS volumes hold user data but carry no
+     * persisted-name record, so probe: one created before the {@code floci-aws-} migration keeps
+     * its legacy name, and its data, forever. Only when no legacy volume exists is the current
+     * name used. The probe stays indefinitely; it is what makes upgrades across several versions
+     * safe.
+     */
+    private String efsVolumeName(String accessPointArn) {
+        String token = efsVolumeToken(accessPointArn);
+        String legacyName = ContainerStorageHelper.legacyDockerName(config, token);
+        if (lifecycleManager.volumeExists(legacyName)) {
+            return legacyName;
+        }
+        return ContainerStorageHelper.dockerName(config, token);
     }
 
     private static String sha256Hex(String value) {
@@ -1055,19 +1232,18 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         }
     }
 
-    /**
-     * Buffer for the tar-streaming pipe. The default {@link java.io.PipedInputStream} buffer is
-     * only 1KB, which forces a writer/reader thread hand-off (wait/notify) every 1KB. Streaming a
-     * ~90MB node_modules through that ran at ~0.5MB/s (≈3 min per cold start) — pure synchronization
-     * thrash, not I/O. A large buffer lets the tar writer stream ahead so throughput is bound by the
-     * Docker daemon, not the pipe.
-     */
-    private static final int TAR_PIPE_BUFFER_BYTES = 16 * 1024 * 1024;
-
     @FunctionalInterface
     interface DirectoryTarWriter {
         void write(Path sourceDir, OutputStream out) throws IOException;
     }
+
+    /**
+     * See {@link RetryingTarCopier}: these copies retry at the call site because the transport
+     * seam cannot replay a one-shot {@code InputStream} body. A failure throws so launch() cleans
+     * up the half-built container instead of leaking it.
+     */
+    static final int COPY_MAX_ATTEMPTS = 6;
+    static final long COPY_RETRY_BACKOFF_MS = 500L;
 
     private void copyDirToContainer(DockerClient dockerClient, String containerId,
                                     Path sourceDir, String remotePath, String functionName) {
@@ -1079,7 +1255,14 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                                    Path sourceDir, String remotePath, String functionName,
                                    DirectoryTarWriter tarWriter) {
         copyDirToContainer(dockerClient, containerId, sourceDir, remotePath, functionName,
-                tarWriter, false);
+                tarWriter, false, COPY_MAX_ATTEMPTS, COPY_RETRY_BACKOFF_MS);
+    }
+
+    void copyDirToContainer(DockerClient dockerClient, String containerId,
+                            Path sourceDir, String remotePath, String functionName,
+                            int maxAttempts, long backoffMillis) {
+        copyDirToContainer(dockerClient, containerId, sourceDir, remotePath, functionName,
+                ContainerLauncher::createTarFromDir, false, maxAttempts, backoffMillis);
     }
 
     private void copyDirToContainerStrict(DockerClient dockerClient, String containerId,
@@ -1092,93 +1275,79 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                                          Path sourceDir, String remotePath, String functionName,
                                          DirectoryTarWriter tarWriter) {
         copyDirToContainer(dockerClient, containerId, sourceDir, remotePath, functionName,
-                tarWriter, true);
+                tarWriter, true, COPY_MAX_ATTEMPTS, COPY_RETRY_BACKOFF_MS);
     }
 
     private static void copyDirToContainer(DockerClient dockerClient, String containerId,
                                            Path sourceDir, String remotePath, String functionName,
-                                           DirectoryTarWriter tarWriter, boolean failOnTarFailure) {
+                                           DirectoryTarWriter tarWriter, boolean failOnTarFailure,
+                                           int maxAttempts, long backoffMillis) {
         // No per-copy gating here: the heavy /var/task populate for large code already holds a
-        // POPULATE_SEMAPHORE permit; small-code direct copies and layer copies are light enough
+        // populateSemaphore permit; small-code direct copies and layer copies are light enough
         // to run unthrottled.
-        try (java.io.PipedOutputStream pos = new java.io.PipedOutputStream();
-             java.io.PipedInputStream pis = new java.io.PipedInputStream(pos, TAR_PIPE_BUFFER_BYTES)) {
-
-            AtomicReference<IOException> tarFailure = new AtomicReference<>();
-            Thread tarStreamer = new Thread(() -> {
-                try (pos) {
-                    tarWriter.write(sourceDir, pos);
-                } catch (IOException e) {
-                    if (failOnTarFailure) {
-                        tarFailure.set(e);
-                    } else {
-                        LOG.errorv("Failed to stream directory tar for function {0}: {1}",
-                                functionName, e.getMessage());
-                    }
-                }
-            }, "tar-streamer-dir-" + functionName);
-            tarStreamer.start();
-
-            dockerClient.copyArchiveToContainerCmd(containerId)
-                    .withRemotePath(remotePath)
-                    .withTarInputStream(pis)
-                    .exec();
-            if (failOnTarFailure) {
-                waitForTarStreamer(tarStreamer, tarFailure, functionName, sourceDir);
+        AtomicReference<IOException> tarFailure = new AtomicReference<>();
+        try {
+            RetryingTarCopier.copyStreamed(dockerClient, containerId, remotePath,
+                    "dir-" + functionName, out -> {
+                        tarFailure.set(null);
+                        try {
+                            tarWriter.write(sourceDir, out);
+                        } catch (IOException e) {
+                            tarFailure.set(e);
+                            if (!failOnTarFailure) {
+                                LOG.errorv("Failed to stream directory tar for function {0}: {1}",
+                                        functionName, e.getMessage());
+                            }
+                            throw e;
+                        }
+                    },
+                    maxAttempts, backoffMillis);
+        } catch (RuntimeException e) {
+            // RetryingTarCopier always surfaces a tar-producer failure it captured (so a writer
+            // failure the daemon happened to accept doesn't masquerade as success), wrapped in its
+            // own generic message. A distinct docker-level failure (the daemon itself rejecting the
+            // stream, not our own writer) isn't ours to reinterpret and must propagate as-is.
+            IOException producerFailure = tarFailure.get();
+            if (!isCausedBy(e, producerFailure)) {
+                throw e;
             }
-            LOG.debugv("Copied directory {0} into container {1} at {2}", sourceDir, containerId, remotePath);
-        } catch (Exception e) {
-            // Fail loudly so launch() cleans up the half-built container instead of leaking it.
+            if (!failOnTarFailure) {
+                LOG.debugv("Ignoring tolerated tar-producer failure for function {0}", functionName);
+                return;
+            }
+            IOException cause = new IOException("Failed to stream tar for function " + functionName
+                    + " from " + sourceDir, producerFailure);
             throw new RuntimeException("Failed to copy directory " + sourceDir + " into container "
-                    + containerId + " for function " + functionName + ": " + e.getMessage(), e);
+                    + containerId + " for function " + functionName + ": " + cause.getMessage(), cause);
         }
+        LOG.debugv("Copied directory {0} into container {1} at {2}", sourceDir, containerId, remotePath);
+    }
+
+    /** True if {@code target} appears by reference in {@code thrown}'s cause chain. */
+    private static boolean isCausedBy(Throwable thrown, Throwable target) {
+        if (target == null) {
+            return false;
+        }
+        for (Throwable t = thrown; t != null; t = t.getCause()) {
+            if (t == target) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private void copyFileToContainer(DockerClient dockerClient, String containerId,
                                      Path sourceFile, String remotePath, String entryName, String functionName) {
-        try (java.io.PipedOutputStream pos = new java.io.PipedOutputStream();
-             java.io.PipedInputStream pis = new java.io.PipedInputStream(pos, TAR_PIPE_BUFFER_BYTES)) {
-
-            new Thread(() -> {
-                try (TarArchiveOutputStream tar = newTarStream(pos)) {
-                    TarArchiveEntry entry = new TarArchiveEntry(entryName);
-                    entry.setSize(Files.size(sourceFile));
-                    entry.setMode(0755);
-                    tar.putArchiveEntry(entry);
-                    try (var fis = Files.newInputStream(sourceFile)) {
-                        fis.transferTo(tar);
-                    }
-                    tar.closeArchiveEntry();
-                } catch (IOException e) {
-                    LOG.errorv("Failed to stream file tar for function {0}: {1}", functionName, e.getMessage());
-                }
-            }, "tar-streamer-file-" + functionName).start();
-
-            dockerClient.copyArchiveToContainerCmd(containerId)
-                    .withRemotePath(remotePath)
-                    .withTarInputStream(pis)
-                    .exec();
-            LOG.debugv("Copied file {0} as {1} into container {2} at {3}", sourceFile, entryName, containerId, remotePath);
-        } catch (Exception e) {
-            throw new RuntimeException("Failed to copy file " + sourceFile + " into container "
-                    + containerId + " for function " + functionName + ": " + e.getMessage(), e);
-        }
+        copyFileToContainer(dockerClient, containerId, sourceFile, remotePath, entryName, functionName,
+                COPY_MAX_ATTEMPTS, COPY_RETRY_BACKOFF_MS);
     }
 
-    private static void waitForTarStreamer(Thread tarStreamer, AtomicReference<IOException> tarFailure,
-                                           String functionName, Path sourcePath) throws IOException {
-        try {
-            tarStreamer.join();
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new IOException("Interrupted while streaming tar for function " + functionName
-                    + " from " + sourcePath, e);
-        }
-        IOException failure = tarFailure.get();
-        if (failure != null) {
-            throw new IOException("Failed to stream tar for function " + functionName
-                    + " from " + sourcePath, failure);
-        }
+    void copyFileToContainer(DockerClient dockerClient, String containerId,
+                             Path sourceFile, String remotePath, String entryName, String functionName,
+                             int maxAttempts, long backoffMillis) {
+        RetryingTarCopier.copyFile(dockerClient, containerId, remotePath, entryName, sourceFile,
+                0755, maxAttempts, backoffMillis);
+        LOG.debugv("Copied file {0} as {1} into container {2} at {3}", sourceFile, entryName, containerId, remotePath);
     }
 
     private static boolean isProvidedRuntime(String runtime) {
@@ -1210,7 +1379,37 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
      * (or other extensions) from running.
      */
     /** Where a container's output is sent: the CloudWatch log group/stream and its region. */
-    private record LogDestination(String logGroup, String logStream, String region) { }
+    private record LogDestination(String accountId, String logGroup, String logStream, String region) { }
+
+    /**
+     * Arms an async watch (via Docker's own wait-for-exit API, not polling) that notices when
+     * this container's main process dies while nothing inside the runtime reported it - a
+     * stray {@code sys.exit}/{@code process.exit}/{@code System.exit} in the handler, or any
+     * other crash (see #3314). Without this, a dead runtime left every pending/in-flight
+     * invocation waiting out the full function timeout to be told {@code Function.TimedOut}
+     * instead of the {@code Runtime.ExitError} AWS reports immediately.
+     *
+     * <p>Fires exactly once per container, on whatever exit eventually happens - including an
+     * intentional {@code docker stop} during normal teardown. {@link RuntimeApiServer
+     * #handleRuntimeProcessExited} itself distinguishes a genuine crash from that case (its own
+     * {@code stopped}/{@code faulted} guard), so this method only needs to forward the event;
+     * it does not need to be un-armed on the teardown path.
+     */
+    private void watchForUnexpectedExit(DockerClient dockerClient, String containerId,
+                                        RuntimeApiServer runtimeApiServer) {
+        try {
+            dockerClient.waitContainerCmd(containerId).exec(new WaitContainerResultCallback() {
+                @Override
+                public void onNext(WaitResponse response) {
+                    super.onNext(response);
+                    Integer statusCode = response.getStatusCode();
+                    runtimeApiServer.handleRuntimeProcessExited(statusCode != null ? statusCode : -1);
+                }
+            });
+        } catch (RuntimeException e) {
+            LOG.debugv(e, "Could not arm exit watcher for container {0}", containerId);
+        }
+    }
 
     private void launchExtensions(DockerClient dockerClient, String containerId, String functionName,
                                   RuntimeApiServer runtimeApiServer, LogDestination logDestination) {
@@ -1222,7 +1421,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         for (String name : extensionNames) {
             try {
                 String path = EXTENSIONS_DIR + "/" + name;
-                var create = dockerClient.execCreateCmd(containerId)
+                ExecCreateCmd create = dockerClient.execCreateCmd(containerId)
                         .withCmd(path)
                         .withAttachStdout(true)
                         .withAttachStderr(true);
@@ -1236,8 +1435,9 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                 // the container log and an observability extension's output would vanish entirely.
                 // Draining is also required in its own right — an unread exec pipe fills up and
                 // stalls the extension process.
-                dockerClient.execStartCmd(execId).exec(logStreamer.execLogCallback(
-                        logDestination.logGroup(), logDestination.logStream(), logDestination.region(),
+                dockerClient.execStartCmd(execId).exec(logStreamer.execLogCallbackForAccount(
+                        logDestination.accountId(), logDestination.logGroup(), logDestination.logStream(),
+                        logDestination.region(),
                         "lambda:" + functionName + ":" + name));
                 LOG.infov("Launched extension {0} for function {1} (container {2})",
                         name, functionName, containerId);
@@ -1315,83 +1515,6 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         }
     }
 
-    /**
-     * Resolves the host path of Floci's CA certificate to inject into Lambda containers, or
-     * empty when TLS is disabled or no readable certificate exists. Mirrors {@code TlsConfigSource}:
-     * a user-provided {@code floci.tls.cert-path} wins; otherwise the self-signed cert under
-     * {@code {persistent-path}/tls/}.
-     *
-     * <p>The resolved certificate is injected into containers as a <em>trust anchor</em> (CA), so it
-     * should be a self-signed CA certificate. The auto-generated Floci cert is one; a user-supplied
-     * {@code floci.tls.cert-path} that points at a leaf/server certificate is accepted but only pins
-     * that exact certificate (it cannot validate a chain it signs), so a warning is logged.
-     */
-    public static Optional<Path> resolveFlociCaCertPath(boolean tlsEnabled, Optional<String> userCertPath,
-                                                        String persistentPath) {
-        if (!tlsEnabled) {
-            return Optional.empty();
-        }
-        Optional<String> trimmedUserPath = userCertPath.filter(s -> !s.isBlank());
-        Path certPath = trimmedUserPath
-                .map(Path::of)
-                .orElseGet(() -> Path.of(persistentPath, "tls", SELF_SIGNED_CERT_NAME));
-        if (!Files.isReadable(certPath)) {
-            LOG.warnv("TLS enabled but Floci CA certificate not readable at {0}; "
-                    + "Lambda containers will not trust Floci HTTPS callbacks", certPath);
-            return Optional.empty();
-        }
-        if (trimmedUserPath.isPresent() && !isSelfSignedCaCertificate(certPath)) {
-            LOG.warnv("Configured floci.tls.cert-path {0} is not a self-signed CA certificate; it is "
-                    + "injected into Lambda containers as a trust anchor (CA), which only validates "
-                    + "this exact certificate and not a chain it signs. Provide a self-signed CA "
-                    + "certificate for reliable HTTPS callbacks.", certPath);
-        }
-        return Optional.of(certPath);
-    }
-
-    /**
-     * Returns {@code true} only if {@code certPath} holds a genuinely self-signed CA certificate
-     * (issuer == subject and BasicConstraints {@code CA:true}) — the form usable as a trust anchor.
-     * A leaf/server certificate, or one that cannot be read/parsed as X.509, returns {@code false}.
-     */
-    static boolean isSelfSignedCaCertificate(Path certPath) {
-        try (InputStream in = Files.newInputStream(certPath)) {
-            X509Certificate cert = (X509Certificate) CertificateFactory.getInstance("X.509")
-                    .generateCertificate(in);
-            boolean selfSigned = cert.getSubjectX500Principal().equals(cert.getIssuerX500Principal());
-            boolean isCa = cert.getBasicConstraints() >= 0; // -1 == not a CA
-            return selfSigned && isCa;
-        } catch (Exception e) {
-            LOG.debugv("Could not inspect TLS certificate {0} for CA suitability: {1}",
-                    certPath, e.getMessage());
-            return false;
-        }
-    }
-
-    /**
-     * Environment entries that make the container <em>add</em> Floci's CA to its trust, without
-     * replacing the system trust store (which would break the Lambda's external HTTPS calls):
-     * <ul>
-     *   <li>{@code NODE_EXTRA_CA_CERTS} appends Floci's cert to Node's built-in CAs, so public TLS
-     *       from the Lambda still works; and</li>
-     *   <li>{@code AWS_CA_BUNDLE} is scoped to AWS SDK/CLI traffic, which Floci redirects to its own
-     *       endpoint via {@code AWS_ENDPOINT_URL} — so pointing it at Floci's cert only affects
-     *       calls that already target Floci.</li>
-     * </ul>
-     * {@code SSL_CERT_FILE} and {@code REQUESTS_CA_BUNDLE} are deliberately <em>not</em> set: each
-     * <em>replaces</em> the entire OpenSSL / Python-requests trust store with only Floci's cert,
-     * which breaks every external HTTPS call (curl, openssl, requests/botocore) the Lambda makes.
-     * Returns an empty list when no CA cert is available (TLS off).
-     */
-    public static List<String> flociCaEnv(Optional<Path> caCert) {
-        if (caCert.isEmpty()) {
-            return List.of();
-        }
-        return List.of(
-                "NODE_EXTRA_CA_CERTS=" + FLOCI_CA_CONTAINER_PATH,
-                "AWS_CA_BUNDLE=" + FLOCI_CA_CONTAINER_PATH);
-    }
-
     private static String extractRegionFromArn(String arn, String defaultRegion) {
         return AwsArnUtils.regionOrDefault(arn, defaultRegion);
     }
@@ -1402,8 +1525,8 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
      * are preserved without truncation.
      */
     private static void createTarFromDir(Path sourceDir, OutputStream out) throws IOException {
-        try (TarArchiveOutputStream tar = newTarStream(out);
-             var stream = Files.walk(sourceDir)) {
+        try (TarArchiveOutputStream tar = RetryingTarCopier.newTarStream(out);
+             Stream<Path> stream = Files.walk(sourceDir)) {
             for (Path path : (Iterable<Path>) stream::iterator) {
                 if (Files.isDirectory(path)) {
                     continue;
@@ -1413,18 +1536,11 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                 entry.setSize(Files.size(path));
                 entry.setMode(0755);
                 tar.putArchiveEntry(entry);
-                try (var fis = Files.newInputStream(path)) {
+                try (InputStream fis = Files.newInputStream(path)) {
                     fis.transferTo(tar);
                 }
                 tar.closeArchiveEntry();
             }
         }
-    }
-
-    private static TarArchiveOutputStream newTarStream(OutputStream out) {
-        TarArchiveOutputStream tar = new TarArchiveOutputStream(out);
-        tar.setLongFileMode(TarArchiveOutputStream.LONGFILE_GNU);
-        tar.setBigNumberMode(TarArchiveOutputStream.BIGNUMBER_STAR);
-        return tar;
     }
 }

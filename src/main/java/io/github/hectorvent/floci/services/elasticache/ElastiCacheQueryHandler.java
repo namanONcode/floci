@@ -2,17 +2,22 @@ package io.github.hectorvent.floci.services.elasticache;
 
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
-import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.AwsRegions;
+import io.github.hectorvent.floci.core.common.BackupWindows;
 import io.github.hectorvent.floci.core.common.AwsNamespaces;
 import io.github.hectorvent.floci.core.common.AwsQueryResponse;
+import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.XmlBuilder;
 import io.github.hectorvent.floci.services.elasticache.model.AuthMode;
 import io.github.hectorvent.floci.services.elasticache.model.CacheCluster;
 import io.github.hectorvent.floci.services.elasticache.model.CacheParameterGroup;
 import io.github.hectorvent.floci.services.elasticache.model.CacheSubnetGroup;
+import io.github.hectorvent.floci.services.elasticache.model.ClusterNode;
 import io.github.hectorvent.floci.services.elasticache.model.ElastiCacheUser;
 import io.github.hectorvent.floci.services.elasticache.model.Endpoint;
 import io.github.hectorvent.floci.services.elasticache.model.ReplicationGroup;
+import io.github.hectorvent.floci.services.elasticache.model.ReplicationGroupSettings;
+import io.github.hectorvent.floci.services.elasticache.model.ReplicationGroupStatus;
 import io.github.hectorvent.floci.services.elasticache.proxy.SigV4Validator;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -20,10 +25,14 @@ import jakarta.ws.rs.core.MultivaluedMap;
 import jakarta.ws.rs.core.Response;
 import org.jboss.logging.Logger;
 
+import java.net.URI;
+import java.net.URLDecoder;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 
 /**
@@ -63,7 +72,7 @@ public class ElastiCacheQueryHandler {
             case "DescribeUsers"              -> handleDescribeUsers(params);
             case "ModifyUser"                 -> handleModifyUser(params);
             case "DeleteUser"                 -> handleDeleteUser(params);
-            case "CreateCacheCluster"         -> handleCreateCacheCluster(params);
+            case "CreateCacheCluster"         -> handleCreateCacheCluster(params, region);
             case "DescribeCacheClusters"      -> handleDescribeCacheClusters(params);
             case "DeleteCacheCluster"         -> handleDeleteCacheCluster(params);
             case "CreateCacheSubnetGroup"     -> handleCreateCacheSubnetGroup(params);
@@ -105,7 +114,26 @@ public class ElastiCacheQueryHandler {
 
         try {
             ReplicationGroup group = service.createReplicationGroup(
-                    groupId, description != null ? description : "", authMode, authToken, region);
+                    new ElastiCacheService.CreateReplicationGroupRequest(
+                            groupId,
+                            description != null ? description : "",
+                            authMode,
+                            authToken,
+                            region,
+                            params.getFirst("Engine"),
+                            params.getFirst("EngineVersion"),
+                            params.getFirst("CacheNodeType"),
+                            params.getFirst("CacheParameterGroupName"),
+                            params.getFirst("CacheSubnetGroupName"),
+                            params.getFirst("ClusterMode"),
+                            intParam(params, "NumNodeGroups"),
+                            intParam(params, "ReplicasPerNodeGroup"),
+                            intParam(params, "NumCacheClusters"),
+                            boolParam(params, "AutomaticFailoverEnabled"),
+                            boolParam(params, "MultiAZEnabled"),
+                            intParam(params, "Port"),
+                            replicationGroupSettings(params),
+                            parseTags(params)));
             String result = replicationGroupXml(group);
             return Response.ok(AwsQueryResponse.envelope("CreateReplicationGroup", AwsNamespaces.EC, result)).build();
         } catch (AwsException e) {
@@ -113,11 +141,55 @@ public class ElastiCacheQueryHandler {
         }
     }
 
+    private static ReplicationGroupSettings replicationGroupSettings(MultivaluedMap<String, String> params) {
+        String atRest = params.getFirst("AtRestEncryptionEnabled");
+        // A live account reads any value that is not "false" as true — "banana", "yes" and
+        // "TRUE " all created an encrypted group — so the flag is read the same way here.
+        return new ReplicationGroupSettings(
+                atRest == null ? null : !"false".equalsIgnoreCase(atRest.trim()),
+                params.getFirst("KmsKeyId"),
+                optionalInt(params.getFirst("SnapshotRetentionLimit")),
+                params.getFirst("SnapshotWindow"));
+    }
+
+    private static Integer optionalInt(String value) {
+        if (value == null || value.isBlank()) {
+            return null;
+        }
+        try {
+            return Integer.parseInt(value.trim());
+        } catch (NumberFormatException e) {
+            throw new AwsException("InvalidParameterValue", "Value " + value + " is not a valid integer.", 400);
+        }
+    }
+
+    private static Integer intParam(MultivaluedMap<String, String> params, String name) {
+        String value = params.getFirst(name);
+        if (value == null || value.isBlank()) {
+            return null;
+        }
+        try {
+            return Integer.valueOf(value.trim());
+        } catch (NumberFormatException e) {
+            throw new AwsException("InvalidParameterValue",
+                    "The parameter " + name + " must be an integer.", 400);
+        }
+    }
+
+    private static Boolean boolParam(MultivaluedMap<String, String> params, String name) {
+        String value = params.getFirst(name);
+        if (value == null || value.isBlank()) {
+            return null;
+        }
+        return Boolean.parseBoolean(value.trim());
+    }
+
+
     private Response handleDescribeReplicationGroups(MultivaluedMap<String, String> params) {
         String filterId = params.getFirst("ReplicationGroupId");
         try {
             Collection<ReplicationGroup> groups = service.listReplicationGroups(filterId);
-            var xml = new XmlBuilder().start("ReplicationGroups");
+            XmlBuilder xml = new XmlBuilder().start("ReplicationGroups");
             for (ReplicationGroup g : groups) {
                 xml.raw(replicationGroupXml(g));
             }
@@ -153,9 +225,12 @@ public class ElastiCacheQueryHandler {
         List<String> userIdsToAdd = extractMemberList(params, "UserGroupIdsToAdd.member.");
         List<String> userIdsToRemove = extractMemberList(params, "UserGroupIdsToRemove.member.");
         try {
+            // AtRestEncryptionEnabled and KmsKeyId are fixed at create and not in the modify shape
+            ReplicationGroupSettings settings = new ReplicationGroupSettings(null, null,
+                    optionalInt(params.getFirst("SnapshotRetentionLimit")), params.getFirst("SnapshotWindow"));
             ReplicationGroup group = service.modifyReplicationGroup(groupId,
                     userIdsToAdd.isEmpty() ? null : userIdsToAdd,
-                    userIdsToRemove.isEmpty() ? null : userIdsToRemove);
+                    userIdsToRemove.isEmpty() ? null : userIdsToRemove, settings);
             String result = replicationGroupXml(group);
             return Response.ok(AwsQueryResponse.envelope("ModifyReplicationGroup", AwsNamespaces.EC, result)).build();
         } catch (AwsException e) {
@@ -169,7 +244,6 @@ public class ElastiCacheQueryHandler {
         String userId = params.getFirst("UserId");
         String userName = params.getFirst("UserName");
         String accessString = params.getFirst("AccessString");
-        String authModeType = params.getFirst("AuthenticationMode.Type");
         String engine = params.getFirst("Engine");
 
         if (userId == null || userId.isBlank()) {
@@ -179,18 +253,11 @@ public class ElastiCacheQueryHandler {
             return AwsQueryResponse.error("InvalidParameterValue", "UserName is required.", AwsNamespaces.EC, 400);
         }
 
-        AuthMode authMode;
-        List<String> passwords = new ArrayList<>();
-        if ("iam".equalsIgnoreCase(authModeType)) {
-            authMode = AuthMode.IAM;
-        } else if ("password".equalsIgnoreCase(authModeType)) {
-            authMode = AuthMode.PASSWORD;
-            passwords = extractMemberList(params, "AuthenticationMode.Passwords.member.");
-        } else {
-            authMode = AuthMode.NO_AUTH;
-        }
-
         try {
+            // A request naming no authentication at all keeps Floci's previous implicit no-password-required.
+            UserAuthentication auth = resolveUserAuthentication(params);
+            AuthMode authMode = auth != null ? auth.mode() : AuthMode.NO_AUTH;
+            List<String> passwords = auth != null ? auth.passwords() : List.of();
             ElastiCacheUser user = service.createUser(userId, userName, authMode, passwords, accessString, engine);
             return Response.ok(AwsQueryResponse.envelope("CreateUser", AwsNamespaces.EC, userXml(user))).build();
         } catch (AwsException e) {
@@ -203,7 +270,7 @@ public class ElastiCacheQueryHandler {
         String filterEngine = params.getFirst("Engine");
         try {
             Collection<ElastiCacheUser> users = service.listUsers(filterId, filterEngine);
-            var xml = new XmlBuilder().start("Users");
+            XmlBuilder xml = new XmlBuilder().start("Users");
             for (ElastiCacheUser u : users) {
                 xml.start("member").raw(userXml(u)).end("member");
             }
@@ -220,9 +287,18 @@ public class ElastiCacheQueryHandler {
         if (userId == null || userId.isBlank()) {
             return AwsQueryResponse.error("InvalidParameterValue", "UserId is required.", AwsNamespaces.EC, 400);
         }
-        List<String> passwords = extractMemberList(params, "AuthenticationMode.Passwords.member.");
+        String accessString = params.getFirst("AccessString");
+        String appendAccessString = params.getFirst("AppendAccessString");
+        if (accessString != null && appendAccessString != null) {
+            return AwsQueryResponse.error("InvalidParameterCombination",
+                    "AccessString and AppendAccessString cannot be specified together.", AwsNamespaces.EC, 400);
+        }
         try {
-            ElastiCacheUser user = service.modifyUser(userId, passwords.isEmpty() ? null : passwords, engine);
+            UserAuthentication auth = resolveUserAuthentication(params);
+            ElastiCacheUser user = service.modifyUser(userId,
+                    auth != null ? auth.mode() : null,
+                    auth != null ? auth.passwords() : null,
+                    accessString, appendAccessString, engine);
             return Response.ok(AwsQueryResponse.envelope("ModifyUser", AwsNamespaces.EC, userXml(user))).build();
         } catch (AwsException e) {
             return AwsQueryResponse.error(e.getErrorCode(), e.getMessage(), AwsNamespaces.EC, e.getHttpStatus());
@@ -243,9 +319,9 @@ public class ElastiCacheQueryHandler {
         }
     }
 
-    // ── Cache Clusters (Memcached) ────────────────────────────────────────────
+    // ── Cache Clusters (Memcached, and single-node Redis/Valkey) ──────────────
 
-    private Response handleCreateCacheCluster(MultivaluedMap<String, String> params) {
+    private Response handleCreateCacheCluster(MultivaluedMap<String, String> params, String region) {
         String clusterId = params.getFirst("CacheClusterId");
         String engine = params.getFirst("Engine");
 
@@ -253,32 +329,137 @@ public class ElastiCacheQueryHandler {
             return AwsQueryResponse.error("InvalidParameterValue",
                     "CacheClusterId is required.", AwsNamespaces.EC, 400);
         }
-        if (!"memcached".equalsIgnoreCase(engine)) {
+        if (!"memcached".equalsIgnoreCase(engine) && !"redis".equalsIgnoreCase(engine)
+                && !"valkey".equalsIgnoreCase(engine)) {
             return AwsQueryResponse.error("InvalidParameterValue",
-                    "Engine must be 'memcached'. For Redis/Valkey use CreateReplicationGroup.", AwsNamespaces.EC, 400);
+                    "Engine must be 'memcached', 'redis' or 'valkey'.", AwsNamespaces.EC, 400);
         }
 
         try {
-            CacheCluster cluster = memcachedService.createCacheCluster(clusterId);
-            return Response.ok(AwsQueryResponse.envelope("CreateCacheCluster", AwsNamespaces.EC, cacheClusterXml(cluster))).build();
+            ElastiCacheService.CreateCacheClusterRequest request = new ElastiCacheService.CreateCacheClusterRequest(
+                            clusterId,
+                            engine,
+                            params.getFirst("EngineVersion"),
+                            params.getFirst("CacheNodeType"),
+                            intParam(params, "NumCacheNodes"),
+                            intParam(params, "Port"),
+                            cacheClusterAuthMode(params),
+                            params.getFirst("AuthToken"),
+                            params.getFirst("CacheParameterGroupName"),
+                            params.getFirst("CacheSubnetGroupName"),
+                            optionalInt(params.getFirst("SnapshotRetentionLimit")),
+                            params.getFirst("SnapshotWindow"),
+                            params.getFirst("PreferredMaintenanceWindow"),
+                            params.getFirst("PreferredAvailabilityZone"),
+                            parseSecurityGroupIds(params),
+                            params.getFirst("NetworkType"),
+                            params.getFirst("IpDiscovery"),
+                            boolParam(params, "AtRestEncryptionEnabled"),
+                            region,
+                            parseTags(params));
+            CacheCluster cluster = "memcached".equalsIgnoreCase(engine)
+                    ? memcachedService.createCacheCluster(request)
+                    : service.createCacheCluster(request);
+            return Response.ok(AwsQueryResponse.envelope("CreateCacheCluster", AwsNamespaces.EC,
+                    cacheClusterXml(cluster, false))).build();
         } catch (AwsException e) {
             return AwsQueryResponse.error(e.getErrorCode(), e.getMessage(), AwsNamespaces.EC, e.getHttpStatus());
         }
     }
 
+    /** Read exactly as CreateReplicationGroup reads it, so both actions agree about one request. */
+    private static AuthMode cacheClusterAuthMode(MultivaluedMap<String, String> params) {
+        String authToken = params.getFirst("AuthToken");
+        if (authToken != null && !authToken.isBlank()) {
+            return AuthMode.PASSWORD;
+        }
+        if ("true".equalsIgnoreCase(params.getFirst("TransitEncryptionEnabled"))) {
+            return AuthMode.IAM;
+        }
+        return AuthMode.NO_AUTH;
+    }
+
     private Response handleDescribeCacheClusters(MultivaluedMap<String, String> params) {
         String filterId = params.getFirst("CacheClusterId");
+        boolean showNodeInfo = "true".equalsIgnoreCase(params.getFirst("ShowCacheNodeInfo"));
+        boolean filtered = filterId != null && !filterId.isBlank();
         try {
-            Collection<CacheCluster> clusterList = memcachedService.listCacheClusters(filterId);
-            var xml = new XmlBuilder().start("CacheClusters");
+            List<ElastiCacheService.MemberCacheCluster> members = service.listMemberCacheClusters(filterId);
+            List<CacheCluster> clusterList = new ArrayList<>(service.findCacheClusters(filterId));
+            // The Memcached lookup is the one that raises CacheClusterNotFound for an unknown id,
+            // which is the right answer only once no other source has answered.
+            if (!filtered || (members.isEmpty() && clusterList.isEmpty())) {
+                clusterList.addAll(memcachedService.listCacheClusters(filterId));
+            }
+            XmlBuilder xml = new XmlBuilder().start("CacheClusters");
             for (CacheCluster c : clusterList) {
-                xml.raw(cacheClusterXml(c));
+                xml.raw(cacheClusterXml(c, showNodeInfo));
+            }
+            for (ElastiCacheService.MemberCacheCluster member : members) {
+                xml.raw(memberCacheClusterXml(member, showNodeInfo));
             }
             xml.end("CacheClusters").start("Marker").end("Marker");
             return Response.ok(AwsQueryResponse.envelope("DescribeCacheClusters", AwsNamespaces.EC, xml.build())).build();
         } catch (AwsException e) {
             return AwsQueryResponse.error(e.getErrorCode(), e.getMessage(), AwsNamespaces.EC, e.getHttpStatus());
         }
+    }
+
+    private String memberCacheClusterXml(ElastiCacheService.MemberCacheCluster member, boolean showNodeInfo) {
+        ReplicationGroup g = member.group();
+        boolean authTokenEnabled = g.getAuthMode() == AuthMode.PASSWORD;
+        XmlBuilder xml = new XmlBuilder()
+                .start("CacheCluster")
+                  .elem("CacheClusterId", member.cacheClusterId())
+                  .elem("CacheClusterStatus", memberCacheClusterStatus(g))
+                  .elem("NumCacheNodes", 1L)
+                  .elem("ReplicationGroupId", g.getReplicationGroupId())
+                  .elem("AutoMinorVersionUpgrade", true)
+                  .elem("AuthTokenEnabled", authTokenEnabled)
+                  .elem("TransitEncryptionEnabled", transitEncryptionEnabled(g))
+                  .elem("AtRestEncryptionEnabled", g.isAtRestEncryptionEnabled());
+        if (g.getEngine() != null) {
+            xml.elem("Engine", g.getEngine());
+        }
+        if (g.getEngineVersion() != null) {
+            xml.elem("EngineVersion", g.getEngineVersion());
+        }
+        if (g.getCacheNodeType() != null) {
+            xml.elem("CacheNodeType", g.getCacheNodeType());
+        }
+        if (g.getCacheParameterGroupName() != null) {
+            xml.start("CacheParameterGroup")
+               .elem("CacheParameterGroupName", g.getCacheParameterGroupName())
+               .elem("ParameterApplyStatus", "in-sync")
+               .end("CacheParameterGroup");
+        }
+        if (g.getCacheSubnetGroupName() != null) {
+            xml.elem("CacheSubnetGroupName", g.getCacheSubnetGroupName());
+        }
+        if (showNodeInfo && g.getConfigurationEndpoint() != null) {
+            xml.start("CacheNodes")
+               .start("CacheNode")
+                 .elem("CacheNodeId", "0001")
+                 .elem("CacheNodeStatus", "available")
+                 .start("Endpoint")
+                   .elem("Address", g.getConfigurationEndpoint().address())
+                   .elem("Port", (long) member.port())
+                 .end("Endpoint")
+               .end("CacheNode")
+               .end("CacheNodes");
+        }
+        return xml.end("CacheCluster").build();
+    }
+
+    /**
+     * Members mirror the group's status, except {@code create-failed}: that value is only legal
+     * on ReplicationGroup.Status, so members report the documented {@code restore-failed}.
+     */
+    private static String memberCacheClusterStatus(ReplicationGroup g) {
+        if (g.getStatus() == ReplicationGroupStatus.CREATE_FAILED) {
+            return "restore-failed";
+        }
+        return g.getStatus().wireName();
     }
 
     private Response handleDeleteCacheCluster(MultivaluedMap<String, String> params) {
@@ -288,8 +469,13 @@ public class ElastiCacheQueryHandler {
                     "CacheClusterId is required.", AwsNamespaces.EC, 400);
         }
         try {
-            CacheCluster cluster = memcachedService.deleteCacheCluster(clusterId);
-            return Response.ok(AwsQueryResponse.envelope("DeleteCacheCluster", AwsNamespaces.EC, cacheClusterXml(cluster))).build();
+            // Standalone redis/valkey clusters are stored apart from Memcached ones, so the id is
+            // looked for there first and the Memcached delete keeps raising the not-found fault.
+            CacheCluster cluster = service.findCacheClusters(clusterId).isEmpty()
+                    ? memcachedService.deleteCacheCluster(clusterId)
+                    : service.deleteCacheCluster(clusterId);
+            return Response.ok(AwsQueryResponse.envelope("DeleteCacheCluster", AwsNamespaces.EC,
+                    cacheClusterXml(cluster, false))).build();
         } catch (AwsException e) {
             return AwsQueryResponse.error(e.getErrorCode(), e.getMessage(), AwsNamespaces.EC, e.getHttpStatus());
         }
@@ -304,7 +490,7 @@ public class ElastiCacheQueryHandler {
                     params.getFirst("CacheSubnetGroupDescription"),
                     parseSubnetIds(params),
                     parseTags(params));
-            var xml = new XmlBuilder();
+            XmlBuilder xml = new XmlBuilder();
             appendSubnetGroup(xml, group);
             return Response.ok(AwsQueryResponse.envelope("CreateCacheSubnetGroup", AwsNamespaces.EC, xml.build())).build();
         } catch (AwsException e) {
@@ -316,7 +502,7 @@ public class ElastiCacheQueryHandler {
         try {
             List<CacheSubnetGroup> groups =
                     service.describeCacheSubnetGroups(params.getFirst("CacheSubnetGroupName"));
-            var xml = new XmlBuilder().start("CacheSubnetGroups");
+            XmlBuilder xml = new XmlBuilder().start("CacheSubnetGroups");
             groups.forEach(group -> appendSubnetGroup(xml, group));
             xml.end("CacheSubnetGroups");
             return Response.ok(AwsQueryResponse.envelope("DescribeCacheSubnetGroups", AwsNamespaces.EC, xml.build())).build();
@@ -331,7 +517,7 @@ public class ElastiCacheQueryHandler {
                     params.getFirst("CacheSubnetGroupName"),
                     params.getFirst("CacheSubnetGroupDescription"),
                     parseSubnetIds(params));
-            var xml = new XmlBuilder();
+            XmlBuilder xml = new XmlBuilder();
             appendSubnetGroup(xml, group);
             return Response.ok(AwsQueryResponse.envelope("ModifyCacheSubnetGroup", AwsNamespaces.EC, xml.build())).build();
         } catch (AwsException e) {
@@ -362,8 +548,8 @@ public class ElastiCacheQueryHandler {
                 .end("Subnet"));
         xml.end("Subnets")
                 .start("SupportedNetworkTypes").elem("member", "ipv4").end("SupportedNetworkTypes")
-                .elem("ARN", "arn:aws:elasticache:" + regionResolver.getRegion() + ":"
-                        + regionResolver.getAccountId() + ":subnetgroup:" + group.getName())
+                .elem("ARN", AwsArnUtils.Arn.of("elasticache", regionResolver.getRegion(),
+                        regionResolver.getAccountId(), "subnetgroup:" + group.getName()).toString())
                 .end("CacheSubnetGroup");
     }
 
@@ -382,6 +568,21 @@ public class ElastiCacheQueryHandler {
         return subnetIds;
     }
 
+    /** Reads the SecurityGroupIds list under every spelling the Query protocol sends it in. */
+    private static List<String> parseSecurityGroupIds(MultivaluedMap<String, String> params) {
+        List<String> securityGroupIds = new ArrayList<>();
+        for (String prefix : List.of("SecurityGroupIds.SecurityGroupId", "SecurityGroupIds.member")) {
+            for (int i = 1; ; i++) {
+                String securityGroupId = params.getFirst(prefix + "." + i);
+                if (securityGroupId == null) {
+                    break;
+                }
+                securityGroupIds.add(securityGroupId);
+            }
+        }
+        return securityGroupIds;
+    }
+
 private Response handleCreateCacheParameterGroup(MultivaluedMap<String, String> params) {
         try {
             CacheParameterGroup group = service.createCacheParameterGroup(
@@ -389,7 +590,7 @@ private Response handleCreateCacheParameterGroup(MultivaluedMap<String, String> 
                     params.getFirst("CacheParameterGroupFamily"),
                     params.getFirst("Description"),
                     parseTags(params));
-            var xml = new XmlBuilder();
+            XmlBuilder xml = new XmlBuilder();
             appendParameterGroup(xml, group);
             return Response.ok(AwsQueryResponse.envelope("CreateCacheParameterGroup", AwsNamespaces.EC, xml.build())).build();
         } catch (AwsException e) {
@@ -401,7 +602,7 @@ private Response handleCreateCacheParameterGroup(MultivaluedMap<String, String> 
         try {
             List<CacheParameterGroup> groups =
                     service.describeCacheParameterGroups(params.getFirst("CacheParameterGroupName"));
-            var xml = new XmlBuilder().start("CacheParameterGroups");
+            XmlBuilder xml = new XmlBuilder().start("CacheParameterGroups");
             groups.forEach(group -> appendParameterGroup(xml, group));
             xml.end("CacheParameterGroups");
             return Response.ok(AwsQueryResponse.envelope("DescribeCacheParameterGroups", AwsNamespaces.EC, xml.build())).build();
@@ -414,7 +615,7 @@ private Response handleCreateCacheParameterGroup(MultivaluedMap<String, String> 
         try {
             String name = params.getFirst("CacheParameterGroupName");
             service.modifyCacheParameterGroup(name, parseParameterNameValues(params));
-            var xml = new XmlBuilder().elem("CacheParameterGroupName", name);
+            XmlBuilder xml = new XmlBuilder().elem("CacheParameterGroupName", name);
             return Response.ok(AwsQueryResponse.envelope("ModifyCacheParameterGroup", AwsNamespaces.EC, xml.build())).build();
         } catch (AwsException e) {
             return AwsQueryResponse.error(e.getErrorCode(), e.getMessage(), AwsNamespaces.EC, e.getHttpStatus());
@@ -429,7 +630,7 @@ private Response handleCreateCacheParameterGroup(MultivaluedMap<String, String> 
             String source = params.getFirst("Source");
             boolean includeUserParameters = source == null || source.isBlank() || "user".equals(source);
 
-            var xml = new XmlBuilder().start("Parameters");
+            XmlBuilder xml = new XmlBuilder().start("Parameters");
             if (includeUserParameters) {
                 group.getParameters().forEach((name, value) -> xml
                         .start("Parameter")
@@ -461,8 +662,9 @@ private Response handleCreateCacheParameterGroup(MultivaluedMap<String, String> 
             // Every component names part of the resource, so each is checked before the name is
             // used: a partition, service, region or account that is not this one asks about a
             // different resource, and answering from the trailing name would describe the wrong.
-            if (!"aws".equals(arn[1])) {
-                throw new AwsException("InvalidARN", "partition field is wrong. Expected value is aws", 400);
+            String partition = AwsRegions.partitionFor(regionResolver.getRegion());
+            if (!partition.equals(arn[1])) {
+                throw new AwsException("InvalidARN", "partition field is wrong. Expected value is " + partition, 400);
             }
             if (!"elasticache".equals(arn[2])) {
                 throw new AwsException("InvalidARN",
@@ -478,6 +680,31 @@ private Response handleCreateCacheParameterGroup(MultivaluedMap<String, String> 
             }
 
             Map<String, String> tags = Map.of();
+            if ("replicationgroup".equals(arn[5])) {
+                // the store keys groups by id alone; the record must be the one the ARN names
+                ReplicationGroup group = service.getReplicationGroup(arn[6]);
+                if (group.getArn() != null && !group.getArn().equalsIgnoreCase(resourceName)) {
+                    throw new AwsException("ReplicationGroupNotFoundFault",
+                            "Replication group " + arn[6] + " not found.", 404);
+                }
+                tags = group.getTags();
+            }
+            if ("cluster".equals(arn[5])) {
+                CacheCluster cluster = service.findCacheClusters(arn[6]).stream().findFirst().orElse(null);
+                if (cluster != null) {
+                    // Same shape as the replicationgroup arm: the store keys clusters by id
+                    // alone, so the record found must also be the one this ARN names.
+                    if (cluster.getArn() != null && !cluster.getArn().equalsIgnoreCase(resourceName)) {
+                        throw new AwsException("CacheClusterNotFound",
+                                "Cache cluster " + arn[6] + " not found.", 404);
+                    }
+                    tags = cluster.getTags();
+                } else if (service.listMemberCacheClusters(arn[6]).isEmpty()) {
+                    // Memcached clusters and replication group members carry no tags, but they do
+                    // exist. Only an id no source knows is a not-found.
+                    memcachedService.getCacheCluster(arn[6]);
+                }
+            }
             if ("subnetgroup".equals(arn[5])) {
                 tags = service.describeCacheSubnetGroups(arn[6]).getFirst().getTags();
             }
@@ -487,7 +714,7 @@ private Response handleCreateCacheParameterGroup(MultivaluedMap<String, String> 
                                 arn[6] + " is not present", 404))
                         .getTags();
             }
-            var xml = new XmlBuilder().start("TagList");
+            XmlBuilder xml = new XmlBuilder().start("TagList");
             tags.forEach((key, value) -> xml.start("Tag")
                     .elem("Key", key)
                     .elem("Value", value)
@@ -519,8 +746,8 @@ private Response handleCreateCacheParameterGroup(MultivaluedMap<String, String> 
     }
 
     private String parameterGroupArn(String name) {
-        return "arn:aws:elasticache:" + regionResolver.getRegion() + ":"
-                + regionResolver.getAccountId() + ":parametergroup:" + name;
+        return AwsArnUtils.Arn.of("elasticache", regionResolver.getRegion(),
+                regionResolver.getAccountId(), "parametergroup:" + name).toString();
     }
 
     /**
@@ -584,45 +811,232 @@ private Response handleCreateCacheParameterGroup(MultivaluedMap<String, String> 
 
     // ── XML helpers ───────────────────────────────────────────────────────────
 
-    private String cacheClusterXml(CacheCluster c) {
+    /**
+     * A cache cluster as its engine has AWS report it. Memcached carries a ConfigurationEndpoint,
+     * the address of its node-discovery endpoint; a single-node redis or valkey cluster has none,
+     * and its endpoint is the node's, reported under CacheNodes when the request asks for node
+     * info. terraform-provider-aws reads {@code port} from whichever of the two is present, so a
+     * redis cluster answering with a ConfigurationEndpoint instead would report itself as the
+     * wrong thing.
+     */
+    private String cacheClusterXml(CacheCluster c, boolean showNodeInfo) {
         Endpoint ep = c.getConfigurationEndpoint();
-        var xml = new XmlBuilder()
+        XmlBuilder xml = new XmlBuilder()
                 .start("CacheCluster")
                   .elem("CacheClusterId", c.getCacheClusterId())
-                  .elem("CacheClusterStatus", c.getCacheClusterStatus().name().toLowerCase())
+                  .elem("CacheClusterStatus", c.getCacheClusterStatus().wireName())
                   .elem("Engine", c.getEngine())
                   .elem("EngineVersion", c.getEngineVersion());
-        if (ep != null) {
-            xml.start("ConfigurationEndpoint")
-               .elem("Address", ep.address())
-               .elem("Port", (long) ep.port())
-               .end("ConfigurationEndpoint");
+        boolean memcached = "memcached".equals(c.getEngine());
+        int numCacheNodes = c.getNumCacheNodes();
+        if (memcached) {
+            if (ep != null) {
+                xml.start("ConfigurationEndpoint")
+                   .elem("Address", ep.address())
+                   .elem("Port", (long) ep.port())
+                   .end("ConfigurationEndpoint");
+            }
+            // A record persisted before node counts were stored reads back 0; the cluster it
+            // describes was created with AWS's default of one node.
+            numCacheNodes = Math.max(1, numCacheNodes);
+            xml.elem("NumCacheNodes", (long) numCacheNodes);
+        } else {
+            xml.elem("NumCacheNodes", (long) numCacheNodes)
+               .elem("AutoMinorVersionUpgrade", true)
+               .elem("AuthTokenEnabled", c.getAuthMode() == AuthMode.PASSWORD)
+               .elem("TransitEncryptionEnabled", c.getAuthMode() != null && c.getAuthMode() != AuthMode.NO_AUTH)
+               .elem("AtRestEncryptionEnabled", c.isAtRestEncryptionEnabled())
+               .elem("SnapshotRetentionLimit", (long) c.getSnapshotRetentionLimit())
+               .elem("SnapshotWindow", c.getSnapshotWindow() != null
+                       ? c.getSnapshotWindow() : ReplicationGroupSettings.DEFAULT_SNAPSHOT_WINDOW)
+               .elem("PreferredMaintenanceWindow", c.getPreferredMaintenanceWindow() != null
+                       ? c.getPreferredMaintenanceWindow() : BackupWindows.DEFAULT_MAINTENANCE_WINDOW);
+        }
+        if (c.getCacheClusterCreateTime() != null) {
+            xml.elem("CacheClusterCreateTime", c.getCacheClusterCreateTime().toString());
+        }
+        if (c.getPreferredAvailabilityZone() != null) {
+            xml.elem("PreferredAvailabilityZone", c.getPreferredAvailabilityZone());
+        }
+        if (c.getNetworkType() != null) {
+            xml.elem("NetworkType", c.getNetworkType());
+        }
+        if (c.getIpDiscovery() != null) {
+            xml.elem("IpDiscovery", c.getIpDiscovery());
+        }
+        if (!c.getSecurityGroupIds().isEmpty()) {
+            xml.start("SecurityGroups");
+            for (String securityGroupId : c.getSecurityGroupIds()) {
+                xml.start("member")
+                   .elem("SecurityGroupId", securityGroupId)
+                   .elem("Status", "active")
+                   .end("member");
+            }
+            xml.end("SecurityGroups");
+        }
+        if (c.getCacheNodeType() != null) {
+            xml.elem("CacheNodeType", c.getCacheNodeType());
+        }
+        if (c.getCacheParameterGroupName() != null) {
+            xml.start("CacheParameterGroup")
+               .elem("CacheParameterGroupName", c.getCacheParameterGroupName())
+               .elem("ParameterApplyStatus", "in-sync")
+               .end("CacheParameterGroup");
+        }
+        if (c.getCacheSubnetGroupName() != null) {
+            xml.elem("CacheSubnetGroupName", c.getCacheSubnetGroupName());
+        }
+        if (c.getArn() != null) {
+            xml.elem("ARN", c.getArn());
+        }
+        if (showNodeInfo && ep != null) {
+            // terraform-provider-aws dereferences CacheNodeCreateTime and ParameterGroupStatus
+            // without a nil check while adopting the resource, so a node carrying only an
+            // endpoint fails the refresh right after a successful create. Both are stable
+            // metadata AWS returns on every available node, and both are already known here:
+            // a node was created with its cluster, and its parameter group has the same in-sync
+            // status reported for the cluster above. A redis cluster has one node; a Memcached
+            // cluster has NumCacheNodes, all served by its one container, so every node reports
+            // the cluster's endpoint.
+            xml.start("CacheNodes");
+            for (int node = 1; node <= (memcached ? numCacheNodes : 1); node++) {
+                xml.start("CacheNode")
+                     .elem("CacheNodeId", String.format("%04d", node))
+                     .elem("CacheNodeStatus", "available");
+                if (c.getCacheClusterCreateTime() != null) {
+                    xml.elem("CacheNodeCreateTime", c.getCacheClusterCreateTime().toString());
+                }
+                xml.start("Endpoint")
+                     .elem("Address", ep.address())
+                     .elem("Port", (long) ep.port())
+                   .end("Endpoint")
+                   .elem("ParameterGroupStatus", "in-sync");
+                if (c.getPreferredAvailabilityZone() != null) {
+                    xml.elem("CustomerAvailabilityZone", c.getPreferredAvailabilityZone());
+                }
+                xml.end("CacheNode");
+            }
+            xml.end("CacheNodes");
         }
         return xml.end("CacheCluster").build();
+    }
+
+    /**
+     * TransitEncryptionEnabled is not AuthTokenEnabled. An auth token forces encryption in transit,
+     * so a PASSWORD group is always encrypted — but the reverse does not hold: a group created with
+     * {@code TransitEncryptionEnabled=true} and no token is encrypted in transit too, and this
+     * handler records exactly that request as {@link AuthMode#IAM}. Reporting the auth-token flag
+     * for both answers false for such a group, which is permanent drift for Terraform's
+     * aws_elasticache_replication_group: it reads transit_encryption_enabled back on every plan.
+     */
+    private static boolean transitEncryptionEnabled(ReplicationGroup g) {
+        return g.getAuthMode() != AuthMode.NO_AUTH;
     }
 
     private String replicationGroupXml(ReplicationGroup g) {
         Endpoint ep = g.getConfigurationEndpoint();
         boolean authTokenEnabled = g.getAuthMode() == AuthMode.PASSWORD;
-        var xml = new XmlBuilder()
+        List<ElastiCacheService.MemberCacheCluster> members = service.memberCacheClusters(g);
+        XmlBuilder xml = new XmlBuilder()
                 .start("ReplicationGroup")
                   .elem("ReplicationGroupId", g.getReplicationGroupId())
                   .elem("Description", g.getDescription())
-                  .elem("Status", g.getStatus().name().toLowerCase())
+                  .elem("Status", g.getStatus().wireName())
                   .elem("AuthTokenEnabled", authTokenEnabled)
-                  .elem("TransitEncryptionEnabled", authTokenEnabled)
-                  .elem("AtRestEncryptionEnabled", false)
-                  .elem("ClusterEnabled", false)
-                  .elem("MultiAZ", "disabled")
-                  .elem("AutomaticFailover", "disabled")
-                  .elem("SnapshotRetentionLimit", 0L);
-        if (ep != null) {
+                  .elem("TransitEncryptionEnabled", transitEncryptionEnabled(g))
+                  .elem("AtRestEncryptionEnabled", g.isAtRestEncryptionEnabled())
+                  .elem("ClusterEnabled", g.isClusterEnabled())
+                  .elem("ClusterMode", g.isClusterEnabled() ? "enabled" : "disabled")
+                  .elem("MultiAZ", g.isMultiAzEnabled() ? "enabled" : "disabled")
+                  .elem("AutomaticFailover", g.isAutomaticFailoverEnabled() ? "enabled" : "disabled")
+                  .elem("SnapshotRetentionLimit", (long) g.getSnapshotRetentionLimit());
+        xml.elem("SnapshotWindow", g.getSnapshotWindow() != null
+                ? g.getSnapshotWindow() : ReplicationGroupSettings.DEFAULT_SNAPSHOT_WINDOW);
+        if (g.getKmsKeyId() != null) {
+            xml.elem("KmsKeyId", g.getKmsKeyId());
+        }
+        if (g.getEngine() != null) {
+            xml.elem("Engine", g.getEngine());
+        }
+        if (g.getCacheNodeType() != null) {
+            xml.elem("CacheNodeType", g.getCacheNodeType());
+        }
+        if (g.getArn() != null) {
+            xml.elem("ARN", g.getArn());
+        }
+        xml.start("MemberClusters");
+        for (ElastiCacheService.MemberCacheCluster member : members) {
+            xml.elem("ClusterId", member.cacheClusterId());
+        }
+        xml.end("MemberClusters");
+        xml.start("NodeGroups");
+        if (g.isClusterEnabled() && !g.getClusterNodes().isEmpty()) {
+            appendClusterModeNodeGroups(xml, g);
+        } else {
+            appendSingleNodeGroup(xml, g, members, ep);
+        }
+        xml.end("NodeGroups");
+        if (g.isClusterEnabled() && ep != null) {
             xml.start("ConfigurationEndpoint")
                .elem("Address", ep.address())
                .elem("Port", (long) ep.port())
                .end("ConfigurationEndpoint");
         }
         return xml.end("ReplicationGroup").build();
+    }
+
+    private static void appendClusterModeNodeGroups(XmlBuilder xml, ReplicationGroup g) {
+        Map<String, List<ClusterNode>> byNodeGroup = new LinkedHashMap<>();
+        for (ClusterNode node : g.getClusterNodes()) {
+            byNodeGroup.computeIfAbsent(node.getNodeGroupId(), key -> new ArrayList<>()).add(node);
+        }
+        byNodeGroup.forEach((nodeGroupId, nodes) -> {
+            xml.start("NodeGroup")
+                    .elem("NodeGroupId", nodeGroupId)
+                    .elem("Status", "available")
+                    .elem("Slots", nodes.getFirst().getSlots())
+                    .start("NodeGroupMembers");
+            for (ClusterNode node : nodes) {
+                xml.start("NodeGroupMember")
+                        .elem("CacheClusterId", node.getMemberClusterId())
+                        .elem("CacheNodeId", "0001")
+                        .end("NodeGroupMember");
+            }
+            xml.end("NodeGroupMembers").end("NodeGroup");
+        });
+    }
+
+    private static void appendSingleNodeGroup(XmlBuilder xml, ReplicationGroup g,
+                                              List<ElastiCacheService.MemberCacheCluster> members,
+                                              Endpoint ep) {
+        xml.start("NodeGroup")
+                .elem("NodeGroupId", "0001")
+                .elem("Status", "available");
+        if (ep != null) {
+            xml.start("PrimaryEndpoint")
+                    .elem("Address", ep.address())
+                    .elem("Port", (long) ep.port())
+                    .end("PrimaryEndpoint")
+                    .start("ReaderEndpoint")
+                    .elem("Address", ep.address())
+                    .elem("Port", (long) ep.port())
+                    .end("ReaderEndpoint");
+        }
+        xml.start("NodeGroupMembers");
+        for (ElastiCacheService.MemberCacheCluster member : members) {
+            xml.start("NodeGroupMember")
+                    .elem("CacheClusterId", member.cacheClusterId())
+                    .elem("CacheNodeId", "0001")
+                    .elem("CurrentRole", member.primary() ? "primary" : "replica");
+            if (ep != null) {
+                xml.start("ReadEndpoint")
+                        .elem("Address", ep.address())
+                        .elem("Port", (long) member.port())
+                        .end("ReadEndpoint");
+            }
+            xml.end("NodeGroupMember");
+        }
+        xml.end("NodeGroupMembers").end("NodeGroup");
     }
 
     private String userXml(ElastiCacheUser u) {
@@ -645,8 +1059,73 @@ private Response handleCreateCacheParameterGroup(MultivaluedMap<String, String> 
                 // MinimumEngineVersion: the only value AWS documents; no valkey-specific one is published.
                 .elem("MinimumEngineVersion", "6.0")
                 .start("UserGroupIds").end("UserGroupIds")
-                .elem("ARN", AwsArnUtils.Arn.of("elasticache", regionResolver.getDefaultRegion(), regionResolver.getAccountId(), "user:" + u.getUserId()).toString())
+                .elem("ARN", userArn(u))
                 .build();
+    }
+
+    /**
+     * The ARN stored at CreateUser. Users persisted before it was stored keep the default-region ARN
+     * they were always reported with, so their identity stays stable.
+     */
+    private String userArn(ElastiCacheUser u) {
+        if (u.getArn() != null) {
+            return u.getArn();
+        }
+        return AwsArnUtils.Arn.of("elasticache", regionResolver.getDefaultRegion(),
+                regionResolver.getAccountId(), "user:" + u.getUserId()).toString();
+    }
+
+    private record UserAuthentication(AuthMode mode, List<String> passwords) {}
+
+    /**
+     * Resolves the authentication a CreateUser or ModifyUser request asks for. AWS accepts it
+     * either as an {@code AuthenticationMode} or through the top-level {@code Passwords} and
+     * {@code NoPasswordRequired} members, so passwords given either way mean password
+     * authentication. Returns null when the request names no authentication at all.
+     */
+    private static UserAuthentication resolveUserAuthentication(MultivaluedMap<String, String> params) {
+        String type = params.getFirst("AuthenticationMode.Type");
+        List<String> passwords = extractMemberList(params, "AuthenticationMode.Passwords.member.");
+        if (passwords.isEmpty()) {
+            passwords = extractMemberList(params, "Passwords.member.");
+        }
+        boolean noPasswordRequired = Boolean.parseBoolean(params.getFirst("NoPasswordRequired"));
+
+        if (type == null || type.isBlank()) {
+            if (noPasswordRequired && !passwords.isEmpty()) {
+                throw invalidCombination("NoPasswordRequired cannot be true when Passwords are provided.");
+            }
+            if (!passwords.isEmpty()) {
+                return new UserAuthentication(AuthMode.PASSWORD, passwords);
+            }
+            return noPasswordRequired ? new UserAuthentication(AuthMode.NO_AUTH, List.of()) : null;
+        }
+
+        String normalizedType = type.toLowerCase(Locale.ROOT);
+        if (noPasswordRequired && !"no-password-required".equals(normalizedType)) {
+            throw invalidCombination("NoPasswordRequired cannot be true when AuthenticationMode.Type is " + type + ".");
+        }
+        return switch (normalizedType) {
+            case "password" -> {
+                if (passwords.isEmpty()) {
+                    throw new AwsException("InvalidParameterValue",
+                            "Passwords are required when AuthenticationMode.Type is password.", 400);
+                }
+                yield new UserAuthentication(AuthMode.PASSWORD, passwords);
+            }
+            case "iam", "no-password-required" -> {
+                if (!passwords.isEmpty()) {
+                    throw invalidCombination("Passwords cannot be provided when AuthenticationMode.Type is " + type + ".");
+                }
+                yield new UserAuthentication("iam".equals(normalizedType) ? AuthMode.IAM : AuthMode.NO_AUTH, List.of());
+            }
+            default -> throw new AwsException("InvalidParameterValue",
+                    "Invalid AuthenticationMode.Type " + type + ". Valid values are password, no-password-required and iam.", 400);
+        };
+    }
+
+    private static AwsException invalidCombination(String message) {
+        return new AwsException("InvalidParameterCombination", message, 400);
     }
 
     private static List<String> extractMemberList(MultivaluedMap<String, String> params, String prefix) {
@@ -663,7 +1142,7 @@ private Response handleCreateCacheParameterGroup(MultivaluedMap<String, String> 
 
     private static String extractUriHost(String token) {
         try {
-            return java.net.URI.create("http://" + token).getHost();
+            return URI.create("http://" + token).getHost();
         } catch (Exception e) {
             return "";
         }
@@ -671,15 +1150,15 @@ private Response handleCreateCacheParameterGroup(MultivaluedMap<String, String> 
 
     private static String extractQueryParam(String token, String name) {
         try {
-            String rawQuery = java.net.URI.create("http://" + token).getRawQuery();
+            String rawQuery = URI.create("http://" + token).getRawQuery();
             if (rawQuery == null) {
                 return "";
             }
             for (String pair : rawQuery.split("&")) {
                 int eq = pair.indexOf('=');
                 if (eq >= 0 && name.equals(pair.substring(0, eq))) {
-                    return java.net.URLDecoder.decode(pair.substring(eq + 1),
-                            java.nio.charset.StandardCharsets.UTF_8);
+                    return URLDecoder.decode(pair.substring(eq + 1),
+                            StandardCharsets.UTF_8);
                 }
             }
         } catch (Exception ignored) {}

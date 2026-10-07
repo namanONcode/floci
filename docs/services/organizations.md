@@ -25,7 +25,7 @@ AWS_ACCESS_KEY_ID=<new-account-id> AWS_SECRET_ACCESS_KEY=x \
 ## Management account vs member accounts
 
 Authorization mirrors AWS. Every mutating action is restricted to the **management account**
-— the account that called `CreateOrganization` — and returns `AccessDeniedException` otherwise.
+that called `CreateOrganization`, and returns HTTP 400 `AccessDeniedException` otherwise.
 Member accounts can read the organization they belong to (`DescribeOrganization`, `ListRoots`,
 `ListParents`, `DescribeAccount`, `DescribePolicy`), act on handshakes addressed to them, and
 call `LeaveOrganization`. An account in no organization gets
@@ -36,6 +36,12 @@ call `LeaveOrganization`. An account in no organization gets
 - The AWS-managed `p-FullAWSAccess` SCP is created with the organization and attached to the
   root, every new OU and every new account. Detaching the last service control policy from a
   target is rejected with `ConstraintViolationException`, as on AWS.
+- A new root has no policy types enabled, whatever the feature set; `ListRoots` reports an
+  empty `PolicyTypes` until `EnablePolicyType` is called, and `CreatePolicy` / `AttachPolicy`
+  for a type that is not enabled fail with `PolicyTypeNotEnabledException`. SCPs only apply to
+  member accounts once `SERVICE_CONTROL_POLICY` is enabled. The deprecated
+  `AvailablePolicyTypes` on `DescribeOrganization` lists only `SERVICE_CONTROL_POLICY`, for an
+  `ALL` organization, as on AWS.
 - A `CONSOLIDATED_BILLING` organization has no available policy types. `EnableAllFeatures`
   promotes it to `ALL`; with no member accounts the handshake completes immediately. With member
   accounts it stays `REQUESTED` until one of them calls `AcceptHandshake` — AWS requires *every*
@@ -74,6 +80,7 @@ call `LeaveOrganization`. An account in no organization gets
 | `DescribeAccount` | Returns information about the specified member account. |
 | `ListAccounts` | Lists every account in the organization. |
 | `ListAccountsForParent` | Lists the accounts directly under the specified root or OU. |
+| `ListAccountsWithInvalidEffectivePolicy` | Always returns an empty list; effective-policy validation is not modeled. |
 | `MoveAccount` | Moves an account from one root or OU to another. |
 | `RemoveAccountFromOrganization` | Removes a member account from the organization. |
 | `LeaveOrganization` | Removes the calling member account from its organization. |
@@ -111,3 +118,43 @@ call `LeaveOrganization`. An account in no organization gets
 | `ListHandshakesForAccount` | Lists the handshakes that involve the calling account. |
 | `ListHandshakesForOrganization` | Lists the handshakes associated with the organization. |
 <!-- floci:actions:end -->
+
+## Configuration
+
+| Environment variable | Default | Description |
+| --- | --- | --- |
+| `FLOCI_SERVICES_ORGANIZATIONS_ENABLED` | `true` | Enables the service |
+| `FLOCI_SERVICES_ORGANIZATIONS_SCP_ENFORCEMENT_ENABLED` | `false` | When `true` (and IAM enforcement is enabled), attached service control policies participate in IAM policy evaluation |
+| `FLOCI_SERVICES_ORGANIZATIONS_MANAGEMENT_ACCOUNT_EMAIL` | unset | Email reported for the organization's management account (`DescribeOrganization` master account, `ListAccounts`). Unset falls back to the built-in default |
+| `FLOCI_STORAGE_SERVICES_ORGANIZATIONS_MODE` | inherits `FLOCI_STORAGE_MODE` | Storage mode override |
+| `FLOCI_STORAGE_SERVICES_ORGANIZATIONS_FLUSH_INTERVAL_MS` | `5000` | Hybrid/WAL flush interval |
+
+## SCP enforcement
+
+With `FLOCI_SERVICES_IAM_ENFORCEMENT_ENABLED=true` and
+`FLOCI_SERVICES_ORGANIZATIONS_SCP_ENFORCEMENT_ENABLED=true`, service control policies attached to
+the root, OUs, and accounts participate in IAM policy evaluation: an action must be allowed at every
+level of the account's chain, before the caller's identity policies are consulted. SCPs never grant
+permissions on their own. See
+[Service Control Policies (SCPs)](iam.md#service-control-policies-scps) for the evaluation order,
+the account-root behaviour, and the cases that bypass enforcement.
+
+The evaluation itself lives in the IAM enforcement layer — this service stores the policies and
+resolves the chain, but with IAM enforcement off the flag has no effect.
+
+## Example
+
+```bash
+aws --endpoint-url http://localhost:4566 organizations create-organization --feature-set ALL
+
+ROOT_ID=$(aws --endpoint-url http://localhost:4566 organizations list-roots \
+  --query 'Roots[0].Id' --output text)
+
+aws --endpoint-url http://localhost:4566 organizations create-organizational-unit \
+  --parent-id "$ROOT_ID" --name workloads
+
+aws --endpoint-url http://localhost:4566 organizations create-account \
+  --email member@example.com --account-name "workload-account"
+
+aws --endpoint-url http://localhost:4566 organizations list-accounts
+```

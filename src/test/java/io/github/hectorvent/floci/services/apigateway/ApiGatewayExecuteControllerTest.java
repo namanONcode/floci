@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.apigateway;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsException;
@@ -11,13 +12,22 @@ import jakarta.ws.rs.core.HttpHeaders;
 import jakarta.ws.rs.core.MultivaluedHashMap;
 import jakarta.ws.rs.core.MultivaluedMap;
 import jakarta.ws.rs.core.Response;
+import jakarta.ws.rs.core.UriInfo;
 import org.junit.jupiter.api.Test;
 
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.time.Instant;
+import java.time.ZoneOffset;
+import java.time.ZonedDateTime;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.TimeZone;
+import java.util.function.Supplier;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.atLeastOnce;
@@ -33,9 +43,9 @@ class ApiGatewayExecuteControllerTest {
         RegionResolver regionResolver = mock(RegionResolver.class);
         when(regionResolver.getAccountId()).thenReturn("000000000000");
         return new ApiGatewayExecuteController(
-                null, null, null,
+                null, null, null, null,
                 regionResolver, objectMapper, null,
-                null, null, null, null, new ApiGatewayExecuteRouteContext(), null, null);
+                null, null, null, null, new ApiGatewayExecuteRouteContext(), null, null, null, null, null);
     }
 
     @Test
@@ -58,6 +68,22 @@ class ApiGatewayExecuteControllerTest {
                 "GET /users/{user}/orders/{order}", "/users/u-1/orders/o-2");
         assertEquals("u-1", p.get("user"));
         assertEquals("o-2", p.get("order"));
+    }
+
+    @Test
+    void capturesNamedParamsContainingUnderscores() {
+        Map<String, String> p = ApiGatewayExecuteController.extractV2PathParams(
+                "GET /api/v1/key-ids/{key_id}/jobs/{job_id}",
+                "/api/v1/key-ids/key-123/jobs/job-456");
+        assertEquals("key-123", p.get("key_id"));
+        assertEquals("job-456", p.get("job_id"));
+    }
+
+    @Test
+    void capturesNamedParamsContainingDigits() {
+        Map<String, String> p = ApiGatewayExecuteController.extractV2PathParams(
+                "GET /items/{item1}", "/items/value-1");
+        assertEquals("value-1", p.get("item1"));
     }
 
     @Test
@@ -105,19 +131,118 @@ class ApiGatewayExecuteControllerTest {
         requestHeaders.add("X-Dup", "first");
         requestHeaders.add("X-Dup", "second");
         requestHeaders.add("X-Dup", "third");
-        HttpHeaders headers = mock(HttpHeaders.class);
-        when(headers.getRequestHeaders()).thenReturn(requestHeaders);
 
         ObjectMapper objectMapper = new ObjectMapper();
         ObjectNode event = objectMapper.createObjectNode();
         ApiGatewayExecuteController controller = controller(objectMapper);
-        controller.putSingleValueHeaders(event, headers);
-        controller.putMultiValueHeaders(event, headers);
+        controller.putSingleValueHeaders(event, requestHeaders);
+        controller.putMultiValueHeaders(event, requestHeaders);
 
         assertEquals("third", event.path("headers").path("X-Dup").asText());
         assertEquals(
                 objectMapper.valueToTree(List.of("first", "second", "third")),
                 event.path("multiValueHeaders").path("X-Dup"));
+    }
+
+    @Test
+    void duplicateQueryParamUsesLastSingleValueAndPreservesAllMultiValues() {
+        // Measured against a real REST API (us-west-2, Lambda proxy integration):
+        // ?x=1&x=2&x=3 yields queryStringParameters {"x":"3"} and
+        // multiValueQueryStringParameters {"x":["1","2","3"]}, matching how AWS
+        // collapses duplicate request headers.
+        MultivaluedMap<String, String> queryParams = new MultivaluedHashMap<>();
+        queryParams.add("x", "1");
+        queryParams.add("x", "2");
+        queryParams.add("x", "3");
+        UriInfo uriInfo = mock(UriInfo.class);
+        when(uriInfo.getQueryParameters()).thenReturn(queryParams);
+
+        ObjectMapper objectMapper = new ObjectMapper();
+        ObjectNode event = objectMapper.createObjectNode();
+        ApiGatewayExecuteController controller = controller(objectMapper);
+        controller.putQueryStringParameters(event, uriInfo);
+        controller.putMultiValueQueryStringParameters(event, uriInfo);
+
+        assertEquals("3", event.path("queryStringParameters").path("x").asText());
+        assertEquals(
+                objectMapper.valueToTree(List.of("1", "2", "3")),
+                event.path("multiValueQueryStringParameters").path("x"));
+    }
+
+    @Test
+    void repeatedQueryParamEndingEmptyKeepsTheTrailingEmptyValue() {
+        // ?x=1&x= yields {"x":""}: the last value wins even when it is empty.
+        MultivaluedMap<String, String> queryParams = new MultivaluedHashMap<>();
+        queryParams.add("x", "1");
+        queryParams.add("x", "");
+        UriInfo uriInfo = mock(UriInfo.class);
+        when(uriInfo.getQueryParameters()).thenReturn(queryParams);
+
+        ObjectMapper objectMapper = new ObjectMapper();
+        ObjectNode event = objectMapper.createObjectNode();
+        ApiGatewayExecuteController controller = controller(objectMapper);
+        controller.putQueryStringParameters(event, uriInfo);
+
+        assertEquals("", event.path("queryStringParameters").path("x").asText());
+    }
+
+    @Test
+    void bracketedQueryParamNameSurvivesUnchanged() {
+        // JSON:API style filter[status]=open reaches the integration with the brackets intact;
+        // AWS does not rewrite or drop the name. Pinned so the parameter map stays a passthrough.
+        MultivaluedMap<String, String> queryParams = new MultivaluedHashMap<>();
+        queryParams.add("filter[status]", "open");
+        UriInfo uriInfo = mock(UriInfo.class);
+        when(uriInfo.getQueryParameters()).thenReturn(queryParams);
+
+        ObjectMapper objectMapper = new ObjectMapper();
+        ObjectNode event = objectMapper.createObjectNode();
+        ApiGatewayExecuteController controller = controller(objectMapper);
+        controller.putQueryStringParameters(event, uriInfo);
+        controller.putMultiValueQueryStringParameters(event, uriInfo);
+
+        assertEquals("open", event.path("queryStringParameters").path("filter[status]").asText());
+        assertEquals(
+                objectMapper.valueToTree(List.of("open")),
+                event.path("multiValueQueryStringParameters").path("filter[status]"));
+    }
+
+    @Test
+    void absentQueryStringYieldsExplicitNulls() {
+        UriInfo uriInfo = mock(UriInfo.class);
+        when(uriInfo.getQueryParameters()).thenReturn(new MultivaluedHashMap<>());
+
+        ObjectMapper objectMapper = new ObjectMapper();
+        ObjectNode event = objectMapper.createObjectNode();
+        ApiGatewayExecuteController controller = controller(objectMapper);
+        controller.putQueryStringParameters(event, uriInfo);
+        controller.putMultiValueQueryStringParameters(event, uriInfo);
+
+        assertTrue(event.path("queryStringParameters").isNull());
+        assertTrue(event.path("multiValueQueryStringParameters").isNull());
+    }
+
+    @Test
+    void convertsAuthorizerValuesToAwsVtlStringShape() {
+        Map<String, Object> result = ApiGatewayExecuteController.vtlAuthorizerContext(
+                "real-principal",
+                Map.of(
+                        "principalId", "context-principal",
+                        "stringKey", "value",
+                        "numberKey", 1,
+                        "booleanKey", true));
+
+        assertEquals(Map.of(
+                "principalId", "real-principal",
+                "stringKey", "value",
+                "numberKey", "1",
+                "booleanKey", "true"), result);
+    }
+
+    @Test
+    void omitsEmptyAuthorizerVtlContext() {
+        assertNull(ApiGatewayExecuteController.vtlAuthorizerContext(null, null));
+        assertNull(ApiGatewayExecuteController.vtlAuthorizerContext(null, Map.of()));
     }
 
     // ── Lambda proxy response Content-Type header matching ──────
@@ -233,9 +358,9 @@ class ApiGatewayExecuteControllerTest {
                 .thenReturn(null);
 
         ApiGatewayExecuteController controller = new ApiGatewayExecuteController(
-                apiGatewayService, apiGatewayV2Service, null,
+                apiGatewayService, null, apiGatewayV2Service, null,
                 regionResolver, new ObjectMapper(), null,
-                null, null, null, null, new ApiGatewayExecuteRouteContext(), null, null);
+                null, null, null, null, new ApiGatewayExecuteRouteContext(), null, null, null, null, null);
 
         Response response = controller.dispatch("GET", "abc123", "prod", "hello", headers, null, null);
 
@@ -263,9 +388,9 @@ class ApiGatewayExecuteControllerTest {
                 .thenReturn(null);
 
         ApiGatewayExecuteController controller = new ApiGatewayExecuteController(
-                apiGatewayService, apiGatewayV2Service, null,
+                apiGatewayService, null, apiGatewayV2Service, null,
                 regionResolver, new ObjectMapper(), null,
-                null, null, null, null, new ApiGatewayExecuteRouteContext(), null, null);
+                null, null, null, null, new ApiGatewayExecuteRouteContext(), null, null, null, null, null);
 
         controller.dispatch("GET", "abc123", "prod", "hello", headers, null, null);
 
@@ -297,9 +422,9 @@ class ApiGatewayExecuteControllerTest {
                 new AwsException("NotFoundException", "Invalid API id specified", 404));
 
         ApiGatewayExecuteController controller = new ApiGatewayExecuteController(
-                apiGatewayService, apiGatewayV2Service, null,
+                apiGatewayService, null, apiGatewayV2Service, null,
                 regionResolver, new ObjectMapper(), null,
-                null, null, null, null, new ApiGatewayExecuteRouteContext(), null, null);
+                null, null, null, null, new ApiGatewayExecuteRouteContext(), null, null, null, null, null);
 
         controller.dispatch("GET", "restapi1", "prod", "hello", headers, null, null);
 
@@ -368,5 +493,71 @@ class ApiGatewayExecuteControllerTest {
                     response.getStringHeaders().get(HttpHeaders.SET_COOKIE));
             assertEquals("rest-v1", response.getHeaderString("X-Trace"));
         }
+    }
+
+    @Test
+    void requestTimeUsesEnglishMonthUnderNonEnglishDefaultLocale() {
+        // The formatter is built at class initialisation, so switching the default locale here
+        // cannot reach it: pinning its locale is what keeps the month ASCII on any machine.
+        assertEquals(Locale.ENGLISH, ApiGatewayExecuteController.GATEWAY_REQUEST_TIME.getLocale());
+        Locale original = Locale.getDefault();
+        try {
+            Locale.setDefault(Locale.JAPAN);
+            assertEquals("05/Oct/2026:13:45:30 +0000", ApiGatewayExecuteController.GATEWAY_REQUEST_TIME
+                    .format(Instant.parse("2026-10-05T13:45:30Z").atZone(ZoneOffset.UTC)));
+        } finally {
+            Locale.setDefault(original);
+        }
+    }
+
+    @Test
+    void v2ProxyEventTimeIsEnglishUtcUnderNonUtcHost() throws Exception {
+        ApiGatewayExecuteController controller = controller(new ObjectMapper());
+        assertEnglishUtcTimeUnderNonUtcHost(() -> controller.buildV2ProxyEvent("GET", "/items", "GET /items",
+                "api1", "us-east-1", "$default", emptyHeaders(), uriInfoFor("http://localhost/items"),
+                new byte[0], "req-1", null, null, null, null));
+    }
+
+    @Test
+    void v2RequestAuthorizerEventTimeIsEnglishUtcUnderNonUtcHost() throws Exception {
+        ApiGatewayExecuteController controller = controller(new ObjectMapper());
+        assertEnglishUtcTimeUnderNonUtcHost(() -> controller.buildRequestAuthorizerEventV2("GET", "/items",
+                "GET /items", "api1", "$default", "us-east-1", emptyHeaders(),
+                uriInfoFor("http://localhost/items")));
+    }
+
+    private static HttpHeaders emptyHeaders() {
+        HttpHeaders headers = mock(HttpHeaders.class);
+        when(headers.getRequestHeaders()).thenReturn(new MultivaluedHashMap<>());
+        return headers;
+    }
+
+    private static UriInfo uriInfoFor(String uri) {
+        UriInfo uriInfo = mock(UriInfo.class);
+        when(uriInfo.getRequestUri()).thenReturn(URI.create(uri));
+        when(uriInfo.getQueryParameters()).thenReturn(new MultivaluedHashMap<>());
+        return uriInfo;
+    }
+
+    private static void assertEnglishUtcTimeUnderNonUtcHost(Supplier<String> buildEvent) throws Exception {
+        Locale originalLocale = Locale.getDefault();
+        TimeZone originalZone = TimeZone.getDefault();
+        String event;
+        try {
+            Locale.setDefault(Locale.JAPAN);
+            TimeZone.setDefault(TimeZone.getTimeZone("Asia/Tokyo"));
+            event = buildEvent.get();
+        } finally {
+            Locale.setDefault(originalLocale);
+            TimeZone.setDefault(originalZone);
+        }
+
+        JsonNode ctx = new ObjectMapper().readTree(event).path("requestContext");
+        String time = ctx.path("time").asText();
+        assertTrue(time.matches("\\d{2}/[A-Z][a-z]{2}/\\d{4}:\\d{2}:\\d{2}:\\d{2} \\+0000"), time);
+        long timeMillis = ZonedDateTime.parse(time, ApiGatewayExecuteController.GATEWAY_REQUEST_TIME)
+                .toInstant().toEpochMilli();
+        long timeEpoch = ctx.path("timeEpoch").asLong();
+        assertTrue(timeEpoch >= timeMillis && timeEpoch - timeMillis < 2000, time + " vs " + timeEpoch);
     }
 }

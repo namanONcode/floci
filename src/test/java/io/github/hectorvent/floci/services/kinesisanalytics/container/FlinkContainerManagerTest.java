@@ -2,10 +2,13 @@ package io.github.hectorvent.floci.services.kinesisanalytics.container;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.github.dockerjava.api.DockerClient;
+import com.github.dockerjava.api.model.MountType;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
 import io.github.hectorvent.floci.core.common.docker.ContainerDetector;
+import io.github.hectorvent.floci.core.common.docker.ContainerExecStubs;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager.ContainerInfo;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager.EndpointInfo;
@@ -15,6 +18,7 @@ import io.github.hectorvent.floci.core.common.docker.DockerHostResolver;
 import io.github.hectorvent.floci.core.common.docker.LaunchedContainerAwsEnv;
 import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
 import io.github.hectorvent.floci.services.kinesisanalytics.model.FlinkApplication;
+import io.github.hectorvent.floci.services.kinesisanalytics.model.Snapshot;
 import io.github.hectorvent.floci.services.s3.S3Service;
 import io.github.hectorvent.floci.services.s3.model.S3Object;
 import org.junit.jupiter.api.BeforeEach;
@@ -26,14 +30,17 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.OptionalInt;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
@@ -84,10 +91,13 @@ class FlinkContainerManagerTest {
         EmulatorConfig.DnsConfig dnsConfig = mock(EmulatorConfig.DnsConfig.class);
         when(dnsConfig.containerFallbackEnabled()).thenReturn(false);
 
+        EmulatorConfig.StorageConfig storageConfig = storageWithInitImage("busybox:stable");
+
         EmulatorConfig config = mock(EmulatorConfig.class);
         when(config.docker()).thenReturn(dockerConfig);
         when(config.services()).thenReturn(servicesConfig);
         when(config.dns()).thenReturn(dnsConfig);
+        when(config.storage()).thenReturn(storageConfig);
         when(config.defaultRegion()).thenReturn("us-west-2");
 
         DockerHostResolver dockerHostResolver = mock(DockerHostResolver.class);
@@ -97,6 +107,11 @@ class FlinkContainerManagerTest {
         ContainerBuilder containerBuilder = new ContainerBuilder(config, dockerHostResolver, embeddedDnsServer);
 
         lifecycleManager = mock(ContainerLifecycleManager.class);
+        // The log4j-console.properties copy is now required (a failure fails cluster startup, see
+        // log4jConfigCopyFailureRollsBackTheClusterInsteadOfStartingWithTheStockLogFormat below), so
+        // every test that gets as far as create() succeeding needs a working docker client for that
+        // copy to land on by default.
+        when(lifecycleManager.getDockerClient()).thenReturn(mock(DockerClient.class, RETURNS_DEEP_STUBS));
         ContainerLogStreamer logStreamer = mock(ContainerLogStreamer.class);
         ContainerDetector containerDetector = mock(ContainerDetector.class);
         RegionResolver regionResolver = mock(RegionResolver.class);
@@ -115,6 +130,29 @@ class FlinkContainerManagerTest {
                 s3Service,
                 mock(FlinkRestClient.class),
                 MAPPER);
+    }
+
+    private static EmulatorConfig.StorageConfig storageWithInitImage(String initImage) {
+        EmulatorConfig.EfsSharingConfig efs = mock(EmulatorConfig.EfsSharingConfig.class);
+        when(efs.initImage()).thenReturn(initImage);
+        EmulatorConfig.StorageConfig storage = mock(EmulatorConfig.StorageConfig.class);
+        when(storage.efs()).thenReturn(efs);
+        return storage;
+    }
+
+    @Test
+    void deleteSnapshotFilesRemovesTheSavepointInsideTheJobManager() {
+        DockerClient dockerClient = mock(DockerClient.class);
+        when(lifecycleManager.getDockerClient()).thenReturn(dockerClient);
+        List<List<String>> commands = ContainerExecStubs.completeEveryExec(dockerClient, "jm-container-id", 0, "", "");
+        FlinkApplication app = application("my-app");
+        app.setContainerId("jm-container-id");
+        Snapshot snapshot = new Snapshot();
+        snapshot.setFlinkLocation("/savepoints/savepoint-1");
+
+        manager.deleteSnapshotFiles(app, snapshot);
+
+        assertEquals(List.of(List.of("rm", "-rf", "/savepoints/savepoint-1")), commands);
     }
 
     private FlinkApplication application(String name) {
@@ -137,12 +175,14 @@ class FlinkContainerManagerTest {
         when(config.docker()).thenReturn(docker);
         when(docker.logMaxSize()).thenReturn("10m");
         when(docker.logMaxFile()).thenReturn("3");
-        EmulatorConfig.StorageConfig storage = Mockito.mock(EmulatorConfig.StorageConfig.class);
+        EmulatorConfig.StorageConfig storage = storageWithInitImage("busybox:stable");
         when(config.storage()).thenReturn(storage);
         when(storage.hostPersistentPath()).thenReturn("floci-data");
 
         ContainerLifecycleManager lifecycleManager = Mockito.mock(ContainerLifecycleManager.class);
-        when(lifecycleManager.createAndStart(any())).thenReturn(
+        when(lifecycleManager.create(any())).thenReturn("jm-container-id");
+        when(lifecycleManager.getDockerClient()).thenReturn(mock(DockerClient.class, RETURNS_DEEP_STUBS));
+        when(lifecycleManager.startCreated(any(), any())).thenReturn(
                 new ContainerLifecycleManager.ContainerInfo("jm-container-id", Map.of(8081,
                         new ContainerLifecycleManager.EndpointInfo("localhost", 8081))));
 
@@ -208,9 +248,53 @@ class FlinkContainerManagerTest {
     }
 
     @Test
+    void msfStyleLog4j2ConfigBakesInTheApplicationArnAndVersion() throws Exception {
+        FlinkApplication app = new FlinkApplication("demo",
+                "arn:aws:kinesisanalytics:us-east-1:000000000000:application/demo",
+                "FLINK-2_3", "arn:aws:iam::000000000000:role/x", "STREAMING");
+        app.setApplicationVersionId(2L);
+
+        String config = new String(manager.msfStyleLog4j2Config(app), java.nio.charset.StandardCharsets.UTF_8);
+
+        assertTrue(config.contains(
+                "\"applicationARN\":\"%enc{arn:aws:kinesisanalytics:us-east-1:000000000000:application/demo}{JSON}\""));
+        assertTrue(config.contains("\"applicationVersionId\":\"%enc{2}{JSON}\""));
+        assertTrue(config.contains("\"messageSchemaVersion\":\"1\""));
+        assertTrue(config.contains("appender.console.layout.type = PatternLayout"));
+    }
+
+    @Test
+    void msfStyleLog4j2ConfigEscapesLog4jAndPropertiesSyntaxInTheApplicationName() throws Exception {
+        // KinesisAnalyticsV2Service now rejects an ApplicationName outside AWS's own
+        // [a-zA-Z0-9_.-] charset, but this stays defensive in case some other caller ever builds a
+        // FlinkApplication directly: '%' would be a log4j2 conversion-specifier marker, '\' is a
+        // java.util.Properties escape character (Flink loads this file with Properties-style
+        // parsing), and '$' could start a log4j2 '${...}' Lookup that leaks an env var/system
+        // property into every log line -- none of that may reach the pattern unescaped.
+        FlinkApplication app = new FlinkApplication("100%-\\-${env:PATH}-owned",
+                "arn:aws:kinesisanalytics:us-east-1:000000000000:application/100%-\\-${env:PATH}-owned",
+                "FLINK-2_3", "arn:aws:iam::000000000000:role/x", "STREAMING");
+        app.setApplicationVersionId(1L);
+
+        String config = new String(manager.msfStyleLog4j2Config(app), java.nio.charset.StandardCharsets.UTF_8);
+
+        assertTrue(config.contains(
+                "\"applicationARN\":\"%enc{arn:aws:kinesisanalytics:us-east-1:000000000000:application/100%%-\\\\-{env:PATH}-owned}{JSON}\""));
+
+        java.util.Properties parsed = new java.util.Properties();
+        parsed.load(new java.io.ByteArrayInputStream(config.getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+        String loadedPattern = parsed.getProperty("appender.console.layout.pattern");
+        assertTrue(loadedPattern.contains(
+                "\"applicationARN\":\"%enc{arn:aws:kinesisanalytics:us-east-1:000000000000:application/100%%-\\-{env:PATH}-owned}{JSON}\""));
+        assertFalse(loadedPattern.contains("${env:PATH}"), "the $ must not survive, or log4j2 would treat "
+                + "this as a Lookup and resolve it against the environment at config-load time");
+    }
+
+    @Test
     void bareClusterInjectsAwsSdkEnvironmentAndContainerReachability() {
         FlinkApplication app = application("bare");
-        when(lifecycleManager.createAndStart(any())).thenReturn(new ContainerInfo(
+        when(lifecycleManager.create(any())).thenReturn("jm-id");
+        when(lifecycleManager.startCreated(any(), any())).thenReturn(new ContainerInfo(
                 "jm-id", Map.of(8081, new EndpointInfo("localhost", 49152))));
 
         manager.startCluster(app);
@@ -227,6 +311,24 @@ class FlinkContainerManagerTest {
     }
 
     @Test
+    void startCluster_savepointsVolume_isChownedToFlinkUser() {
+        FlinkApplication app = application("snap");
+        when(lifecycleManager.create(any())).thenReturn("jm-id");
+        when(lifecycleManager.startCreated(any(), any())).thenReturn(new ContainerInfo(
+                "jm-id", Map.of(8081, new EndpointInfo("localhost", 49152))));
+
+        manager.startCluster(app);
+
+        String volumeName = app.getDockerVolumeName();
+        verify(lifecycleManager).ensureSharedVolume(volumeName, OptionalInt.of(9999), OptionalInt.of(9999),
+                Optional.empty(), "busybox:stable");
+        ContainerSpec jmSpec = captureCreatedSpecs().getFirst();
+        assertTrue(jmSpec.mounts().stream().anyMatch(mount -> mount.getType() == MountType.VOLUME
+                && volumeName.equals(mount.getSource())
+                && "/opt/flink/savepoints".equals(mount.getTarget())));
+    }
+
+    @Test
     void codeClusterInjectsTheSameAwsSdkEnvironmentIntoBothFlinkProcesses() {
         FlinkApplication app = application("with-code");
         app.setCodeS3Bucket("code-bucket");
@@ -234,7 +336,8 @@ class FlinkContainerManagerTest {
         app.setParallelism(3);
         when(s3Service.getObject("code-bucket", "jobs/demo.jar", null))
                 .thenReturn(new S3Object("code-bucket", "jobs/demo.jar", new byte[]{1}, "application/java-archive"));
-        when(lifecycleManager.createAndStart(any()))
+        when(lifecycleManager.create(any())).thenReturn("jm-id").thenReturn("tm-id");
+        when(lifecycleManager.startCreated(any(), any()))
                 .thenReturn(new ContainerInfo("jm-id", Map.of(8081, new EndpointInfo("localhost", 49152))))
                 .thenReturn(new ContainerInfo("tm-id", Map.of()));
 
@@ -257,12 +360,12 @@ class FlinkContainerManagerTest {
     @Test
     void jobManagerStartFailureRemovesThePartialCluster() {
         FlinkApplication app = application("jm-failure");
-        when(lifecycleManager.createAndStart(any())).thenThrow(new RuntimeException("jobmanager failed"));
+        when(lifecycleManager.create(any())).thenThrow(new RuntimeException("jobmanager failed"));
 
         assertThrows(RuntimeException.class, () -> manager.startCluster(app));
 
-        verify(lifecycleManager, times(2)).removeIfExists("floci-kinesisanalytics-jm-failure");
-        verify(lifecycleManager, atLeastOnce()).removeIfExists("floci-kinesisanalytics-jm-failure-tm");
+        verify(lifecycleManager, times(2)).removeIfExists("floci-aws-kinesisanalytics-arn-aws-kinesisanalytics-us-west-2-000000000000-application-jm-failure");
+        verify(lifecycleManager, atLeastOnce()).removeIfExists("floci-aws-kinesisanalytics-arn-aws-kinesisanalytics-us-west-2-000000000000-application-jm-failure-tm");
         assertNull(app.getContainerId());
         assertNull(app.getTaskManagerContainerId());
     }
@@ -274,22 +377,42 @@ class FlinkContainerManagerTest {
         app.setCodeS3Key("jobs/demo.jar");
         when(s3Service.getObject("code-bucket", "jobs/demo.jar", null))
                 .thenReturn(new S3Object("code-bucket", "jobs/demo.jar", new byte[]{1}, "application/java-archive"));
-        when(lifecycleManager.createAndStart(any()))
-                .thenReturn(new ContainerInfo("jm-id", Map.of(8081, new EndpointInfo("localhost", 49152))))
+        when(lifecycleManager.create(any())).thenReturn("jm-id")
                 .thenThrow(new RuntimeException("taskmanager failed"));
+        when(lifecycleManager.startCreated(any(), any()))
+                .thenReturn(new ContainerInfo("jm-id", Map.of(8081, new EndpointInfo("localhost", 49152))));
 
         assertThrows(RuntimeException.class, () -> manager.startCluster(app));
 
         verify(lifecycleManager).stopAndRemove("jm-id", null);
-        verify(lifecycleManager, atLeastOnce()).removeIfExists("floci-kinesisanalytics-tm-failure-tm");
+        verify(lifecycleManager, atLeastOnce()).removeIfExists("floci-aws-kinesisanalytics-arn-aws-kinesisanalytics-us-west-2-000000000000-application-tm-failure-tm");
         assertNull(app.getContainerId());
         assertNull(app.getRestEndpoint());
         assertNull(app.getTaskManagerContainerId());
     }
 
+    @Test
+    void log4jConfigCopyFailureRollsBackTheClusterInsteadOfStartingWithTheStockLogFormat() {
+        // Before this test, a failed copy of log4j-console.properties was only logged: startCreated()
+        // still ran and startCluster() reported success, so the cluster silently kept the stock
+        // (non-JSON) log format instead of the MSF-style CloudWatch schema this whole feature exists
+        // to provide. copyFileIntoContainer(..., required=true) now rethrows instead, so this failure
+        // takes the same create()-failure rollback path already covered above.
+        FlinkApplication app = application("log4j-copy-failure");
+        when(lifecycleManager.create(any())).thenReturn("jm-id");
+        when(lifecycleManager.getDockerClient()).thenThrow(new RuntimeException("docker copy unavailable"));
+
+        assertThrows(RuntimeException.class, () -> manager.startCluster(app));
+
+        verify(lifecycleManager, times(2)).removeIfExists("floci-aws-kinesisanalytics-arn-aws-kinesisanalytics-us-west-2-000000000000-application-log4j-copy-failure");
+        verify(lifecycleManager, atLeastOnce()).removeIfExists("floci-aws-kinesisanalytics-arn-aws-kinesisanalytics-us-west-2-000000000000-application-log4j-copy-failure-tm");
+        verify(lifecycleManager, Mockito.never()).startCreated(any(), any());
+        assertNull(app.getContainerId());
+    }
+
     private List<ContainerSpec> captureCreatedSpecs() {
         ArgumentCaptor<ContainerSpec> captor = ArgumentCaptor.forClass(ContainerSpec.class);
-        verify(lifecycleManager, atLeastOnce()).createAndStart(captor.capture());
+        verify(lifecycleManager, atLeastOnce()).create(captor.capture());
         return captor.getAllValues();
     }
 }

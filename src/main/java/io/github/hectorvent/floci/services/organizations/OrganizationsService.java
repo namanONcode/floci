@@ -4,10 +4,12 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
-import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
+import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.services.iam.ScpProvider;
 import io.github.hectorvent.floci.services.organizations.model.CreateAccountStatus;
 import io.github.hectorvent.floci.services.organizations.model.Handshake;
 import io.github.hectorvent.floci.services.organizations.model.HandshakeParty;
@@ -51,7 +53,7 @@ import java.util.regex.Pattern;
  * @see <a href="https://docs.aws.amazon.com/organizations/latest/APIReference/Welcome.html">AWS Organizations API Reference</a>
  */
 @ApplicationScoped
-public class OrganizationsService {
+public class OrganizationsService implements ScpProvider {
 
     private static final Logger LOG = Logger.getLogger(OrganizationsService.class);
 
@@ -88,6 +90,10 @@ public class OrganizationsService {
      * {@code DescribeEffectivePolicy} is defined only for the inheritable policy types. AWS
      * rejects the two access-control types outright — they are evaluated as a deny-by-intersection
      * chain rather than merged into a single effective document, so there is nothing to return.
+     *
+     * <p>This is floci's rendering of the model's {@code EffectivePolicyType} shape; the last five
+     * entries were added to the shape after it was first written here. Ordered for the same reason
+     * as {@link #POLICY_TYPES}.
      */
     private static final List<String> EFFECTIVE_POLICY_TYPES = List.of(
             "TAG_POLICY",
@@ -95,7 +101,12 @@ public class OrganizationsService {
             "AISERVICES_OPT_OUT_POLICY",
             "CHATBOT_POLICY",
             "DECLARATIVE_POLICY_EC2",
-            "SECURITYHUB_POLICY");
+            "SECURITYHUB_POLICY",
+            "INSPECTOR_POLICY",
+            "UPGRADE_ROLLOUT_POLICY",
+            "BEDROCK_POLICY",
+            "S3_POLICY",
+            "NETWORK_SECURITY_DIRECTOR_POLICY");
 
     private static final Set<String> EFFECTIVE_POLICY_TYPE_SET = Set.copyOf(EFFECTIVE_POLICY_TYPES);
 
@@ -139,10 +150,20 @@ public class OrganizationsService {
     private final AccountAwareStorageBackend<OrganizationPolicy> policies;
     private final AccountAwareStorageBackend<CreateAccountStatus> createAccountStatuses;
     private final AccountAwareStorageBackend<Handshake> handshakes;
+    private final RegionResolver regionResolver;
+    private final boolean scpEnforcementEnabled;
+    private final String managementAccountEmail;
 
     @Inject
-    public OrganizationsService(StorageFactory storageFactory, ObjectMapper objectMapper) {
+    public OrganizationsService(StorageFactory storageFactory, ObjectMapper objectMapper,
+                                EmulatorConfig config, RegionResolver regionResolver) {
+        EmulatorConfig.OrganizationsServiceConfig organizationsConfig = config.services().organizations();
+        this.scpEnforcementEnabled = organizationsConfig.scpEnforcementEnabled();
+        this.managementAccountEmail = organizationsConfig.managementAccountEmail()
+                .map(OrganizationsService::requireValidConfiguredEmail)
+                .orElse(null);
         this.objectMapper = objectMapper;
+        this.regionResolver = regionResolver;
         this.organizations = storageFactory.create("organizations", "organizations-organizations.json",
                 new TypeReference<Map<String, Organization>>() {});
         this.accounts = storageFactory.create("organizations", "organizations-accounts.json",
@@ -158,19 +179,52 @@ public class OrganizationsService {
     }
 
     OrganizationsService(ObjectMapper objectMapper,
+                         RegionResolver regionResolver,
                          AccountAwareStorageBackend<Organization> organizations,
                          AccountAwareStorageBackend<OrganizationAccount> accounts,
                          AccountAwareStorageBackend<OrganizationalUnit> organizationalUnits,
                          AccountAwareStorageBackend<OrganizationPolicy> policies,
                          AccountAwareStorageBackend<CreateAccountStatus> createAccountStatuses,
                          AccountAwareStorageBackend<Handshake> handshakes) {
+        this(objectMapper, regionResolver, organizations, accounts, organizationalUnits, policies,
+                createAccountStatuses, handshakes, true);
+    }
+
+    OrganizationsService(ObjectMapper objectMapper,
+                         RegionResolver regionResolver,
+                         AccountAwareStorageBackend<Organization> organizations,
+                         AccountAwareStorageBackend<OrganizationAccount> accounts,
+                         AccountAwareStorageBackend<OrganizationalUnit> organizationalUnits,
+                         AccountAwareStorageBackend<OrganizationPolicy> policies,
+                         AccountAwareStorageBackend<CreateAccountStatus> createAccountStatuses,
+                         AccountAwareStorageBackend<Handshake> handshakes,
+                         boolean scpEnforcementEnabled) {
+        this(objectMapper, regionResolver, organizations, accounts, organizationalUnits, policies,
+                createAccountStatuses, handshakes, scpEnforcementEnabled, null);
+    }
+
+    OrganizationsService(ObjectMapper objectMapper,
+                         RegionResolver regionResolver,
+                         AccountAwareStorageBackend<Organization> organizations,
+                         AccountAwareStorageBackend<OrganizationAccount> accounts,
+                         AccountAwareStorageBackend<OrganizationalUnit> organizationalUnits,
+                         AccountAwareStorageBackend<OrganizationPolicy> policies,
+                         AccountAwareStorageBackend<CreateAccountStatus> createAccountStatuses,
+                         AccountAwareStorageBackend<Handshake> handshakes,
+                         boolean scpEnforcementEnabled,
+                         String managementAccountEmail) {
         this.objectMapper = objectMapper;
+        this.regionResolver = regionResolver;
         this.organizations = organizations;
         this.accounts = accounts;
         this.organizationalUnits = organizationalUnits;
         this.policies = policies;
         this.createAccountStatuses = createAccountStatuses;
         this.handshakes = handshakes;
+        this.scpEnforcementEnabled = scpEnforcementEnabled;
+        this.managementAccountEmail = managementAccountEmail == null
+                ? null
+                : requireValidConfiguredEmail(managementAccountEmail);
     }
 
     /** A parent reference as returned by {@code ListParents}. */
@@ -217,16 +271,18 @@ public class OrganizationsService {
         organization.setFeatureSet(resolvedFeatureSet);
         organization.setMasterAccountId(callerAccountId);
         organization.setMasterAccountArn(arn(callerAccountId, "account/" + organizationId + "/" + callerAccountId));
-        organization.setMasterAccountEmail("master@" + callerAccountId + ".example.com");
+        organization.setMasterAccountEmail(managementAccountEmail != null
+                ? managementAccountEmail
+                : "master@" + callerAccountId + ".example.com");
         organization.setCreatedTimestamp(Instant.now());
 
         Root root = new Root();
         root.setId(rootId);
         root.setArn(arn(callerAccountId, "root/" + organizationId + "/" + rootId));
         root.setName("Root");
-        if (FEATURE_SET_ALL.equals(resolvedFeatureSet)) {
-            root.getPolicyTypes().add(new PolicyTypeSummary(SERVICE_CONTROL_POLICY, "ENABLED"));
-        }
+        // A new root has no policy types enabled, whatever the feature set: callers enable SCPs with
+        // EnablePolicyType, and Terraform's enabled_policy_types does exactly that right after
+        // CreateOrganization, so a pre-enabled root fails it with PolicyTypeAlreadyEnabledException.
         organization.setRoot(root);
 
         organizations.putForAccount(callerAccountId, organizationId, organization);
@@ -397,6 +453,17 @@ public class OrganizationsService {
         return List.of(new ParentRef(parentId, parentType(organization, parentId)));
     }
 
+    /**
+     * The organization path of a root, OU or account:
+     * {@code o-<org>/r-<root>[/ou-<ou>]*[/<accountId>]/}, trailing slash included. This is the
+     * value the Organizations API reports as {@code OrganizationalUnit.Path} and as the single
+     * entry of {@code Account.Paths}, and what {@code Fn::GetAtt} returns for the same keys.
+     */
+    public String organizationPath(String callerAccountId, String resourceId) {
+        Organization organization = requireOrganizationForCaller(callerAccountId);
+        return organization.getId() + "/" + String.join("/", ancestryOf(organization, resourceId)) + "/";
+    }
+
     public List<ChildRef> listChildren(String callerAccountId, String parentId, String childType) {
         Organization organization = requireOrganizationForCaller(callerAccountId);
         requireParent(organization, parentId);
@@ -478,6 +545,15 @@ public class OrganizationsService {
 
     public OrganizationAccount describeAccount(String callerAccountId, String accountId) {
         return requireAccount(requireOrganizationForCaller(callerAccountId), accountId);
+    }
+
+    public java.util.Optional<OrganizationAccount> findAccountForPortal(String accountId) {
+        if (accountId == null || !ACCOUNT_ID_PATTERN.matcher(accountId).matches()) {
+            return java.util.Optional.empty();
+        }
+        return accounts.scanAllAccounts().stream()
+                .filter(account -> accountId.equals(account.getId()))
+                .findFirst();
     }
 
     public List<OrganizationAccount> listAccounts(String callerAccountId) {
@@ -738,14 +814,48 @@ public class OrganizationsService {
     }
 
     /**
+     * Rejects anything outside the {@code EffectivePolicyType} enum, which both
+     * DescribeEffectivePolicy and ListAccountsWithInvalidEffectivePolicy draw their required
+     * PolicyType from. Without it the latter answers 200 with an empty account list for a
+     * policy type that does not exist, which reads as "nothing is broken".
+     */
+    private void validateEffectivePolicyType(String policyType) {
+        if (policyType == null || !EFFECTIVE_POLICY_TYPE_SET.contains(policyType)) {
+            throw invalidInput("PolicyType must be one of " + String.join(", ", EFFECTIVE_POLICY_TYPES) + ".");
+        }
+    }
+
+    /**
+     * Floci does not evaluate effective policies, so no account can be reported as carrying an
+     * invalid one. The operation still has to validate its required PolicyType before it can
+     * honestly answer "none".
+     *
+     * <p>The model restricts this to the management account or a delegated administrator, but
+     * names no service that delegation must be scoped to and {@code EffectivePolicyType} maps to
+     * none — there is nothing to check a delegated admin's registration against, because
+     * delegated administration of Organizations' own operations is granted through the
+     * organization's resource-based delegation policy ({@code PutResourcePolicy}), not through
+     * {@code RegisterDelegatedAdministrator}'s per-service map. Floci exposes the resource-policy
+     * CRUD but nothing reads it for authorization yet, so the concept genuinely isn't modelled
+     * here — if it ever is, the resource policy is the hook. Management-only is stricter than the
+     * model text, matching how every other operation carrying this same boilerplate phrase is
+     * gated here ({@link #attachPolicy}, {@link #enablePolicyType},
+     * {@link #registerDelegatedAdministrator}, {@link #listDelegatedAdministrators}).
+     */
+    public List<OrganizationAccount> listAccountsWithInvalidEffectivePolicy(String callerAccountId,
+                                                                           String policyType) {
+        requireManagementAccount(callerAccountId);
+        validateEffectivePolicyType(policyType);
+        return List.of();
+    }
+
+    /**
      * Merges every policy of {@code policyType} down the inheritance chain root → OU(s) → target,
      * with the closest ancestor taking precedence on conflicting keys.
      */
     public EffectivePolicy describeEffectivePolicy(String callerAccountId, String policyType, String targetId) {
         Organization organization = requireOrganizationForCaller(callerAccountId);
-        if (policyType == null || !EFFECTIVE_POLICY_TYPE_SET.contains(policyType)) {
-            throw invalidInput("PolicyType must be one of " + String.join(", ", EFFECTIVE_POLICY_TYPES) + ".");
-        }
+        validateEffectivePolicyType(policyType);
         String effectiveTarget = targetId == null || targetId.isEmpty() ? callerAccountId : targetId;
         requireTarget(organization, effectiveTarget);
 
@@ -766,6 +876,100 @@ public class OrganizationsService {
                     "No policy of type " + policyType + " applies to " + effectiveTarget + ".", 400);
         }
         return new EffectivePolicy(merged.toString(), policyType, effectiveTarget, Instant.now());
+    }
+
+    // ──────────────────────────── Control Tower guardrails ────────────────────────────
+
+    static final String CONTROL_TOWER_GUARDRAIL_ID = "p-flocictguardrail";
+    static final String CONTROL_TOWER_GUARDRAIL_NAME = "aws-guardrails-FlociControlTowerBaseline";
+
+    /**
+     * Reconciles the Organizations side effect of Control Tower OU registration. Real Control
+     * Tower attaches customer-managed SCPs named {@code aws-guardrails-*}; LZA 1.14 uses that
+     * observable contract to validate top-level OU governance. The Security OU is governed by
+     * the landing zone itself and therefore may not appear in the enabled-baseline targets.
+     */
+    public void ensureControlTowerGuardrails(String callerAccountId, Set<String> registeredOuIds) {
+        Organization organization;
+        try {
+            organization = requireManagementAccount(callerAccountId);
+        } catch (AwsException e) {
+            return;
+        }
+        Set<String> targetIds = new java.util.LinkedHashSet<>(registeredOuIds);
+        organizationalUnitsIn(organization).stream()
+                .filter(ou -> "Security".equals(ou.getName()))
+                .map(OrganizationalUnit::getId)
+                .forEach(targetIds::add);
+        if (targetIds.isEmpty()) {
+            return;
+        }
+        targetIds.forEach(targetId -> requireOrganizationalUnit(organization, targetId));
+
+        OrganizationPolicy guardrail = policiesIn(organization).stream()
+                .filter(policy -> SERVICE_CONTROL_POLICY.equals(policy.getType()))
+                .filter(policy -> CONTROL_TOWER_GUARDRAIL_NAME.equals(policy.getName()))
+                .findFirst()
+                .orElseGet(() -> {
+                    OrganizationPolicy policy = new OrganizationPolicy();
+                    policy.setId(CONTROL_TOWER_GUARDRAIL_ID);
+                    policy.setName(CONTROL_TOWER_GUARDRAIL_NAME);
+                    policy.setDescription("Control Tower governance marker for registered OUs");
+                    policy.setType(SERVICE_CONTROL_POLICY);
+                    policy.setContent(FULL_AWS_ACCESS_CONTENT);
+                    policy.setAwsManaged(false);
+                    policy.setOrganizationId(organization.getId());
+                    policy.setArn(policyArn(organization, CONTROL_TOWER_GUARDRAIL_ID, SERVICE_CONTROL_POLICY));
+                    return policy;
+                });
+
+        if (guardrail.getTargets().addAll(targetIds) || guardrail.getTargets().isEmpty()) {
+            policies.putForAccount(organization.getMasterAccountId(), guardrail.getId(), guardrail);
+        }
+    }
+
+    // ──────────────────────────── SCP provider ────────────────────────────
+
+    /**
+     * {@inheritDoc}
+     *
+     * <p>Levels are ordered root → OUs on the path → account. Only bites when
+     * {@code floci.services.organizations.scp-enforcement-enabled} is set (and, in practice,
+     * IAM enforcement too — {@code IamEnforcementFilter} is the only consumer). The management
+     * account is exempt, matching AWS.</p>
+     */
+    @Override
+    public List<List<String>> effectiveScpLevels(String accountId) {
+        if (!scpEnforcementEnabled) {
+            return null;
+        }
+        Organization organization;
+        try {
+            organization = requireOrganizationForCaller(accountId);
+        } catch (AwsException e) {
+            return null;
+        }
+        if (accountId.equals(organization.getMasterAccountId())) {
+            return null;
+        }
+        boolean scpEnabled = organization.getRoot().getPolicyTypes().stream()
+                .anyMatch(t -> SERVICE_CONTROL_POLICY.equals(t.getType()) && "ENABLED".equals(t.getStatus()));
+        if (!scpEnabled) {
+            return null;
+        }
+        List<OrganizationPolicy> organizationPolicies = policiesIn(organization);
+        List<List<String>> levels = new ArrayList<>();
+        for (String node : ancestryOf(organization, accountId)) {
+            List<String> documents = organizationPolicies.stream()
+                    .filter(policy -> SERVICE_CONTROL_POLICY.equals(policy.getType())
+                            && policy.getTargets().contains(node))
+                    .map(OrganizationPolicy::getContent)
+                    .toList();
+            if (!documents.isEmpty()) {
+                levels.add(documents);
+            }
+        }
+        return levels.isEmpty() ? null : levels;
     }
 
     // ──────────────────────────── Tags ────────────────────────────
@@ -898,6 +1102,12 @@ public class OrganizationsService {
         }
         organization.setResourcePolicyContent(content);
         if (tags != null) {
+            // Put replaces rather than merges: a caller that supplies Tags is stating the full set,
+            // so a key it no longer lists is dropped. The resource policy is not addressable by
+            // TagResource/UntagResource the way accounts, OUs, roots and policies are, so this call
+            // is the only way CloudFormation can converge Tags on an update. Omitting Tags
+            // entirely (null) leaves the existing ones untouched.
+            organization.getResourcePolicyTags().clear();
             organization.getResourcePolicyTags().putAll(tags);
         }
         organizations.putForAccount(organization.getMasterAccountId(), organization.getId(), organization);
@@ -1109,6 +1319,56 @@ public class OrganizationsService {
             throw accessDenied("This operation can be performed only by the management account of the organization.");
         }
         return organization;
+    }
+
+    /**
+     * The management account that owns the given organization, root, OU, account, policy or
+     * resource-policy id, or empty when nothing matches.
+     *
+     * <p>CloudFormation's delete path carries no caller identity — {@code CfnResourceProvisioner}
+     * hands over a physical id and a region only — so the owner has to be recovered from the
+     * resource itself before a management-account-scoped operation can run against it.
+     */
+    public Optional<String> findManagementAccountForResource(String resourceId) {
+        if (resourceId == null || resourceId.isEmpty()) {
+            return Optional.empty();
+        }
+        for (Organization organization : organizations.scanAllAccounts()) {
+            boolean owns = resourceId.equals(organization.getId())
+                    || resourceId.equals(organization.getRoot().getId())
+                    || resourceId.equals(organization.getResourcePolicyId());
+            if (owns) {
+                return Optional.of(organization.getMasterAccountId());
+            }
+        }
+        if (ACCOUNT_ID_PATTERN.matcher(resourceId).matches()) {
+            return accounts.scanAllAccounts().stream()
+                    .filter(account -> resourceId.equals(account.getId()))
+                    .findFirst()
+                    .flatMap(account -> organizationById(account.getOrganizationId()))
+                    .map(Organization::getMasterAccountId);
+        }
+        if (OU_ID_PATTERN.matcher(resourceId).matches()) {
+            return organizationalUnits.scanAllAccounts().stream()
+                    .filter(unit -> resourceId.equals(unit.getId()))
+                    .findFirst()
+                    .flatMap(unit -> organizationById(unit.getOrganizationId()))
+                    .map(Organization::getMasterAccountId);
+        }
+        if (POLICY_ID_PATTERN.matcher(resourceId).matches()) {
+            return policies.scanAllAccounts().stream()
+                    .filter(policy -> resourceId.equals(policy.getId()))
+                    .findFirst()
+                    .flatMap(policy -> organizationById(policy.getOrganizationId()))
+                    .map(Organization::getMasterAccountId);
+        }
+        return Optional.empty();
+    }
+
+    public boolean isManagementAccount(String accountId) {
+        return findOrganizationForAccount(accountId)
+                .map(organization -> accountId.equals(organization.getMasterAccountId()))
+                .orElse(false);
     }
 
     private Optional<Organization> findOrganizationForAccount(String accountId) {
@@ -1473,9 +1733,6 @@ public class OrganizationsService {
 
     private void applyEnableAllFeatures(Organization organization) {
         organization.setFeatureSet(FEATURE_SET_ALL);
-        if (findPolicyType(organization.getRoot(), SERVICE_CONTROL_POLICY).isEmpty()) {
-            organization.getRoot().getPolicyTypes().add(new PolicyTypeSummary(SERVICE_CONTROL_POLICY, "ENABLED"));
-        }
         organizations.putForAccount(organization.getMasterAccountId(), organization.getId(), organization);
     }
 
@@ -1598,9 +1855,9 @@ public class OrganizationsService {
                 "policy/" + organization.getId() + "/" + type.toLowerCase(java.util.Locale.ROOT) + "/" + policyId);
     }
 
-    /** Organizations ARNs carry no region, so the region segment is deliberately empty. */
+    /** Organizations ARNs carry no region; they take the request's partition. */
     private String arn(String accountId, String resource) {
-        return AwsArnUtils.Arn.of("organizations", "", accountId, resource).toString();
+        return regionResolver.buildGlobalArn("organizations", accountId, resource);
     }
 
     private String randomId(int length) {
@@ -1632,9 +1889,28 @@ public class OrganizationsService {
         if (email == null || email.isEmpty()) {
             throw invalidInput("Email is required.");
         }
-        if (email.length() < 6 || email.length() > 64 || !EMAIL_PATTERN.matcher(email).matches()) {
+        if (!isValidEmail(email)) {
             throw invalidInput("Email must be a valid address between 6 and 64 characters.");
         }
+    }
+
+    private static boolean isValidEmail(String email) {
+        return email.length() >= 6 && email.length() <= 64 && EMAIL_PATTERN.matcher(email).matches();
+    }
+
+    /**
+     * Applies the same rules as {@link #validateEmail} to the configured management-account
+     * email, but fails at startup rather than surfacing an operator misconfiguration to an
+     * API caller as {@code InvalidInputException}.
+     */
+    private static String requireValidConfiguredEmail(String email) {
+        if (!isValidEmail(email)) {
+            throw new IllegalArgumentException(
+                    "floci.services.organizations.management-account-email"
+                            + " (FLOCI_SERVICES_ORGANIZATIONS_MANAGEMENT_ACCOUNT_EMAIL) must be a valid"
+                            + " email address between 6 and 64 characters, got \"" + email + "\"");
+        }
+        return email;
     }
 
     private void validateServicePrincipal(String servicePrincipal) {
@@ -1662,6 +1938,6 @@ public class OrganizationsService {
     }
 
     private static AwsException accessDenied(String message) {
-        return new AwsException("AccessDeniedException", message, 403);
+        return new AwsException("AccessDeniedException", message, 400);
     }
 }

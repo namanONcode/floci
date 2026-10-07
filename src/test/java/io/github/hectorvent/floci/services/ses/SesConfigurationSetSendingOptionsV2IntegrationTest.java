@@ -193,7 +193,7 @@ class SesConfigurationSetSendingOptionsV2IntegrationTest {
     @Test
     @Order(13)
     void putSendingOptions_stringSendingEnabled_coercesToTrue() {
-        // Real AWS coerces any string to true (200), matching CreateConfigurationSet. Verify the
+        // Real AWS coerces "yes" to true (200), matching CreateConfigurationSet. Verify the
         // persisted value, not just the status — CS was disabled by @Order(12).
         given()
                 .contentType("application/json")
@@ -246,10 +246,10 @@ class SesConfigurationSetSendingOptionsV2IntegrationTest {
 
     @Test
     @Order(16)
-    void v1_updateConfigurationSetSendingEnabled_nonBooleanEnabled_returnsInvalidParameterValue() {
-        // parseRequiredBoolean enforces AWS-style "true"|"false". Anything else (e.g.
-        // "yes") must surface as InvalidParameterValue instead of being silently
-        // coerced to false (which would disable sending without the caller realizing).
+    void v1_updateConfigurationSetSendingEnabled_nonBooleanEnabled_returnsMalformedInput() {
+        // Query-protocol booleans are strict xsd 1.1 (probed against real AWS 2026-09-05):
+        // anything but case-sensitive true/false/1/0 is MalformedInput rather than being
+        // silently coerced to false (which would disable sending without the caller realizing).
         given()
                 .contentType("application/x-www-form-urlencoded")
                 .header("Authorization", SES_AUTH)
@@ -260,8 +260,8 @@ class SesConfigurationSetSendingOptionsV2IntegrationTest {
                 .post("/")
         .then()
                 .statusCode(400)
-                .body(containsString("<Code>InvalidParameterValue</Code>"))
-                .body(containsString("Enabled"));
+                .body(containsString("<Code>MalformedInput</Code>"))
+                .body(containsString("boolean must follow xsd1.1 definition"));
     }
 
     private static io.restassured.response.Response sendEmail(String configSet) {

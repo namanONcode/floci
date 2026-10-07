@@ -4,8 +4,10 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
+import io.github.hectorvent.floci.services.cloudformation.provisioners.CfnResourceDispatcher;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.CfnRollback;
-import io.github.hectorvent.floci.services.cloudformation.provisioners.CloudFormationResourceRegistry;
+import io.github.hectorvent.floci.services.cloudformation.provisioners.IamManagedPolicyCfnProvisioner;
+import io.github.hectorvent.floci.services.cloudformation.provisioners.IamPolicyCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.IamRoleCfnProvisioner;
 import io.github.hectorvent.floci.services.iam.IamService;
 import io.github.hectorvent.floci.services.iam.model.IamPolicy;
@@ -42,19 +44,17 @@ class CloudFormationIamAttachmentProvisionerTest {
 
     private final ObjectMapper mapper = new ObjectMapper();
     private IamService iamService;
-    private CloudFormationResourceProvisioner provisioner;
+    private CfnResourceDispatcher provisioner;
 
     @BeforeEach
     void setUp() {
         iamService = mock(IamService.class);
-        provisioner = new CloudFormationResourceProvisioner(
-                null, null, null, null, null, iamService, null, null, null, null,
-                null, null, null, null, null, null,
-                mapper,
-                null, null, null, null, null, null, null,
-                null, null, null, null, null, null, null,
-                null, null,
-                new CloudFormationResourceRegistry(List.of(new IamRoleCfnProvisioner(iamService))));
+        provisioner = CfnProvisionerFixture.builder()
+                .iam(iamService)
+                .objectMapper(mapper)
+                .provisioners(new IamRoleCfnProvisioner(iamService), new IamPolicyCfnProvisioner(iamService),
+                        new IamManagedPolicyCfnProvisioner(iamService))
+                .build();
     }
 
     @Test
@@ -405,7 +405,7 @@ class CloudFormationIamAttachmentProvisionerTest {
         assertEquals("old-user", result.getAttributes().get("InlineUserTargets"));
         assertEquals("old-group", result.getAttributes().get("InlineGroupTargets"));
         assertEquals("true", result.getAttributes().get(
-                CloudFormationResourceProvisioner.UPDATE_ROLLBACK_RESTORED_ATTR));
+                CfnRollback.UPDATE_ROLLBACK_RESTORED_ATTR));
         verify(iamService).deleteRolePolicy("new-role", policyName);
         verify(iamService, never()).deleteRolePolicy("old-role", policyName);
     }

@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.ses;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.ses.model.AccountSuppressionAttributes;
@@ -19,6 +20,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.TreeSet;
 
 /**
  * Suppression: the account-level suppression attributes and the per-address suppression list,
@@ -29,7 +31,7 @@ import java.util.Set;
  * rather than splitting one off, both stores move together into this service and the helper becomes
  * a private detail of it. The send path keeps its cross-domain orchestration
  * ({@code getEffectiveSuppressedReasons} reads a configuration set's options or falls back here;
- * {@code collectSuppressedReasons}/{@code resolveSuppressionReason} filter a send) in the
+ * {@code collectSuppressedReasons} filters a send) in the
  * {@link SesService} facade, which reads entries back through {@link #findSuppressedDestination}.
  */
 @ApplicationScoped
@@ -39,19 +41,24 @@ public class SesSuppressionService {
 
     private final StorageBackend<String, SuppressedDestination> suppressionStore;
     private final StorageBackend<String, AccountSuppressionAttributes> accountSuppressionStore;
+    private final StorageBackend<String, SuppressedDestination> tenantSuppressionStore;
 
     @Inject
     public SesSuppressionService(StorageFactory storageFactory) {
-        this.suppressionStore = storageFactory.create("ses", "ses-suppression.json",
-                new TypeReference<Map<String, SuppressedDestination>>() {});
-        this.accountSuppressionStore = storageFactory.create("ses", "ses-account-suppression.json",
-                new TypeReference<Map<String, AccountSuppressionAttributes>>() {});
+        this(storageFactory.create("ses", "ses-suppression.json",
+                        new TypeReference<Map<String, SuppressedDestination>>() {}),
+                storageFactory.create("ses", "ses-account-suppression.json",
+                        new TypeReference<Map<String, AccountSuppressionAttributes>>() {}),
+                storageFactory.create("ses", "ses-tenant-suppression.json",
+                        new TypeReference<Map<String, SuppressedDestination>>() {}));
     }
 
     SesSuppressionService(StorageBackend<String, SuppressedDestination> suppressionStore,
-                          StorageBackend<String, AccountSuppressionAttributes> accountSuppressionStore) {
+                          StorageBackend<String, AccountSuppressionAttributes> accountSuppressionStore,
+                          StorageBackend<String, SuppressedDestination> tenantSuppressionStore) {
         this.suppressionStore = suppressionStore;
         this.accountSuppressionStore = accountSuppressionStore;
+        this.tenantSuppressionStore = tenantSuppressionStore;
     }
 
     // ──────────────────── Account-level suppression attributes ────────────────────
@@ -129,9 +136,9 @@ public class SesSuppressionService {
     }
 
     /**
-     * Reads a suppression entry without throwing, so the facade's send-path filters
-     * ({@code collectSuppressedReasons} / {@code resolveSuppressionReason}) can look one up by raw
-     * address and share this service's normalization and legacy-key fallback.
+     * Reads a suppression entry without throwing, so the facade's send-path filter
+     * ({@code collectSuppressedReasons}) can look one up by raw address and share this service's
+     * normalization and legacy-key fallback.
      */
     public Optional<SuppressedDestination> findSuppressedDestination(String region, String rawEmail) {
         if (rawEmail == null || rawEmail.isBlank()) {
@@ -167,7 +174,126 @@ public class SesSuppressionService {
         return Optional.empty();
     }
 
+    /**
+     * SES binds the token to the filter it was taken with, so a token replayed with other reasons is
+     * refused; its own order is not stable between calls, so Floci keeps oldest first.
+     */
+    public PaginatedResult<SuppressedDestination> listSuppressedDestinations(
+            String region, List<String> reasonFilters, SesListPaging paging, Integer pageSize, String nextToken) {
+        Set<String> filters = validateReasonFilters(reasonFilters);
+        String prefix = "suppression::" + region + "::";
+        return paging.page(region, tokenScope("", filters),
+                oldestFirst(suppressionStore.scan(k -> k.startsWith(prefix)), filters),
+                SesSuppressionService::cursor, pageSize, nextToken);
+    }
+
+    private static String tokenScope(String tenantId, Set<String> filters) {
+        return tenantId + "/" + String.join(",", new TreeSet<>(filters));
+    }
+
+    private static String cursor(SuppressedDestination destination) {
+        return SesListPaging.oldestFirst(destination.getLastUpdateTime(), destination.getEmailAddress());
+    }
+
+    private static List<SuppressedDestination> oldestFirst(List<SuppressedDestination> entries,
+                                                           Set<String> filters) {
+        return entries.stream()
+                .filter(s -> filters.isEmpty() || filters.contains(s.getReason()))
+                .sorted(Comparator.comparing(SesSuppressionService::cursor))
+                .toList();
+    }
+
     public List<SuppressedDestination> listSuppressedDestinations(String region, List<String> reasonFilters) {
+        Set<String> filters = validateReasonFilters(reasonFilters);
+        String prefix = "suppression::" + region + "::";
+        return oldestFirst(suppressionStore.scan(k -> k.startsWith(prefix)), filters);
+    }
+
+    private static String suppressionKey(String region, String emailAddress) {
+        return "suppression::" + region + "::" + emailAddress;
+    }
+
+    // ──────────────────── Tenant-scoped suppression list (Phase 3) ────────────────────
+    // Probe-confirmed 2026-08-30: each tenant's list is fully separate from the account list (they
+    // are mutually invisible), the tenant's SuppressionScope does not gate these operations, and the
+    // not-found message says "tenant suppression list". Keys carry the TenantId, so a recreated
+    // same-name tenant starts with an empty list; DeleteTenant cascades via deleteAllForTenant.
+    // Callers pass through SesTenantService.runWithTenant, which resolves the tenant (404) and
+    // serializes against the DeleteTenant cascade.
+
+    public void putTenantSuppressedDestination(String region, String tenantId, String tenantName,
+                                               String emailAddress, String reason) {
+        String normalized = normalizeSuppressionEmail(emailAddress);
+        validateSuppressionReason(reason, "reason", false);
+        SuppressedDestination entry = new SuppressedDestination(normalized, reason);
+        entry.setTenantName(tenantName);
+        tenantSuppressionStore.put(tenantSuppressionKey(region, tenantId, normalized), entry);
+        LOG.infov("Suppressed destination {0} for tenant {1} in region {2} (reason={3})",
+                normalized, tenantName, region, reason);
+    }
+
+    public SuppressedDestination getTenantSuppressedDestination(String region, String tenantId,
+                                                                String emailAddress) {
+        String normalized = normalizeSuppressionEmail(emailAddress);
+        return tenantSuppressionStore.get(tenantSuppressionKey(region, tenantId, normalized))
+                .orElseThrow(() -> tenantEntryNotFound(normalized));
+    }
+
+    /** Unlike the tenant resource associations, this delete is not idempotent on AWS: a second
+     * delete of the same address is a NotFound. */
+    public void deleteTenantSuppressedDestination(String region, String tenantId, String emailAddress) {
+        String normalized = normalizeSuppressionEmail(emailAddress);
+        String key = tenantSuppressionKey(region, tenantId, normalized);
+        if (tenantSuppressionStore.get(key).isEmpty()) {
+            throw tenantEntryNotFound(normalized);
+        }
+        tenantSuppressionStore.delete(key);
+        LOG.infov("Removed tenant suppression entry for {0} in region {1}", normalized, region);
+    }
+
+    public PaginatedResult<SuppressedDestination> listTenantSuppressedDestinations(
+            String region, String tenantId, List<String> reasonFilters, SesListPaging paging, Integer pageSize,
+            String nextToken) {
+        Set<String> filters = validateReasonFilters(reasonFilters);
+        String prefix = tenantSuppressionKeyPrefix(region, tenantId);
+        return paging.page(region, tokenScope(tenantId, filters),
+                oldestFirst(tenantSuppressionStore.scan(k -> k.startsWith(prefix)), filters),
+                SesSuppressionService::cursor, pageSize, nextToken);
+    }
+
+    public List<SuppressedDestination> listTenantSuppressedDestinations(String region, String tenantId,
+                                                                        List<String> reasonFilters) {
+        Set<String> filters = validateReasonFilters(reasonFilters);
+        String prefix = tenantSuppressionKeyPrefix(region, tenantId);
+        return oldestFirst(tenantSuppressionStore.scan(k -> k.startsWith(prefix)), filters);
+    }
+
+    /** DeleteTenant's cascade for this domain, run from inside the tenant lock. */
+    public void deleteAllForTenant(String region, String tenantId) {
+        String prefix = tenantSuppressionKeyPrefix(region, tenantId);
+        for (String key : tenantSuppressionStore.keys().stream()
+                .filter(k -> k.startsWith(prefix)).toList()) {
+            tenantSuppressionStore.delete(key);
+        }
+    }
+
+    private static AwsException tenantEntryNotFound(String normalizedEmail) {
+        return new AwsException("NotFoundException",
+                "Email address " + normalizedEmail + " does not exist on your tenant suppression list.",
+                404);
+    }
+
+    private static String tenantSuppressionKey(String region, String tenantId, String emailAddress) {
+        return tenantSuppressionKeyPrefix(region, tenantId) + emailAddress;
+    }
+
+    private static String tenantSuppressionKeyPrefix(String region, String tenantId) {
+        return "tenantSuppression::" + region + "::" + tenantId + "::";
+    }
+
+    /** Validates a Reasons filter list, returning the non-blank values; shared by the account and
+     * tenant list paths, and by the facade to keep request validation ahead of tenant existence. */
+    static Set<String> validateReasonFilters(List<String> reasonFilters) {
         Set<String> filters = new HashSet<>();
         if (reasonFilters != null) {
             for (String r : reasonFilters) {
@@ -177,25 +303,10 @@ public class SesSuppressionService {
                 }
             }
         }
-        String prefix = "suppression::" + region + "::";
-        List<SuppressedDestination> all = new ArrayList<>(suppressionStore.scan(k -> k.startsWith(prefix)));
-        all.sort(Comparator.comparing(SuppressedDestination::getLastUpdateTime,
-                        Comparator.nullsLast(Comparator.naturalOrder()))
-                .thenComparing(SuppressedDestination::getEmailAddress,
-                        Comparator.nullsLast(Comparator.naturalOrder())));
-        if (filters.isEmpty()) {
-            return all;
-        }
-        return all.stream()
-                .filter(s -> filters.contains(s.getReason()))
-                .toList();
+        return filters;
     }
 
-    private static String suppressionKey(String region, String emailAddress) {
-        return "suppression::" + region + "::" + emailAddress;
-    }
-
-    private static String normalizeSuppressionEmail(String emailAddress) {
+    static String normalizeSuppressionEmail(String emailAddress) {
         if (emailAddress == null || emailAddress.isBlank()) {
             throw new AwsException("BadRequestException", "EmailAddress is required.", 400);
         }
@@ -223,7 +334,7 @@ public class SesSuppressionService {
      * (single Reason field) returns the unwrapped form; the two list-bearing APIs return the wrapped
      * form. Shared by the two sub-domains above, which is why they were extracted together.
      */
-    private static void validateSuppressionReason(String reason, String fieldName, boolean nested) {
+    static void validateSuppressionReason(String reason, String fieldName, boolean nested) {
         if (reason == null || (!"BOUNCE".equals(reason) && !"COMPLAINT".equals(reason))) {
             String constraint = nested
                     ? "Member must satisfy constraint: [Member must satisfy enum value set: [BOUNCE, COMPLAINT]]"

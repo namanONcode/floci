@@ -7,14 +7,20 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
+import io.github.hectorvent.floci.services.cloudwatch.logs.model.LogStream;
+import io.github.hectorvent.floci.services.cloudwatch.metrics.CloudWatchMetricsService;
 import jakarta.ws.rs.core.Response;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+
+import java.util.List;
+import java.util.Map;
 
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.is;
 import static org.hamcrest.Matchers.not;
+import static org.mockito.Mockito.mock;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -50,10 +56,18 @@ class CloudWatchLogsHandlerTest {
                 new InMemoryStorage<>(),
                 new InMemoryStorage<>(),
                 new InMemoryStorage<>(),
+                new InMemoryStorage<>(),
                 10_000,
                 new RegionResolver(REGION, ACCOUNT)
         );
-        handler = new CloudWatchLogsHandler(service, MAPPER);
+        handler = new CloudWatchLogsHandler(
+                service,
+                new CloudWatchLogsCrossAccountService(
+                        new InMemoryStorage<>(), new InMemoryStorage<>(),
+                        new RegionResolver(REGION, ACCOUNT), MAPPER),
+                new CloudWatchLogsMetricFilterService(service,
+                        mock(CloudWatchMetricsService.class), new RegionResolver(REGION, ACCOUNT)),
+                MAPPER);
 
         service.createLogGroup(GROUP, null, null, REGION);
         service.createLogStream(GROUP, STREAM, REGION);
@@ -78,9 +92,9 @@ class CloudWatchLogsHandlerTest {
     void describeLogStreamsHonorsOrderByDescendingLimitAndReturnsNextToken() {
         service.createLogStream(GROUP, "another-stream", REGION);
         service.putLogEvents(GROUP, STREAM,
-                java.util.List.of(java.util.Map.of("timestamp", 2000L, "message", "new")), REGION);
+                List.of(Map.of("timestamp", 2000L, "message", "new")), REGION);
         service.putLogEvents(GROUP, "another-stream",
-                java.util.List.of(java.util.Map.of("timestamp", 1000L, "message", "old")), REGION);
+                List.of(Map.of("timestamp", 1000L, "message", "old")), REGION);
         ObjectNode request = MAPPER.createObjectNode()
                 .put("logGroupName", GROUP)
                 .put("orderBy", "LastEventTime")
@@ -100,6 +114,52 @@ class CloudWatchLogsHandlerTest {
         ObjectNode nextEntity = (ObjectNode) handler.handle("DescribeLogStreams", nextRequest, REGION).getEntity();
         assertEquals("another-stream", nextEntity.path("logStreams").get(0).path("logStreamName").asText());
         assertFalse(nextEntity.has("nextToken"));
+    }
+
+    // ──────────────────────────── creationTime (issue #4084) ────────────────────────────
+
+    @Test
+    void describeLogGroupsReturnsCreationTimeNotCreatedTime() {
+        ObjectNode request = MAPPER.createObjectNode().put("logGroupNamePrefix", GROUP);
+
+        JsonNode group = ((JsonNode) handler.handle("DescribeLogGroups", request, REGION).getEntity())
+                .path("logGroups").get(0);
+
+        assertTrue(group.path("creationTime").isNumber());
+        assertTrue(group.path("creationTime").asLong() > 0);
+        assertFalse(group.has("createdTime"));
+    }
+
+    @Test
+    void describeLogGroupsReturnsStoredBytesSummedAcrossStreams() {
+        service.createLogStream(GROUP, "second-stream", REGION);
+        service.putLogEvents(GROUP, STREAM,
+                List.of(Map.of("timestamp", 1L, "message", "alpha")), REGION);
+        service.putLogEvents(GROUP, "second-stream",
+                List.of(Map.of("timestamp", 2L, "message", "beta")), REGION);
+
+        long expected = service.describeLogStreams(GROUP, null, REGION).stream()
+                .mapToLong(LogStream::getStoredBytes)
+                .sum();
+
+        JsonNode group = ((JsonNode) handler.handle("DescribeLogGroups",
+                MAPPER.createObjectNode().put("logGroupNamePrefix", GROUP), REGION).getEntity())
+                .path("logGroups").get(0);
+
+        assertTrue(expected > 0);
+        assertEquals(expected, group.path("storedBytes").asLong());
+    }
+
+    @Test
+    void describeLogStreamsReturnsCreationTimeNotCreatedTime() {
+        ObjectNode request = MAPPER.createObjectNode().put("logGroupName", GROUP);
+
+        JsonNode stream = ((JsonNode) handler.handle("DescribeLogStreams", request, REGION).getEntity())
+                .path("logStreams").get(0);
+
+        assertTrue(stream.path("creationTime").isNumber());
+        assertTrue(stream.path("creationTime").asLong() > 0);
+        assertFalse(stream.has("createdTime"));
     }
 
     // ──────────────────────────── GetDataProtectionPolicy ────────────────────────────
@@ -308,7 +368,7 @@ class CloudWatchLogsHandlerTest {
         Response response = handler.handle("PutLogEvents", request, REGION);
 
         assertEquals(200, response.getStatus());
-        var stored = service.getLogEvents(GROUP, STREAM, null, null, 100, true, null, REGION);
+        CloudWatchLogsService.LogEventsResult stored = service.getLogEvents(GROUP, STREAM, null, null, 100, true, null, REGION);
         assertEquals(1, stored.events().size());
         assertEquals("hello via ARN", stored.events().getFirst().getMessage());
     }
@@ -319,7 +379,7 @@ class CloudWatchLogsHandlerTest {
     void getLogEventsByLogGroupIdentifierArnAndLogStreamArn() {
         long now = System.currentTimeMillis();
         service.putLogEvents(GROUP, STREAM,
-                java.util.List.of(java.util.Map.of("timestamp", now, "message", "via arn")),
+                List.of(Map.of("timestamp", now, "message", "via arn")),
                 REGION);
 
         ObjectNode request = MAPPER.createObjectNode();
@@ -339,9 +399,9 @@ class CloudWatchLogsHandlerTest {
     @Test
     void filterLogEventsByLogGroupIdentifierArnAndStreamArns() {
         long now = System.currentTimeMillis();
-        service.putLogEvents(GROUP, STREAM, java.util.List.of(
-                java.util.Map.of("timestamp", now, "message", "ERROR: kaboom"),
-                java.util.Map.of("timestamp", now + 1, "message", "INFO: fine")
+        service.putLogEvents(GROUP, STREAM, List.of(
+                Map.of("timestamp", now, "message", "ERROR: kaboom"),
+                Map.of("timestamp", now + 1, "message", "INFO: fine")
         ), REGION);
 
         ObjectNode request = MAPPER.createObjectNode();
@@ -367,11 +427,11 @@ class CloudWatchLogsHandlerTest {
         service.createLogStream(GROUP, otherStream, REGION);
 
         long now = System.currentTimeMillis();
-        service.putLogEvents(GROUP, STREAM, java.util.List.of(
-                java.util.Map.of("timestamp", now, "message", "ERROR: from first")
+        service.putLogEvents(GROUP, STREAM, List.of(
+                Map.of("timestamp", now, "message", "ERROR: from first")
         ), REGION);
-        service.putLogEvents(GROUP, otherStream, java.util.List.of(
-                java.util.Map.of("timestamp", now + 1, "message", "ERROR: from second")
+        service.putLogEvents(GROUP, otherStream, List.of(
+                Map.of("timestamp", now + 1, "message", "ERROR: from second")
         ), REGION);
 
         ObjectNode request = MAPPER.createObjectNode();
@@ -392,8 +452,8 @@ class CloudWatchLogsHandlerTest {
         // OutputLogEvent has no logStreamName in real AWS: the caller named the stream in the
         // request, so echoing it back would be a shape floci invents.
         long now = System.currentTimeMillis();
-        service.putLogEvents(GROUP, STREAM, java.util.List.of(
-                java.util.Map.of("timestamp", now, "message", "only one stream here")
+        service.putLogEvents(GROUP, STREAM, List.of(
+                Map.of("timestamp", now, "message", "only one stream here")
         ), REGION);
 
         ObjectNode request = MAPPER.createObjectNode();
@@ -411,9 +471,9 @@ class CloudWatchLogsHandlerTest {
     @Test
     void filterLogEventsByLogGroupIdentifierArnWithoutStreamFilter() {
         long now = System.currentTimeMillis();
-        service.putLogEvents(GROUP, STREAM, java.util.List.of(
-                java.util.Map.of("timestamp", now, "message", "a"),
-                java.util.Map.of("timestamp", now + 1, "message", "b")
+        service.putLogEvents(GROUP, STREAM, List.of(
+                Map.of("timestamp", now, "message", "a"),
+                Map.of("timestamp", now + 1, "message", "b")
         ), REGION);
 
         ObjectNode request = MAPPER.createObjectNode();
@@ -431,12 +491,12 @@ class CloudWatchLogsHandlerTest {
         // response, goes out on the next request, and the second page carries the matches the
         // first one capped off.
         long now = System.currentTimeMillis();
-        service.putLogEvents(GROUP, STREAM, java.util.List.of(
-                java.util.Map.of("timestamp", now, "message", "msg-0"),
-                java.util.Map.of("timestamp", now + 1, "message", "msg-1"),
-                java.util.Map.of("timestamp", now + 2, "message", "msg-2"),
-                java.util.Map.of("timestamp", now + 3, "message", "msg-3"),
-                java.util.Map.of("timestamp", now + 4, "message", "msg-4")
+        service.putLogEvents(GROUP, STREAM, List.of(
+                Map.of("timestamp", now, "message", "msg-0"),
+                Map.of("timestamp", now + 1, "message", "msg-1"),
+                Map.of("timestamp", now + 2, "message", "msg-2"),
+                Map.of("timestamp", now + 3, "message", "msg-3"),
+                Map.of("timestamp", now + 4, "message", "msg-4")
         ), REGION);
 
         ObjectNode firstRequest = MAPPER.createObjectNode();
@@ -527,5 +587,166 @@ class CloudWatchLogsHandlerTest {
         AwsException ex = assertThrows(AwsException.class,
                 () -> handler.handle("StartQuery", request, REGION));
         assertEquals("InvalidParameterException", ex.getErrorCode());
+    }
+
+    // ──────────────────────────── AssociateKmsKey / DisassociateKmsKey ────────────────────────────
+
+    private static final String KEY_ARN =
+            "arn:aws:kms:" + REGION + ":" + ACCOUNT + ":key/1234abcd-12ab-34cd-56ef-1234567890ab";
+
+    @Test
+    void associateKmsKeyIsEchoedBackByDescribeLogGroups() {
+        // LZA's Custom::UpdateSubscriptionFilter Lambda reads logGroup.kmsKeyId from
+        // DescribeLogGroups and only calls AssociateKmsKey when it differs from the target
+        // key ARN. If DescribeLogGroups never surfaces the field, the association never
+        // converges and the Lambda re-associates on every deploy.
+        ObjectNode associate = MAPPER.createObjectNode();
+        associate.put("logGroupName", GROUP);
+        associate.put("kmsKeyId", KEY_ARN);
+
+        assertEquals(200, handler.handle("AssociateKmsKey", associate, REGION).getStatus());
+
+        JsonNode group = describeGroup();
+        assertEquals(KEY_ARN, group.path("kmsKeyId").asText());
+    }
+
+    @Test
+    void describeLogGroupsOmitsKmsKeyIdWhenNoKeyIsAssociated() {
+        assertThat(describeGroup().has("kmsKeyId"), is(false));
+    }
+
+    @Test
+    void disassociateKmsKeyClearsTheAssociation() {
+        ObjectNode associate = MAPPER.createObjectNode();
+        associate.put("logGroupName", GROUP);
+        associate.put("kmsKeyId", KEY_ARN);
+        handler.handle("AssociateKmsKey", associate, REGION);
+
+        ObjectNode disassociate = MAPPER.createObjectNode();
+        disassociate.put("logGroupName", GROUP);
+        assertEquals(200, handler.handle("DisassociateKmsKey", disassociate, REGION).getStatus());
+
+        assertThat(describeGroup().has("kmsKeyId"), is(false));
+    }
+
+    @Test
+    void associateKmsKeyResolvesAnArnResourceIdentifier() {
+        // The wire field for the ARN alternative on Associate/DisassociateKmsKey is
+        // resourceIdentifier (not the logGroupIdentifier the query operations use).
+        ObjectNode associate = MAPPER.createObjectNode();
+        associate.put("resourceIdentifier", GROUP_ARN);
+        associate.put("kmsKeyId", KEY_ARN);
+
+        assertEquals(200, handler.handle("AssociateKmsKey", associate, REGION).getStatus());
+        assertEquals(KEY_ARN, describeGroup().path("kmsKeyId").asText());
+    }
+
+    @Test
+    void associateKmsKeyWithBothIdentifiersThrowsInvalidParameter() {
+        // AWS models the two identifiers as mutually exclusive: exactly one is required.
+        ObjectNode associate = MAPPER.createObjectNode();
+        associate.put("logGroupName", GROUP);
+        associate.put("resourceIdentifier", GROUP_ARN);
+        associate.put("kmsKeyId", KEY_ARN);
+
+        AwsException ex = assertThrows(AwsException.class,
+                () -> handler.handle("AssociateKmsKey", associate, REGION));
+        assertEquals("InvalidParameterException", ex.getErrorCode());
+    }
+
+    @Test
+    void associateKmsKeyWithBlankNameBesideValidArnThrowsInvalidParameter() {
+        // A present-but-blank identifier is not "absent": the model pins logGroupName
+        // to min length 1, so blank + a valid counterpart must reject, not silently
+        // proceed on the valid one.
+        ObjectNode associate = MAPPER.createObjectNode();
+        associate.put("logGroupName", "");
+        associate.put("resourceIdentifier", GROUP_ARN);
+        associate.put("kmsKeyId", KEY_ARN);
+
+        AwsException ex = assertThrows(AwsException.class,
+                () -> handler.handle("AssociateKmsKey", associate, REGION));
+        assertEquals("InvalidParameterException", ex.getErrorCode());
+    }
+
+    @Test
+    void associateKmsKeyWithOnlyABlankIdentifierThrowsInvalidParameter() {
+        ObjectNode associate = MAPPER.createObjectNode();
+        associate.put("logGroupName", "");
+        associate.put("kmsKeyId", KEY_ARN);
+
+        AwsException ex = assertThrows(AwsException.class,
+                () -> handler.handle("AssociateKmsKey", associate, REGION));
+        assertEquals("InvalidParameterException", ex.getErrorCode());
+    }
+
+    @Test
+    void associateKmsKeyWithoutAnyIdentifierThrowsInvalidParameter() {
+        ObjectNode associate = MAPPER.createObjectNode();
+        associate.put("kmsKeyId", KEY_ARN);
+
+        AwsException ex = assertThrows(AwsException.class,
+                () -> handler.handle("AssociateKmsKey", associate, REGION));
+        assertEquals("InvalidParameterException", ex.getErrorCode());
+    }
+
+    @Test
+    void associateKmsKeyOnUnknownLogGroupThrows() {
+        ObjectNode associate = MAPPER.createObjectNode();
+        associate.put("logGroupName", "/nope");
+        associate.put("kmsKeyId", KEY_ARN);
+
+        AwsException ex = assertThrows(AwsException.class,
+                () -> handler.handle("AssociateKmsKey", associate, REGION));
+        assertEquals("ResourceNotFoundException", ex.getErrorCode());
+    }
+
+    @Test
+    void createLogGroupWithKmsKeyIdIsEchoedBackByDescribeLogGroups() {
+        // CreateLogGroup models kmsKeyId (Required: No) as the normal way to create an
+        // encrypted group in one call; it must be stored and surfaced the same way
+        // AssociateKmsKey's result is.
+        String newGroup = "/aws/rds/instance/encrypted-at-creation/postgresql";
+        ObjectNode create = MAPPER.createObjectNode();
+        create.put("logGroupName", newGroup);
+        create.put("kmsKeyId", KEY_ARN);
+
+        assertEquals(200, handler.handle("CreateLogGroup", create, REGION).getStatus());
+
+        ObjectNode describeRequest = MAPPER.createObjectNode();
+        describeRequest.put("logGroupNamePrefix", newGroup);
+        Response response = handler.handle("DescribeLogGroups", describeRequest, REGION);
+        ArrayNode groups = (ArrayNode) ((ObjectNode) response.getEntity()).path("logGroups");
+        assertEquals(1, groups.size());
+        assertEquals(KEY_ARN, groups.get(0).path("kmsKeyId").asText());
+    }
+
+    @Test
+    void associateKmsKeyWithQueryResultResourceIdentifierIsRejectedAsUnsupported() {
+        // arn:...:query-result:* is a real, modeled resourceIdentifier form (account-wide
+        // GetQueryResults encryption), but it is a genuinely different feature from
+        // per-log-group encryption. extractLogGroupNameFromArn only recognizes :log-group:,
+        // so left unchecked this ARN falls through unchanged and becomes a log group NAME,
+        // producing a ResourceNotFoundException that names a log group the caller never
+        // specified. It must be rejected as unsupported instead.
+        ObjectNode associate = MAPPER.createObjectNode();
+        associate.put("resourceIdentifier",
+                "arn:aws:logs:" + REGION + ":" + ACCOUNT + ":query-result:*");
+        associate.put("kmsKeyId", KEY_ARN);
+
+        AwsException ex = assertThrows(AwsException.class,
+                () -> handler.handle("AssociateKmsKey", associate, REGION));
+        assertEquals("InvalidParameterException", ex.getErrorCode());
+        assertThat(ex.getMessage(), containsString("query-result"));
+    }
+
+    private JsonNode describeGroup() {
+        ObjectNode request = MAPPER.createObjectNode();
+        request.put("logGroupNamePrefix", GROUP);
+        Response response = handler.handle("DescribeLogGroups", request, REGION);
+        assertEquals(200, response.getStatus());
+        ArrayNode groups = (ArrayNode) ((ObjectNode) response.getEntity()).path("logGroups");
+        assertEquals(1, groups.size());
+        return groups.get(0);
     }
 }
